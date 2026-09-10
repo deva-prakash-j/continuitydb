@@ -1,0 +1,12 @@
+node_modules/
+.context-vault/
+.continuitydb/
+.env
+.env.*
+!.env.example
+coverage/
+*.tgz
+*.log
+*.db
+*.db-shm
+*.db-wal

@@ -1,0 +1,12 @@
+{
+  "working_ttl_seconds": 86400,
+  "inference_ttl_seconds": 604800,
+  "auto_activate_confidence": 0.8,
+  "max_records_per_project_per_agent": 10000,
+  "project_roots": {
+    "service-a": {
+      "root": "/absolute/read-only/path/to/service-a",
+      "allowed_refs": ["HEAD", "refs/heads/main"]
+    }
+  }
+}

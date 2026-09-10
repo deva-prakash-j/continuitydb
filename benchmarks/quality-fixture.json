@@ -1,0 +1,100 @@
+{
+  "links": [
+    {
+      "source_project": "charge-api",
+      "target_project": "charge-schema",
+      "provenance": "charge-api build manifest declares charge-schema"
+    },
+    {
+      "source_project": "api-gateway",
+      "target_project": "auth-client",
+      "provenance": "api-gateway build manifest declares auth-client"
+    }
+  ],
+  "records": [
+    {
+      "key": "schema-regeneration",
+      "title": "ChargeSchema client regeneration",
+      "body": "Changing ChargeSchema requires regenerating the Java client in charge-api before release.",
+      "project_id": "charge-schema",
+      "symbol": "ChargeSchema"
+    },
+    {
+      "key": "protobuf-rule",
+      "title": "Protobuf compatibility rule",
+      "body": "Never reuse removed protobuf field numbers; reserve both the number and name.",
+      "project_id": "charge-schema",
+      "symbol": "ChargeEvent"
+    },
+    {
+      "key": "release-order",
+      "title": "Schema and API release order",
+      "body": "Publish charge-schema first, regenerate the client, then deploy charge-api.",
+      "project_id": "charge-api"
+    },
+    {
+      "key": "billing-outbox",
+      "title": "Billing event outbox",
+      "body": "Billing persists the invoice and an outbox row in one transaction; a relay publishes the Kafka event later.",
+      "project_id": "billing-service",
+      "symbol": "InvoiceOutboxRelay"
+    },
+    {
+      "key": "billing-flyway",
+      "title": "Billing Flyway policy",
+      "body": "Database changes use forward-only Flyway migrations and must pass migrationTest.",
+      "project_id": "billing-service"
+    },
+    {
+      "key": "java-preference",
+      "title": "Java test preference",
+      "body": "For Java 21 services, run focused unit tests before the full integration suite.",
+      "namespace_id": "personal/global"
+    },
+    {
+      "key": "refresh-skew",
+      "title": "Token refresh clock skew",
+      "body": "Refresh access tokens sixty seconds before expiry to tolerate clock skew between services.",
+      "project_id": "auth-client",
+      "symbol": "TokenRefreshScheduler"
+    },
+    {
+      "key": "gateway-retry",
+      "title": "Gateway retry classification",
+      "body": "The API gateway retries connection resets and 503 responses, but never retries validation failures.",
+      "project_id": "api-gateway"
+    },
+    {
+      "key": "notification-dlq",
+      "title": "Notification dead-letter handling",
+      "body": "After five delivery attempts, notification events move to notification.dlq for manual replay.",
+      "project_id": "notification-service"
+    },
+    {
+      "key": "payroll-encryption",
+      "title": "Payroll encryption",
+      "body": "Payroll exports use the organization-managed encryption key.",
+      "project_id": "payroll-private"
+    }
+  ],
+  "queries": [
+    { "query": "ChargeSchema regeneration", "project_id": "charge-api", "expected": "schema-regeneration", "kind": "exact" },
+    { "query": "protobuf removed field numbers", "project_id": "charge-api", "expected": "protobuf-rule", "kind": "exact" },
+    { "query": "schema API release order", "project_id": "charge-api", "expected": "release-order", "kind": "exact" },
+    { "query": "Kafka outbox relay", "project_id": "billing-service", "expected": "billing-outbox", "kind": "exact" },
+    { "query": "Flyway migrationTest", "project_id": "billing-service", "expected": "billing-flyway", "kind": "exact" },
+    { "query": "Java 21 focused tests", "project_id": "billing-service", "expected": "java-preference", "kind": "exact" },
+    { "query": "token refresh clock skew", "project_id": "api-gateway", "expected": "refresh-skew", "kind": "exact" },
+    { "query": "gateway retries 503", "project_id": "api-gateway", "expected": "gateway-retry", "kind": "exact" },
+    { "query": "notification dead letter replay", "project_id": "notification-service", "expected": "notification-dlq", "kind": "exact" },
+    { "query": "avoid dual-write inconsistency", "project_id": "billing-service", "expected": "billing-outbox", "kind": "semantic" },
+    { "query": "handle machines whose clocks disagree during authentication", "project_id": "api-gateway", "expected": "refresh-skew", "kind": "semantic" },
+    { "query": "safe evolution of serialized contracts", "project_id": "charge-api", "expected": "protobuf-rule", "kind": "semantic" },
+    { "query": "what must downstream consumers update after a model change", "project_id": "charge-api", "expected": "schema-regeneration", "kind": "semantic" },
+    { "query": "quarantine repeatedly failing messages", "project_id": "notification-service", "expected": "notification-dlq", "kind": "semantic" }
+  ],
+  "isolation_probes": [
+    { "query": "payroll encryption", "project_id": "billing-service", "forbidden": "payroll-encryption" },
+    { "query": "Payroll exports organization key", "project_id": "charge-api", "forbidden": "payroll-encryption" }
+  ]
+}

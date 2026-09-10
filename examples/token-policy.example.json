@@ -1,0 +1,14 @@
+{
+  "tokens": [
+    {
+      "token_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "tenant_id": "example-org",
+      "principal_id": "example-agent-1",
+      "owner_id": "example-user",
+      "agent_id": "coding-agent",
+      "scopes": ["memory:read", "memory:capture", "memory:feedback"],
+      "allowed_projects": ["service-a", "schema-a"],
+      "allowed_sensitivities": ["public", "private"]
+    }
+  ]
+}

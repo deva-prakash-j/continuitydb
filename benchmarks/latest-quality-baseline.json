@@ -1,0 +1,20 @@
+{
+  "date": "2026-09-09",
+  "mode": "SQLite FTS5 lexical baseline",
+  "overall_recall_at_5": 0.643,
+  "by_kind": {
+    "exact": {
+      "hits": 9,
+      "total": 9,
+      "recall_at_5": 1.0
+    },
+    "semantic": {
+      "hits": 0,
+      "total": 5,
+      "recall_at_5": 0.0
+    }
+  },
+  "isolation_probes": 2,
+  "isolation_violations": 0,
+  "interpretation": "FTS5 is an excellent exact-code baseline but cannot satisfy paraphrased conceptual recall. A derived semantic index is justified and must be evaluated against this same fixture."
+}

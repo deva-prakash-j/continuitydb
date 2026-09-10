@@ -1,0 +1,347 @@
+import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
+import { ContextVault } from "./store.js";
+import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
+import {
+  isLoopback,
+  loadTokenPolicy,
+  normalizeIdentity,
+  requireScope,
+  TokenAuthorizer,
+  TokenBucketLimiter,
+} from "./security.js";
+
+const JSON_TYPE = "application/json; charset=utf-8";
+const MAX_BODY_BYTES = Number(process.env.CONTINUITYDB_MAX_BODY_BYTES || 1_048_576);
+
+function json(response, status, value, requestId) {
+  const body = JSON.stringify(value);
+  response.writeHead(status, {
+    "content-type": JSON_TYPE,
+    "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'",
+    "referrer-policy": "no-referrer",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "x-request-id": requestId,
+  });
+  response.end(body);
+}
+
+async function readJson(request) {
+  const declared = Number(request.headers["content-length"] || 0);
+  if (declared > MAX_BODY_BYTES) throw Object.assign(new Error("request body too large"), { statusCode: 413 });
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw Object.assign(new Error("request body too large"), { statusCode: 413 });
+    chunks.push(chunk);
+  }
+  if (!chunks.length) return {};
+  if (!(request.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+    throw Object.assign(new Error("content-type must be application/json"), { statusCode: 415 });
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("invalid JSON body"), { statusCode: 400 });
+  }
+}
+
+function boundedSearch(body, identity) {
+  return {
+    query: body.query,
+    project_id: body.project_id || null,
+    dependency_depth: body.dependency_depth,
+    top_k: body.top_k,
+    token_budget: body.token_budget,
+    branch: body.branch || null,
+    as_of: body.as_of || null,
+    include_stale: Boolean(body.include_stale),
+    tenant_id: identity.tenant_id,
+    owner_id: identity.owner_id,
+    allowed_projects: identity.allowed_projects,
+    allowed_sensitivities: identity.allowed_sensitivities,
+  };
+}
+
+function boundedWrite(body, identity, idempotencyKey = null) {
+  return {
+    ...body,
+    tenant_id: identity.tenant_id,
+    owner_id: identity.owner_id,
+    agent_id: identity.agent_id,
+    idempotency_key: body.idempotency_key || idempotencyKey || undefined,
+  };
+}
+
+function validateWriteScope(body, identity) {
+  if (body.project_id && !identity.allowed_projects.includes(body.project_id)) {
+    throw Object.assign(new Error(`project ${body.project_id} is not allowed for this caller`), { code: "FORBIDDEN" });
+  }
+  if (body.sensitivity && !identity.allowed_sensitivities.includes(body.sensitivity)) {
+    throw Object.assign(new Error(`sensitivity ${body.sensitivity} is not allowed for this caller`), { code: "FORBIDDEN" });
+  }
+  const expectedNamespace = body.project_id ? `project/${body.project_id}` : "personal/global";
+  if (body.namespace_id && body.namespace_id !== expectedNamespace) {
+    throw Object.assign(new Error(`namespace must be ${expectedNamespace} for this write`), { code: "FORBIDDEN" });
+  }
+}
+
+function isVisibleTo(identity, memory) {
+  return Boolean(memory
+    && memory.tenant_id === identity.tenant_id
+    && memory.owner_id === identity.owner_id
+    && (!memory.project_id || identity.allowed_projects.includes(memory.project_id))
+    && identity.allowed_sensitivities.includes(memory.sensitivity));
+}
+
+function errorStatus(error) {
+  if (error.statusCode) return error.statusCode;
+  if (error.code === "FORBIDDEN") return 403;
+  if (/not found/.test(error.message)) return 404;
+  if (/not allowed|missing required scope/.test(error.message)) return 403;
+  if (/must|invalid|exceeds|prohibited|not proposed|same tenant/.test(error.message)) return 400;
+  return 500;
+}
+
+function routeMatch(pathname, pattern) {
+  const expected = pattern.split("/").filter(Boolean);
+  const actual = pathname.split("/").filter(Boolean);
+  if (expected.length !== actual.length) return null;
+  const params = {};
+  for (let index = 0; index < expected.length; index += 1) {
+    if (expected[index].startsWith(":")) params[expected[index].slice(1)] = decodeURIComponent(actual[index]);
+    else if (expected[index] !== actual[index]) return null;
+  }
+  return params;
+}
+
+export function createContinuityServer({
+  vault = new ContextVault(),
+  host = process.env.CONTINUITYDB_HOST || "127.0.0.1",
+  port = Number(process.env.CONTINUITYDB_PORT || 7331),
+  tokenPolicyPath = process.env.CONTINUITYDB_TOKEN_POLICY_FILE || null,
+  trustProxyTls = process.env.CONTINUITYDB_TRUST_PROXY_TLS === "true",
+  localIdentity = null,
+  embedder = createEmbedderFromEnv(),
+  capturePolicy = new CapturePolicy(loadCapturePolicy(process.env.CONTINUITYDB_CAPTURE_POLICY_FILE || null)),
+} = {}) {
+  const entries = loadTokenPolicy(tokenPolicyPath);
+  if (!isLoopback(host) && (!entries.length || !trustProxyTls)) {
+    throw new Error("non-loopback HTTP requires a token policy and CONTINUITYDB_TRUST_PROXY_TLS=true");
+  }
+  const authorizer = new TokenAuthorizer(entries);
+  const fallbackIdentity = normalizeIdentity(localIdentity || {
+    tenant_id: process.env.CONTINUITYDB_TENANT_ID || "local",
+    principal_id: process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user",
+    owner_id: process.env.CONTINUITYDB_OWNER_ID || process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user",
+    agent_id: process.env.CONTINUITYDB_AGENT_ID || null,
+    scopes: ["memory:read", "memory:capture", "memory:feedback", "metrics:read"],
+    allowed_projects: (process.env.CONTINUITYDB_ALLOWED_PROJECTS || "").split(",").filter(Boolean),
+    allowed_sensitivities: (process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private").split(",").filter(Boolean),
+  });
+  const limiter = new TokenBucketLimiter();
+  const engine = new HybridEngine(vault, embedder);
+  const metrics = { requests: 0, errors: 0, rate_limited: 0, started_at: Date.now() };
+
+  const server = createServer(async (request, response) => {
+    const requestId = request.headers["x-request-id"]?.slice(0, 128) || randomUUID();
+    metrics.requests += 1;
+    try {
+      const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
+      if (request.method === "GET" && url.pathname === "/healthz") {
+        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.3.0" }, requestId);
+      }
+
+      const identity = entries.length
+        ? authorizer.authorize(request.headers.authorization)
+        : isLoopback(host) ? fallbackIdentity : null;
+      if (!identity) return json(response, 401, { error: "unauthorized", request_id: requestId }, requestId);
+      if (!limiter.consume(`${identity.tenant_id}:${identity.principal_id}`)) {
+        metrics.rate_limited += 1;
+        response.setHeader("retry-after", "1");
+        return json(response, 429, { error: "rate limit exceeded", request_id: requestId }, requestId);
+      }
+
+      if (request.method === "GET" && url.pathname === "/readyz") {
+        vault.db.prepare("SELECT 1").get();
+        return json(response, 200, { status: "ready" }, requestId);
+      }
+      if (request.method === "GET" && url.pathname === "/metrics") {
+        requireScope(identity, "metrics:read");
+        response.writeHead(200, { "content-type": "text/plain; version=0.0.4", "cache-control": "no-store" });
+        response.end([
+          `continuitydb_http_requests_total ${metrics.requests}`,
+          `continuitydb_http_errors_total ${metrics.errors}`,
+          `continuitydb_http_rate_limited_total ${metrics.rate_limited}`,
+          `continuitydb_uptime_seconds ${Math.floor((Date.now() - metrics.started_at) / 1000)}`,
+          "",
+        ].join("\n"));
+        return;
+      }
+      if (request.method === "GET" && url.pathname === "/v1/stats") {
+        requireScope(identity, "memory:admin");
+        return json(response, 200, vault.stats({ tenant_id: identity.tenant_id }), requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/search") {
+        requireScope(identity, "memory:read");
+        const body = await readJson(request);
+        return json(response, 200, { results: await engine.search(boundedSearch(body, identity)) }, requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/context-packs") {
+        requireScope(identity, "memory:read");
+        const body = await readJson(request);
+        return json(response, 200, await engine.contextPack({
+          ...boundedSearch({ ...body, query: body.task }, identity),
+          task: body.task,
+        }), requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/memories/proposals") {
+        requireScope(identity, "memory:propose");
+        const body = await readJson(request);
+        validateWriteScope(body, identity);
+        const result = vault.propose(boundedWrite(body, identity, request.headers["idempotency-key"]), {
+          actor: `${identity.principal_id}/${identity.agent_id || "host"}`,
+        });
+        return json(response, result.duplicate ? 200 : 201, result, requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/memories/captures") {
+        requireScope(identity, "memory:capture");
+        const body = await readJson(request);
+        const assessment = capturePolicy.evaluate({
+          ...body,
+          idempotency_key: body.idempotency_key || request.headers["idempotency-key"] || undefined,
+        }, identity, vault);
+        const result = vault.capture(assessment, { actor: `${identity.principal_id}/${identity.agent_id || "agent"}` });
+        let semantic_index = { indexed: false, reason: "memory is not active or semantic retrieval is disabled" };
+        if (result.record.status === "active" && embedder) {
+          try { semantic_index = await engine.indexMemory(result.record.id); }
+          catch (error) { semantic_index = { indexed: false, reason: error.message }; }
+        }
+        return json(response, result.duplicate ? 200 : 201, { ...result, semantic_index }, requestId);
+      }
+      const feedbackParams = request.method === "POST" && routeMatch(url.pathname, "/v1/memories/:id/feedback");
+      if (feedbackParams) {
+        requireScope(identity, "memory:feedback");
+        const current = vault.get(feedbackParams.id);
+        if (!isVisibleTo(identity, current)) return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        const body = await readJson(request);
+        return json(response, 200, vault.feedback({
+          tenant_id: identity.tenant_id,
+          owner_id: identity.owner_id,
+          principal_id: identity.principal_id,
+          agent_id: identity.agent_id,
+          memory_id: current.id,
+          signal: body.signal,
+          reason: body.reason || null,
+        }), requestId);
+      }
+      const commitParams = request.method === "POST" && routeMatch(url.pathname, "/v1/memories/:id/commit");
+      if (commitParams) {
+        requireScope(identity, "memory:approve");
+        const current = vault.get(commitParams.id, { includeInactive: true });
+        if (!isVisibleTo(identity, current)) {
+          return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        }
+        const committed = vault.commit(commitParams.id, { actor: identity.principal_id });
+        let semantic_index = { indexed: false, reason: "semantic retrieval disabled" };
+        if (embedder) {
+          try { semantic_index = await engine.indexMemory(committed.id); }
+          catch (error) { semantic_index = { indexed: false, reason: error.message }; }
+        }
+        return json(response, 200, { ...committed, semantic_index }, requestId);
+      }
+      const memoryParams = routeMatch(url.pathname, "/v1/memories/:id");
+      const correctionParams = request.method === "POST" && routeMatch(url.pathname, "/v1/memories/:id/corrections");
+      if (correctionParams) {
+        requireScope(identity, "memory:admin");
+        const current = vault.get(correctionParams.id);
+        if (!isVisibleTo(identity, current)) {
+          return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        }
+        const body = await readJson(request);
+        const replacement = body.replacement || body;
+        validateWriteScope({ ...current, ...replacement }, identity);
+        return json(response, 200, vault.correct(correctionParams.id, replacement, body.reason || "api-correction"), requestId);
+      }
+      if (request.method === "GET" && memoryParams) {
+        requireScope(identity, "memory:read");
+        const current = vault.get(memoryParams.id);
+        if (!isVisibleTo(identity, current)) {
+          return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        }
+        return json(response, 200, current, requestId);
+      }
+      if (request.method === "DELETE" && memoryParams) {
+        requireScope(identity, "memory:admin");
+        const current = vault.get(memoryParams.id, { includeInactive: true });
+        if (!isVisibleTo(identity, current)) {
+          return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        }
+        return json(response, 200, vault.forget(memoryParams.id, "api-request"), requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/project-links") {
+        requireScope(identity, "memory:admin");
+        const body = await readJson(request);
+        if (!identity.allowed_projects.includes(body.source_project) || !identity.allowed_projects.includes(body.target_project)) {
+          throw Object.assign(new Error("both projects must be allowed for this caller"), { code: "FORBIDDEN" });
+        }
+        return json(response, 201, vault.linkProjects({ ...body, tenant_id: identity.tenant_id }), requestId);
+      }
+      if (request.method === "POST" && url.pathname === "/v1/memory-links") {
+        requireScope(identity, "memory:admin");
+        const body = await readJson(request);
+        const source = vault.get(body.source_memory_id, { includeInactive: true });
+        const target = vault.get(body.target_memory_id, { includeInactive: true });
+        if (!isVisibleTo(identity, source) || !isVisibleTo(identity, target)) {
+          return json(response, 404, { error: "memory not found", request_id: requestId }, requestId);
+        }
+        return json(response, 201, vault.linkMemories({ ...body, tenant_id: identity.tenant_id }), requestId);
+      }
+      return json(response, 404, { error: "route not found", request_id: requestId }, requestId);
+    } catch (error) {
+      metrics.errors += 1;
+      const status = errorStatus(error);
+      const message = status >= 500 ? "internal server error" : error.message;
+      return json(response, status, { error: message, request_id: requestId }, requestId);
+    }
+  });
+
+  server.requestTimeout = 15_000;
+  server.headersTimeout = 10_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxRequestsPerSocket = 1_000;
+
+  return {
+    server,
+    vault,
+    metrics,
+    async listen() {
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, host, resolve);
+      });
+      return server.address();
+    },
+    async close() {
+      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      vault.close();
+    },
+  };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const service = createContinuityServer();
+  const address = await service.listen();
+  process.stderr.write(`ContinuityDB listening on ${typeof address === "string" ? address : `${address.address}:${address.port}`}\n`);
+  const shutdown = async () => {
+    await service.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}

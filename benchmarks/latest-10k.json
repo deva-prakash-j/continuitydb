@@ -1,0 +1,19 @@
+{
+  "date": "2026-09-09",
+  "runtime": "Node.js v25.9.0 built-in node:sqlite",
+  "mode": "local SQLite WAL + FTS5; canonical file per record; proposal then commit",
+  "records": 10000,
+  "queries": 500,
+  "ingest_records_per_second": 281,
+  "search_ms": {
+    "p50": 0.178,
+    "p95": 0.283,
+    "p99": 0.436
+  },
+  "limitations": [
+    "Synthetic exact-symbol workload, not a retrieval-quality benchmark",
+    "Single warm local process",
+    "No semantic vector index or reranker",
+    "Hardware details were not normalized"
+  ]
+}

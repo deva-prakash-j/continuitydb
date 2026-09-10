@@ -1,0 +1,18 @@
+{
+  "date": "2026-09-09",
+  "version": "0.2.0",
+  "mode": "SQLite FTS5 with tenant, temporal, sensitivity, stale and branch filters plus fusion/MMR",
+  "records": 10000,
+  "queries": 500,
+  "ingest_records_per_second": 132,
+  "search_ms": {
+    "p50": 2.45,
+    "p95": 3.077,
+    "p99": 3.984
+  },
+  "notes": [
+    "Synthetic exact-symbol workload on the local development VM.",
+    "Each record used proposal and commit with canonical-file and hash-chained audit writes.",
+    "Not a production, distributed, semantic-quality, or concurrency claim."
+  ]
+}

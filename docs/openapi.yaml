@@ -1,0 +1,247 @@
+openapi: 3.1.0
+info:
+  title: ContinuityDB API
+  version: 0.3.0
+  description: Versioned API for governed, portable agent memory and context packs.
+servers:
+  - url: http://127.0.0.1:7331
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      operationId: health
+      responses:
+        "200": { description: Process is alive }
+  /readyz:
+    get:
+      operationId: readiness
+      responses:
+        "200": { description: Storage is queryable }
+  /v1/search:
+    post:
+      operationId: searchMemories
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: ACL-filtered results
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [results]
+                properties:
+                  results: { type: array, items: { $ref: "#/components/schemas/MemoryResult" } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/context-packs:
+    post:
+      operationId: buildContextPack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task: { type: string, minLength: 1 }
+                project_id: { type: string }
+                dependency_depth: { type: integer, minimum: 0, maximum: 5, default: 2 }
+                top_k: { type: integer, minimum: 1, maximum: 50, default: 8 }
+                token_budget: { type: integer, minimum: 64, maximum: 32000, default: 1200 }
+                branch: { type: string }
+                as_of: { type: string, format: date-time }
+                include_stale: { type: boolean, default: false }
+      responses:
+        "200": { description: Token-bounded cited context pack }
+  /v1/memories/proposals:
+    post:
+      operationId: proposeMemory
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string, maxLength: 512 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MemoryInput" }
+      responses:
+        "201": { description: Proposal created }
+        "200": { description: Existing idempotent proposal returned }
+  /v1/memories/captures:
+    post:
+      operationId: captureMemory
+      description: Server policy binds identity and returns active, proposed, or quarantined disposition.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string, maxLength: 512 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CaptureRequest" }
+      responses:
+        "201": { description: Capture evaluated and persisted }
+        "200": { description: Existing idempotent capture returned }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /v1/memories/{id}:
+    parameters:
+      - $ref: "#/components/parameters/MemoryId"
+    get:
+      operationId: getMemory
+      responses:
+        "200": { description: Active memory }
+        "404": { description: Not found in caller scope }
+    delete:
+      operationId: forgetMemory
+      responses:
+        "200": { description: Tombstoned; purge is an asynchronous policy action }
+  /v1/memories/{id}/commit:
+    post:
+      operationId: commitMemory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      responses:
+        "200": { description: Proposal activated and optional embedding indexed }
+  /v1/memories/{id}/corrections:
+    post:
+      operationId: correctMemory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [replacement]
+              properties:
+                reason: { type: string }
+                replacement: { $ref: "#/components/schemas/MemoryInput" }
+      responses:
+        "200": { description: New active version created; prior version superseded }
+  /v1/memories/{id}/feedback:
+    post:
+      operationId: recordMemoryFeedback
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signal]
+              properties:
+                signal: { type: string, enum: [helpful, incorrect, outdated] }
+                reason: { type: string, maxLength: 2000 }
+      responses:
+        "200": { description: Non-destructive feedback recorded }
+        "404": { description: Memory is not visible to this caller }
+  /v1/project-links:
+    post:
+      operationId: linkProjects
+      responses:
+        "201": { description: Project graph edge created }
+  /v1/memory-links:
+    post:
+      operationId: linkMemories
+      responses:
+        "201": { description: Temporal memory graph edge created }
+  /v1/stats:
+    get:
+      operationId: getTenantStats
+      responses:
+        "200": { description: Tenant-local counts and audit-chain status }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  parameters:
+    MemoryId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+  responses:
+    Unauthorized: { description: Missing or invalid bearer token }
+    Forbidden: { description: Caller lacks scope or project/sensitivity grant }
+  schemas:
+    SearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query: { type: string, minLength: 1 }
+        project_id: { type: string }
+        dependency_depth: { type: integer, minimum: 0, maximum: 5, default: 2 }
+        top_k: { type: integer, minimum: 1, maximum: 50, default: 8 }
+        token_budget: { type: integer, minimum: 64, maximum: 32000, default: 1200 }
+        branch: { type: string }
+        as_of: { type: string, format: date-time }
+        include_stale: { type: boolean, default: false }
+    MemoryInput:
+      type: object
+      required: [body, namespace_id]
+      properties:
+        body: { type: string, minLength: 1, maxLength: 1000000 }
+        title: { type: string, maxLength: 500 }
+        namespace_id: { type: string }
+        project_id: { type: string }
+        type: { type: string, default: fact }
+        subject_key: { type: string, maxLength: 200 }
+        sensitivity: { type: string, enum: [public, private, sensitive, restricted] }
+        source_type: { type: string }
+        source_uri: { type: string, maxLength: 2048 }
+        repo_path: { type: string }
+        symbol: { type: string }
+        git_commit: { type: string }
+        branch: { type: string }
+        tags: { type: array, maxItems: 64, items: { type: string } }
+        metadata: { type: object, additionalProperties: true }
+        valid_from: { type: string, format: date-time }
+        valid_to: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+    CaptureRequest:
+      type: object
+      required: [body, project_id]
+      additionalProperties: false
+      properties:
+        body: { type: string, minLength: 1, maxLength: 65536 }
+        title: { type: string, maxLength: 500 }
+        project_id: { type: string, minLength: 1, maxLength: 200 }
+        memory_kind: { type: string, enum: [working, inference, git-fact, decision], default: inference }
+        confidence: { type: number, minimum: 0, maximum: 1 }
+        importance: { type: number, minimum: 0, maximum: 1 }
+        sensitivity: { type: string, enum: [private, sensitive, restricted], default: private }
+        ttl_seconds: { type: integer, minimum: 300, maximum: 2592000 }
+        subject_key: { type: string, maxLength: 200 }
+        repo_path: { type: string, maxLength: 1024 }
+        symbol: { type: string, maxLength: 500 }
+        git_commit: { type: string, maxLength: 64 }
+        branch: { type: string, maxLength: 500 }
+        content_checksum: { type: string, pattern: "^[A-Fa-f0-9]{64}$" }
+        tags: { type: array, maxItems: 64, items: { type: string, maxLength: 200 } }
+        idempotency_key: { type: string, maxLength: 512 }
+        observed_at: { type: string, format: date-time }
+    MemoryResult:
+      type: object
+      required: [id, title, body, namespace_id, confidence, score, citation]
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string }
+        namespace_id: { type: string }
+        project_id: { type: [string, "null"] }
+        confidence: { type: number }
+        score: { type: number }
+        score_signals: { type: object, additionalProperties: { type: number } }
+        citation: { type: object, additionalProperties: true }
