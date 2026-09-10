@@ -193,6 +193,12 @@ async function runOnce(config, repetition) {
     for (let index = 0; index < config.records; index += 1) {
       const proposal = vault.propose(recordInput(index, config.tenants, config.projects));
       if (!proposal.duplicate) vault.commit(proposal.record.id);
+      if ((index + 1) % config.progressEvery === 0) {
+        const elapsedSeconds = (performance.now() - ingestStarted) / 1000;
+        process.stderr.write(
+          `ingested ${index + 1}/${config.records} records (${((index + 1) / elapsedSeconds).toFixed(2)} records/s cumulative)\n`,
+        );
+      }
     }
     const ingestMs = performance.now() - ingestStarted;
     const direct = directSearchBenchmark(vault, {
@@ -290,6 +296,7 @@ const config = {
   tenants: positiveInteger(args.tenants, 4, "tenants", 10_000),
   projects: positiveInteger(args.projects, 50, "projects", 10_000),
   warmup: positiveInteger(args.warmup, 50, "warmup", 10_000),
+  progressEvery: positiveInteger(args["progress-every"], 10_000, "progress-every", 1_000_000),
   concurrency: concurrencyValues(args.concurrency),
 };
 if (config.records < config.tenants) throw new Error("records must be at least the tenant count");

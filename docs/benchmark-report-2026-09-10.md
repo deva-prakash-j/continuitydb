@@ -74,3 +74,16 @@ stretch the embedded process.
 3. Add projection-freshness, duplicate-event and injected-failure scenarios.
 4. Expand quality evaluation to grounded semantic, stale/conflict and graph
    impact queries before any 100M or one-billion-record run.
+
+## 100k diagnostic attempt
+
+A follow-up 100k probe was deliberately interrupted before results were
+published. At 14 minutes 46 seconds it had ingested 39,024 records, was using
+99.2% of one CPU and occupied approximately 244 MB of temporary storage. This
+is not a completed benchmark point, but it demonstrates that canonical embedded
+ingestion degrades nonlinearly beyond the 10k corpus on this machine.
+
+The incomplete temporary corpus was deleted and no partial JSON result was
+committed. The harness now prints cumulative ingest progress. The next 100k run
+should include CPU/flamegraph and SQLite/filesystem attribution before being
+repeated three times.

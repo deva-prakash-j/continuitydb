@@ -13,6 +13,7 @@ npm run benchmark:scale -- \
   --operations=500 \
   --repetitions=3 \
   --concurrency=1,8,32 \
+  --progress-every=10000 \
   --output=benchmarks/results/embedded-10k.json
 ```
 
@@ -21,6 +22,9 @@ canonical ingestion and direct retrieval, then drives the HTTP service with a
 75% search, 15% context-pack and 10% automatic-capture workload. It reports all
 individual runs as well as medians, tail latency, failures, isolation violations,
 storage and process memory.
+
+Long corpus builds emit cumulative ingestion progress to stderr so nonlinear
+degradation is visible before a scale rung consumes hours.
 
 The service rate limiter is deliberately bypassed for this capacity test. Rate
 limit behavior remains covered by security tests and must be benchmarked as a
