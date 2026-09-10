@@ -1,251 +1,558 @@
 # ContinuityDB
 
-**Portable, Git-grounded context graph for AI agents.**
+[![CI](https://github.com/deva-prakash-j/continuitydb/actions/workflows/ci.yml/badge.svg)](https://github.com/deva-prakash-j/continuitydb/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Node.js 22.5+](https://img.shields.io/badge/node-%3E%3D22.5-339933?logo=node.js&logoColor=white)](package.json)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status)
 
-ContinuityDB keeps useful engineering context across repositories, sessions,
-IDEs, agents and model providers. It retrieves a small, cited context pack from
-lexical, semantic and dependency-graph signals while enforcing tenant, project,
-sensitivity and temporal boundaries before content is returned.
+**Portable, Git-grounded context continuity for AI agents.**
 
-> Status: **v0.3 alpha.** Embedded mode is executable and tested. A partitioned
-> PostgreSQL/pgvector schema and global-scale design are included, but a
-> billion-record deployment has not been load-proven. See
-> [Scalability](docs/scalability.md).
+ContinuityDB lets useful engineering context survive a new chat, repository,
+IDE, coding agent, or model provider. Agents retrieve a small, cited context
+pack from lexical, semantic, and dependency-graph signals while tenant, owner,
+project, sensitivity, and temporal boundaries are enforced before content is
+returned.
 
-## Why this exists
+## Project status
 
-An AI coding client usually knows the open repository and current conversation.
-It often loses the decision made last week, the dependency living in another
-repository, the release order, or the branch/commit that made a fact true.
-Changing clients makes that context gap worse.
+> **Project status:** v0.3 alpha. The embedded SQLite/FTS5 mode is implemented,
+> tested, and suitable for local evaluation. The repository includes a
+> PostgreSQL/pgvector reference schema and distributed architecture, but the
+> production adapter and billion-record proof do not exist yet.
 
-ContinuityDB makes memory an independent evidence service:
+## The problem
+
+Coding agents usually understand the open repository and current conversation.
+They often lose context that lives elsewhere:
+
+- an API contract decision made in another repository;
+- a release order agreed in a previous session;
+- the downstream effect of a schema or event change;
+- a correction learned by a different agent or IDE;
+- the commit, path, and symbol that make a recalled fact verifiable.
+
+Repository-local instructions help inside one codebase. Conversation memory
+helps inside one provider. ContinuityDB is an independent evidence layer that
+can be shared by authorized agents without making the model provider the source
+of truth.
 
 ```text
-Copilot / Codex / Claude / Gemini / OpenClaw / custom agents
-                              |
-                         MCP or HTTP
-                              |
-      identity + ACL -> hybrid retrieval -> cited context pack
-                              |
-          canonical records + lexical/vector/graph indexes
+Copilot / Codex / Claude / Cursor / Gemini / OpenClaw / custom agents
+                                  |
+                             MCP or HTTP
+                                  |
+                    server-owned identity and policy
+                                  |
+              lexical + semantic + dependency graph retrieval
+                                  |
+                    small, cited, token-bounded context pack
+                                  |
+          canonical records + rebuildable search/vector/graph indexes
 ```
 
-## What is implemented
+## What ContinuityDB is—and is not
 
-- local SQLite WAL store and FTS5/BM25 code-aware lexical search;
+| ContinuityDB is | ContinuityDB is not |
+|---|---|
+| A provider-neutral memory and context service for agents | A replacement for an LLM or coding agent |
+| A Git-aware evidence store with citations and validity | A raw transcript archive |
+| A policy-controlled automatic capture system | Permission for agents to approve or delete their own memory |
+| A local-first embedded runtime with a distributed contract | A billion-scale database proven by a laptop benchmark |
+| A source of untrusted evidence for agent reasoning | An authorization or prompt-policy channel |
+
+## Core use cases
+
+### Cross-session continuity
+
+An agent captures a project-scoped implementation constraint. A later session
+recalls it without copying the old conversation.
+
+### Cross-repository dependency work
+
+Link an API repository to its schema or event producer. Queries from the API
+project can retrieve explicitly allowed dependency context with source citations.
+
+### Cross-agent and cross-provider handoff
+
+Multiple authenticated agents use different `principal_id` and `agent_id`
+values while sharing the same stable `owner_id`. This preserves attribution
+without fragmenting the owner's memory.
+
+### Governed organizational memory
+
+Tenant, project, sensitivity, lifecycle, temporal, and provenance controls keep
+retrieval bounded. Personal and employer data should still use separate stores
+and credentials when their trust domains differ.
+
+## Implemented in v0.3
+
+### Retrieval
+
+- SQLite WAL and FTS5/BM25 lexical retrieval for identifiers, paths, errors, and keywords;
 - optional Ollama or OpenAI-compatible embeddings;
-- Reciprocal Rank Fusion, graph expansion, freshness/trust/scope boosts and MMR;
-- tenant, shared-owner, principal, agent, namespace, project and sensitivity scopes;
-- bi-temporal validity fields, expiry, supersession, correction and tombstones;
-- project dependency edges and typed memory graph edges;
-- Git commit/branch/path/symbol citations;
-- policy-controlled automatic capture plus explicit proposal -> approval lifecycle;
-- MCP tools for search, context packs, bounded capture and non-destructive feedback;
-- versioned HTTP API with server-bound identity, rate limits and safe defaults;
-- CLI for setup, diagnostics, lifecycle, graph links, export and repository scan;
-- tracked-file Git scanner with incremental mode, path containment and secret-path denylist;
-- tamper-evident local audit chain and verification;
-- PostgreSQL/pgvector partition schema for the next distributed adapter;
-- security threat model, OpenAPI contract, CI and a non-root container.
+- bounded exact vector scan for embedded mode;
+- project dependency closure and typed memory-graph expansion;
+- Reciprocal Rank Fusion across lexical, semantic, and graph candidates;
+- project proximity, confidence, importance, freshness, exact-score, and bounded feedback signals;
+- Maximal Marginal Relevance to reduce duplicate context;
+- branch, validity-time, expiry, stale-state, and token-budget controls;
+- repo/path/symbol/commit/branch citations in every returned memory.
 
-The full competitor-derived capability map and deliberate exclusions are in
-[competitive research](docs/competitive-research-2026-09-09.md).
+### Memory lifecycle
 
-## Quick start
+- proposed, active, quarantined, superseded, and tombstoned statuses plus TTL expiry;
+- risk-based automatic agent capture;
+- explicit proposal and separate approval flow;
+- correction by supersession rather than silent overwrite;
+- per-principal helpful/incorrect/outdated feedback;
+- tenant/owner/namespace/agent-scoped idempotency keys;
+- canonical human-readable records and rebuildable indexes;
+- JSONL export and index rebuild support;
+- SHA-256 hash-chained local audit log with verification.
 
-Requires Node.js 22.5 or newer.
+### Interfaces and operations
+
+- four agent-facing MCP tools;
+- versioned HTTP API with server-bound identity and scoped authorization;
+- CLI for setup, health checks, capture, lifecycle, retrieval, graph links,
+  repository scanning, export, statistics, and audit verification;
+- Git tracked-file scanner with incremental mode, path containment, symlink
+  rejection, file limits, and a secret-path denylist;
+- OpenAPI contract, tests, benchmarks, CI, non-root container, threat model,
+  security policy, contribution guide, and governance document;
+- 64-partition PostgreSQL/pgvector reference migrations with owner-aware row-level security.
+
+See the [architecture](docs/architecture.md) and
+[competitor-derived capability review](docs/competitive-research-2026-09-09.md)
+for design details and deliberate exclusions.
+
+## Quick start from source
+
+ContinuityDB has not been documented here as a published npm package. Install
+the current repository source so the command you run matches the audited code.
+Node.js 22.5 or newer is required.
 
 ```bash
-npm install
+git clone https://github.com/deva-prakash-j/continuitydb.git
+cd continuitydb
+npm ci
 npm link
-continuitydb init --home "$PWD/.continuitydb"
-continuitydb doctor --home "$PWD/.continuitydb"
+
+continuitydb init --home "$PWD/.continuitydb-demo"
+continuitydb doctor --home "$PWD/.continuitydb-demo"
 ```
 
-Propose, approve and search a memory:
+All finite CLI commands emit JSON. `serve` and `mcp` remain attached until the
+process receives `SIGINT` or `SIGTERM`.
+
+## Try automatic context transfer
+
+Agent A captures short-lived working context. Server policy—not the agent—sets
+its source trust, scope, status, and maximum lifetime.
 
 ```bash
-continuitydb propose \
-  --home "$PWD/.continuitydb" \
+CONTINUITYDB_OWNER_ID=demo-user \
+CONTINUITYDB_AGENT_ID=agent-a \
+continuitydb capture \
+  --home "$PWD/.continuitydb-demo" \
   --project charge-api \
+  --kind working \
   --body "Publish charge-schema before regenerating the charge-api client" \
   --idempotency-key charge-release-order-v1
-
-continuitydb commit MEMORY_ID --home "$PWD/.continuitydb"
-
-continuitydb search "schema release order" \
-  --home "$PWD/.continuitydb" \
-  --project charge-api
 ```
 
-`propose` never enters recall until a separate `commit`. Agents use `memory_capture`:
-the server—not the model—binds identity and decides whether a capture becomes
-active, proposed or quarantined. MCP never exposes commit, correct, delete, link,
-scope changes or rebuild operations.
-
-## Automatic agent memory
-
-The same stable `CONTINUITYDB_OWNER_ID` lets multiple authenticated agents share
-memory while `CONTINUITYDB_PRINCIPAL_ID` and `CONTINUITYDB_AGENT_ID` preserve actor
-attribution. Capture promotion is risk-based:
-
-| Capture | Default outcome |
-|---|---|
-| Project working context | active with a policy-capped TTL |
-| High-confidence project inference with a stable `subject_key` | active with a policy-capped TTL |
-| Exact Git excerpt verified against an allowed local ref, path and SHA-256 | active and durable |
-| Global memory or decision | proposed for review |
-| Conflict on the same live subject or high-sensitivity content | quarantined |
-| Credential-like content or forbidden scope | rejected before persistence |
-
-Copy [the capture policy example](examples/capture-policy.example.json) to a
-private `0600` file. Project roots should be read-only mounts in production.
-
-## Connect any MCP client
-
-Start the stdio server:
+Agent B, or a new session/provider using the same owner, can recall it:
 
 ```bash
-CONTINUITYDB_TENANT_ID=personal \
+CONTINUITYDB_OWNER_ID=demo-user \
+CONTINUITYDB_AGENT_ID=agent-b \
+continuitydb context "What is the release order?" \
+  --home "$PWD/.continuitydb-demo" \
+  --project charge-api \
+  --allow-projects charge-api
+```
+
+Working memory expires automatically. Durable decisions and unverified claims
+do not become active through this path without the required policy outcome.
+
+## Automatic capture policy
+
+The default policy promotes memory according to risk rather than requiring a
+human for every write:
+
+| Capture type | Default disposition |
+|---|---|
+| Project working context | Active with a policy-capped TTL, default maximum 24 hours |
+| High-confidence project inference with stable `subject_key` | Active with a policy-capped TTL, default maximum 7 days |
+| Exact Git excerpt with allowed ref, reachable commit, safe path, and matching SHA-256 | Active and durable when confidence meets policy |
+| Low-confidence inference or unverifiable Git claim | Proposed for review |
+| Global memory or agent-observed decision | Proposed for review |
+| Conflicting subject or sensitive/restricted content | Quarantined |
+| Credential-like content, forbidden project, or invalid scope | Rejected before persistence |
+
+Agents cannot choose their tenant, owner, namespace, final status, trusted
+source type, or approval state. Copy
+[`examples/capture-policy.example.json`](examples/capture-policy.example.json)
+to a private `0600` file and mount configured repositories read-only.
+
+## Connect an MCP client
+
+After the source installation, start the stdio server with a stable owner and a
+distinct identity for each agent:
+
+```bash
+CONTINUITYDB_TENANT_ID=example-org \
 CONTINUITYDB_PRINCIPAL_ID=copilot-agent-1 \
-CONTINUITYDB_OWNER_ID=deva \
+CONTINUITYDB_OWNER_ID=example-user \
 CONTINUITYDB_AGENT_ID=copilot \
-CONTINUITYDB_ALLOWED_PROJECTS=charge-api,charge-schema \
+CONTINUITYDB_ALLOWED_PROJECTS=service-a,schema-a \
+CONTINUITYDB_ALLOWED_SENSITIVITIES=public,private \
 CONTINUITYDB_CAPTURE_POLICY_FILE=/absolute/private/path/capture-policy.json \
 continuitydb mcp --home /absolute/private/path/continuitydb-data
 ```
 
-Use [the VS Code example](examples/mcp.vscode.example.json) for Copilot-compatible
-configuration. Employers may disable custom MCP servers. Never ingest employer
-code unless policy permits it; keep employer and personal tenants/stores separate.
+The MCP surface is intentionally small:
 
-## HTTP service
+| Tool | Purpose | Can change lifecycle or permissions? |
+|---|---|---|
+| `memory_search` | Retrieve approved, scoped memories | No |
+| `memory_context_pack` | Build a cited, token-budgeted pack for a task | No |
+| `memory_capture` | Submit memory through server-side risk policy | Cannot approve, delete, correct, or change scope |
+| `memory_feedback` | Mark a visible memory helpful, incorrect, or outdated | No; ranking influence is bounded |
 
-Local service:
+Use [`examples/mcp.vscode.example.json`](examples/mcp.vscode.example.json) as a
+VS Code/Copilot-compatible starting point. Other clients can launch the same
+stdio command using their MCP configuration format.
+
+Employers may disable custom MCP servers. Do not ingest employer repositories
+or context unless organizational policy explicitly permits it.
+
+## Link projects and retrieve dependency context
+
+Project edges are explicit, directed, tenant-scoped, and constrained by the
+caller's project allowlist.
 
 ```bash
-continuitydb serve --home /absolute/private/path/continuitydb-data
+continuitydb link-project charge-api charge-schema \
+  --home "$PWD/.continuitydb-demo" \
+  --relation depends-on \
+  --provenance "charge-api build manifest"
+
+continuitydb context "What changes after the schema contract changes?" \
+  --home "$PWD/.continuitydb-demo" \
+  --project charge-api \
+  --allow-projects charge-api,charge-schema \
+  --depth 2
 ```
 
-- `GET /healthz`
-- `GET /readyz`
-- `POST /v1/search`
-- `POST /v1/context-packs`
-- controlled capture/feedback and proposal/approval/get/forget/graph administration under `/v1`
-- `GET /metrics`
+Supported traversal relations currently include `depends-on`, `calls`,
+`consumes`, and `imports`. Memory-to-memory edges can represent relationships
+such as `supersedes`, `derived-from`, or application-defined typed relations.
 
-See [OpenAPI](docs/openapi.yaml). Loopback mode can use the local identity. A
-non-loopback bind refuses to start unless a SHA-256 token policy is mounted and
-trusted-proxy TLS termination is explicitly configured. Production deployments
-should replace static tokens with OIDC or mTLS.
+## CLI reference
 
-## Semantic retrieval
+Run `continuitydb help` for the concise built-in usage text.
 
-Semantic retrieval is opt-in; lexical + graph retrieval remains available
-without a model or network call.
+| Command | Purpose |
+|---|---|
+| `init` | Create a private local data directory and embedded database |
+| `doctor` | Check Node version, directory permissions, SQLite/FTS5, and audit-chain health |
+| `serve` | Start the HTTP service |
+| `mcp` | Start the stdio MCP server |
+| `propose` | Create a memory that remains invisible to recall |
+| `capture` | Apply automatic capture policy as an agent identity |
+| `commit` | Activate a proposed memory through the trusted CLI/admin path |
+| `correct` | Create an active replacement and supersede the old version |
+| `search` | Retrieve ranked memories |
+| `context` | Build a cited, token-budgeted context pack |
+| `link-project` | Add a typed project dependency edge |
+| `link-memory` | Add a typed memory edge |
+| `feedback` | Record bounded helpful/incorrect/outdated feedback |
+| `forget` | Tombstone a memory and remove it from recall |
+| `stats` | Show lifecycle, graph, feedback, and audit counts for one tenant |
+| `export` | Emit all canonical records as JSONL or create a new private output file |
+| `audit-verify` | Verify the local audit hash chain |
+| `repo-scan` | Safely inspect tracked repository files and optionally ingest records |
 
-For a local Ollama-compatible endpoint, configure the provider and model in the
-service environment. For an OpenAI-compatible endpoint, configure its URL, model,
-and the **name** of the host-injected secret environment entry. ContinuityDB reads
-that entry without logging it. Remote embedding endpoints require explicit opt-in
-and HTTPS.
-
-The embedded engine performs a bounded exact vector scan, appropriate only for
-local corpora. Team/global deployments must use pgvector or a sharded ANN adapter.
+Administrative CLI access is a trusted local boundary. Do not expose arbitrary
+CLI execution to an agent merely because the MCP tools are restricted.
 
 ## Repository ingestion
 
-Preview a safe tracked-file scan:
+Preview a tracked-file scan without persisting records:
 
 ```bash
-continuitydb repo-scan /absolute/path/to/repo --project charge-api
+continuitydb repo-scan /absolute/path/to/repo \
+  --project charge-api \
+  --include-records
 ```
 
-Create proposals (still invisible to recall), or send scanner output through a
-trusted capture worker:
+Create proposals that remain invisible to recall:
 
 ```bash
-continuitydb repo-scan /absolute/path/to/repo --project charge-api --ingest
+continuitydb repo-scan /absolute/path/to/repo \
+  --home "$PWD/.continuitydb-demo" \
+  --project charge-api \
+  --ingest
 ```
 
-Add `--since COMMIT` for incremental scans. `--commit` is an explicit bulk
-approval action. v0.2 extracts common symbols and package manifests without
-executing repository code; sandboxed Tree-sitter workers are the next precision
-upgrade.
+`--ingest --commit` is an explicit bulk approval action. Add `--since COMMIT`
+for incremental scans. Limits can be set with `--max-files` and
+`--max-file-bytes`; use `--no-docs` to omit documentation files.
 
-## Retrieval contract
+The scanner does not execute repository code. v0.3 uses bounded pattern-based
+symbol and manifest extraction; sandboxed Tree-sitter workers remain planned.
 
-1. Resolve server-owned tenant/principal/project policy.
-2. Filter status, sensitivity, project closure, branch, validity, expiry and stale state.
-3. Retrieve lexical and optional semantic candidates.
-4. Expand bounded graph neighbors.
-5. Fuse with RRF and apply scope, trust and freshness signals.
-6. Remove redundant candidates with MMR.
-7. Pack within the caller token budget and return source citations.
+## HTTP API
 
-Memory text is always marked as untrusted evidence. It never grants tool
-permission or becomes executable policy.
+Start a loopback-only local service:
 
-## Test and benchmark
+```bash
+CONTINUITYDB_ALLOWED_PROJECTS=charge-api,charge-schema \
+continuitydb serve \
+  --home "$PWD/.continuitydb-demo" \
+  --host 127.0.0.1 \
+  --port 7331
+```
+
+| Endpoint | Required scope |
+|---|---|
+| `GET /healthz` | Public liveness only |
+| `GET /readyz` | Authenticated identity |
+| `POST /v1/search`, `POST /v1/context-packs`, `GET /v1/memories/{id}` | `memory:read` |
+| `POST /v1/memories/captures` | `memory:capture` |
+| `POST /v1/memories/{id}/feedback` | `memory:feedback` |
+| `POST /v1/memories/proposals` | `memory:propose` |
+| `POST /v1/memories/{id}/commit` | `memory:approve` |
+| corrections, deletion, graph links, and stats | `memory:admin` |
+| `GET /metrics` | `metrics:read` |
+
+The complete request and response contract is in
+[`docs/openapi.yaml`](docs/openapi.yaml).
+
+Loopback mode can use its configured local identity. A non-loopback bind refuses
+to start without both a private token-policy file containing only SHA-256 token
+digests and `CONTINUITYDB_TRUST_PROXY_TLS=true`. Set that flag only when a
+trusted reverse proxy actually terminates TLS. Static tokens are an alpha
+adapter; production deployments need OIDC or mTLS.
+
+`memory:capture`, `memory:propose`, `memory:approve`, and `memory:admin` are
+separate authorities. `memory:admin` is privileged and satisfies all scope
+checks; do not assign it to agent identities.
+
+## Configuration reference
+
+### Identity, storage, and service
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTINUITYDB_HOME` | `./.continuitydb` | Canonical records, embedded index, and audit location |
+| `CONTINUITYDB_HOST` | `127.0.0.1` | HTTP bind address |
+| `CONTINUITYDB_PORT` | `7331` | HTTP port |
+| `CONTINUITYDB_TENANT_ID` | `local` | Server-owned tenant scope |
+| `CONTINUITYDB_PRINCIPAL_ID` | `local-user` or `local-agent` by interface | Authenticated caller attribution |
+| `CONTINUITYDB_OWNER_ID` | principal ID | Stable memory owner shared across authorized agents |
+| `CONTINUITYDB_AGENT_ID` | principal ID or unset by interface | Originating agent attribution |
+| `CONTINUITYDB_ALLOWED_PROJECTS` | empty | Comma-separated project allowlist |
+| `CONTINUITYDB_ALLOWED_SENSITIVITIES` | `public,private` | Comma-separated sensitivity allowlist |
+| `CONTINUITYDB_CAPTURE_POLICY_FILE` | unset | Private JSON capture-policy path |
+| `CONTINUITYDB_TOKEN_POLICY_FILE` | unset | Private HTTP token-policy path containing token digests |
+| `CONTINUITYDB_TRUST_PROXY_TLS` | `false` | Assert trusted TLS termination for non-loopback service |
+| `CONTINUITYDB_MAX_BODY_BYTES` | `1048576` | Maximum HTTP request body size |
+| `CONTINUITYDB_MCP_CAPTURE_BURST` | `30` | MCP capture/feedback token-bucket capacity |
+| `CONTINUITYDB_MCP_CAPTURE_PER_SECOND` | `0.5` | MCP capture limiter refill rate |
+
+Policy files must not be readable or writable by group or other users. See the
+[capture-policy](examples/capture-policy.example.json) and inert
+[token-policy](examples/token-policy.example.json) shapes. Never commit usable
+credentials or raw tokens.
+
+### Optional semantic embeddings
+
+Lexical plus graph retrieval works without an embedding model or network call.
+
+| Variable | Values / purpose |
+|---|---|
+| `CONTINUITYDB_EMBEDDING_PROVIDER` | `none`, `ollama`, or `openai-compatible` |
+| `CONTINUITYDB_EMBEDDING_MODEL` | Provider model identifier; required when enabled |
+| `CONTINUITYDB_EMBEDDING_ENDPOINT` | Ollama defaults to loopback `/api/embed`; required for OpenAI-compatible mode |
+| `CONTINUITYDB_EMBEDDING_DIMENSIONS` | Optional requested dimensions for OpenAI-compatible providers |
+| `CONTINUITYDB_EMBEDDING_API_KEY_ENV` | Name of a host-injected environment entry containing the provider credential |
+| `CONTINUITYDB_ALLOW_REMOTE_EMBEDDINGS` | Must be `true` for a non-loopback endpoint |
+
+Remote embedding endpoints must use HTTPS. Endpoint URLs cannot contain
+credentials, query strings, or fragments. ContinuityDB reads the configured
+host-injected credential entry without logging it.
+
+The embedded vector path is a bounded exact scan, not an ANN database. Team and
+distributed deployments must use pgvector or a sharded vector backend with
+filter-before-return isolation tests.
+
+## Data model and retrieval contract
+
+Every canonical record includes:
+
+- **identity:** tenant, shared owner, and originating agent;
+- **scope:** namespace, project, branch, and sensitivity;
+- **content:** type, title, body, tags, and structured metadata;
+- **source:** source type/URI, repository path, symbol, and Git commit;
+- **time:** valid-from, valid-to, observed, created, updated, and expiry times;
+- **quality:** confidence, importance, stale state, feedback, and version;
+- **lifecycle:** status, supersession, content hash, and idempotency key.
+
+Retrieval follows this order:
+
+1. Resolve server-owned tenant, principal, owner, agent, project, and sensitivity policy.
+2. Compute bounded project dependency closure inside the caller allowlist.
+3. Filter lifecycle, scope, branch, validity, expiry, and stale state in each retriever.
+4. Retrieve lexical and optional semantic candidates.
+5. Expand bounded graph neighbors.
+6. Fuse ranks with RRF and apply scope, trust, freshness, exact-score, and feedback signals.
+7. Remove redundant evidence with MMR.
+8. Pack within the caller's token budget and return citations plus score signals.
+
+Every context pack warns that recalled memory is untrusted evidence. It never
+grants tool permission or becomes executable policy.
+
+## Storage and recovery
+
+Embedded mode stores canonical Markdown records separately from SQLite indexes.
+The index can be rebuilt from canonical records. Audit events are appended to a
+hash-chained JSONL file. `continuitydb export` provides a portable JSONL snapshot.
+
+Use an encrypted filesystem or volume, restrict the data directory to its owner,
+and back up the full data directory while the writer is stopped. Application-level
+encryption and remote signed audit checkpoints are not implemented in v0.3.
+
+## Deployment and scale
+
+| Mode | Intended envelope | Status |
+|---|---:|---|
+| Embedded SQLite/FTS5 | One developer, tens of agents, curated local corpus | Implemented and tested; synchronous mixed-write saturation is documented |
+| Team PostgreSQL/pgvector | Hundreds of agents, tens of millions of records | Reference migrations only; runtime adapter pending |
+| Distributed routed indexes | 10–20k+ agents, hundreds of millions to billions | Architecture target; not benchmark-proven |
+
+The container image runs as UID/GID `10001` and includes a health check. Its
+default non-loopback bind intentionally requires authentication policy and a
+real trusted TLS proxy; a successful image build alone is not deployment proof.
+
+Read [`docs/scalability.md`](docs/scalability.md) before making capacity claims.
+
+## Benchmarks
+
+Run functional quality and local capacity suites:
 
 ```bash
 npm test
-npm run benchmark
 npm run benchmark:quality
 npm run benchmark:scale
-# With a configured real embedding provider:
+
+# Requires a configured real embedding provider
 npm run benchmark:hybrid
+
+# Tests, OpenAPI parse, quality baseline, dependency audit, and package check
 npm run release:check
 ```
 
-The original 10k synthetic lexical baseline was p95 **0.283 ms**, with 9/9 exact
-Recall@5, 0/5 semantic Recall@5, and zero leaks in two scope probes. Those are
-local synthetic results, not production claims. v0.2 adds hybrid plumbing and
-security filters: its equivalent 10k run measured p50 **2.450 ms**, p95
-**3.077 ms**, p99 **3.984 ms**, and 132 proposal+commit records/second. v0.3's
-equivalent run, including feedback aggregation, measured p50 **2.098 ms**, p95
-**2.311 ms**, p99 **3.721 ms**, and 138 records/second. The
-additional isolation, temporal, graph-fusion and audit work is visible in the
-latency rather than hidden. A configured real embedding model and a distributed
-load harness are required before publishing semantic or billion-scale claims.
+### Current measured evidence
 
-The first repeatable v0.3 mixed-workload run used 10k memories, four tenants,
-three repetitions and 1/8/32 concurrent HTTP clients. It produced zero misses,
-zero isolation violations and zero HTTP failures. Median throughput plateaued at
-roughly 130 operations/second; at 32 clients, search p95 was **284.101 ms**,
-context-pack p95 **506.872 ms**, and automatic-capture p95 **743.367 ms**. This
-is evidence that the synchronous embedded service saturates under write-mixed
-concurrency, not a distributed-scale claim. See the
-[benchmark report](docs/benchmark-report-2026-09-10.md) and
-[raw result](benchmarks/results/embedded-10k-2026-09-10.json).
+The repeatable v0.3 mixed-workload benchmark used 10,000 memories across four
+tenants and 50 projects, three full repetitions, and a traffic mix of 75% search,
+15% context-pack, and 10% automatic capture.
 
-Raw baseline output is under [`benchmarks/`](benchmarks/). Required global-scale
-gates are defined in [Scalability](docs/scalability.md).
+| Concurrent HTTP clients | Median throughput | Search p95 | Context-pack p95 | Capture p95 |
+|---:|---:|---:|---:|---:|
+| 1 | 132.96 ops/s | 8.554 ms | 9.112 ms | 16.405 ms |
+| 8 | 135.31 ops/s | 71.330 ms | 75.257 ms | 76.447 ms |
+| 32 | 128.34 ops/s | 284.101 ms | 506.872 ms | 743.367 ms |
 
-## Security
+Across the three runs:
 
-Read [SECURITY.md](SECURITY.md) and the [threat model](docs/threat-model.md) before
-network deployment. Important defaults:
+- median canonical ingest: **161.44 records/s**;
+- median direct-search p95: **6.334 ms**;
+- worst direct-search p99: **7.895 ms**;
+- retrieval misses: **0**;
+- tenant-isolation violations: **0**;
+- HTTP failures: **0**.
 
-- loopback bind;
-- non-root container;
-- server-bound tenant, owner, principal and agent identity plus allowlists;
-- request, graph-depth, candidate and vector limits;
-- hash-only static token policy;
-- credential-pattern rejection and secret-path denylist;
-- split capture/approve/admin authority and policy-capped automatic writes;
-- hash-chained audit log;
-- fail-closed remote/TLS startup checks.
+Throughput plateaued while tail latency grew with concurrency. This is evidence
+that the single-process synchronous embedded path saturates; it is not a
+distributed-scale result. A diagnostic 100k attempt reached 39,024 records in
+14 minutes 46 seconds at 99.2% of one CPU before it was deliberately stopped,
+showing nonlinear canonical-ingest degradation that must be profiled and fixed.
 
-Local application-level encryption is not yet implemented. Use encrypted volumes
-and a host secret manager.
+Without an embedding provider, the current lexical fixture achieves 9/9 exact
+Recall@5 and 0/5 semantic Recall@5 with zero isolation leaks. Hybrid quality must
+be reported only with the model, dimensions, dataset, and raw results attached.
+
+See the [methodology and verdict](docs/benchmark-report-2026-09-10.md),
+[raw 10k result](benchmarks/results/embedded-10k-2026-09-10.json), and
+[benchmark instructions](benchmarks/README.md).
+
+## Security model
+
+Important shipped controls include:
+
+- loopback default and fail-closed non-loopback startup;
+- server-bound identity, allowlists, and split capture/approve/admin authority;
+- filter-before-return tenant, owner, project, and sensitivity isolation;
+- bounded request size, graph depth, candidate counts, vector dimensions, timeouts, and capture rates;
+- recursive credential-pattern rejection and repository secret-path denylist;
+- Git commit/ref/path/checksum/excerpt validation for durable Git facts;
+- idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
+- hash-chained audit log and verifier;
+- pinned lockfile, minimal dependencies, CI audit, and non-root container.
+
+Known gaps include static-token lifecycle, application-level encryption,
+complete DLP, precise AST parsing, signed audit checkpoints, Git staleness
+projection, distributed purge acknowledgement, and production OIDC/mTLS.
+
+Read [`SECURITY.md`](SECURITY.md) and the
+[threat model](docs/threat-model.md) before network deployment. Report
+vulnerabilities through GitHub's private security-advisory feature, not a public
+issue.
+
+## Current limitations
+
+- Alpha APIs and record formats may change before 1.0.
+- Embedded writes and queries share one synchronous process.
+- Semantic retrieval is opt-in and has no default model bundled.
+- The local vector path is an exact bounded scan, not billion-scale ANN.
+- PostgreSQL migrations are a reference contract; no production adapter is wired yet.
+- Repository symbol extraction is pattern-based rather than AST-precise.
+- Regex credential detection reduces common accidents but is not complete DLP.
+- Local data relies on host/volume encryption.
+- OIDC/mTLS, projector freshness, distributed deletion, and chaos-tested failover remain pending.
+
+The active roadmap is maintained in [`CHANGELOG.md`](CHANGELOG.md). Contributions
+that close a documented limitation with tests and evidence are especially welcome.
+
+## Project documentation
+
+| Document | Purpose |
+|---|---|
+| [Architecture](docs/architecture.md) | Embedded and distributed design, record model, retrieval, consistency |
+| [OpenAPI](docs/openapi.yaml) | Versioned HTTP contract |
+| [Scalability](docs/scalability.md) | Deployment envelopes, invariants, sharding plan, scale gates |
+| [Threat model](docs/threat-model.md) | Assets, boundaries, threats, shipped controls, production requirements |
+| [Benchmark report](docs/benchmark-report-2026-09-10.md) | Reproduction, hardware, raw metrics, saturation verdict |
+| [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
+| [Security policy](SECURITY.md) | Supported line and private reporting process |
+| [Contributing](CONTRIBUTING.md) | Development and pull-request expectations |
+| [Governance](GOVERNANCE.md) | Maintainer and decision model |
+| [Code of Conduct](CODE_OF_CONDUCT.md) | Community participation rules |
 
 ## Contributing
 
-Issues and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md),
-[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md), and [SECURITY.md](SECURITY.md).
+Issues and pull requests are welcome. Please include a reproducible test or
+benchmark for behavior and performance changes. Avoid real employer code,
+credentials, private memory, or raw conversation exports in fixtures and issue
+reports.
+
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md),
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and [`GOVERNANCE.md`](GOVERNANCE.md)
+before contributing.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0. See [`LICENSE`](LICENSE).
