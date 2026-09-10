@@ -149,18 +149,33 @@ continuitydb doctor --home "$PWD/.continuitydb-demo"
 All finite CLI commands emit JSON. `serve` and `mcp` remain attached until the
 process receives `SIGINT` or `SIGTERM`.
 
-Enable the built-in semantic model without sending memory text to a provider:
+ContinuityDB starts in lexical-plus-graph mode. To enable local semantic
+retrieval without sending memory or query text to a provider, prefetch the
+pinned model, switch the provider to `local`, and backfill existing active
+memories:
 
 ```bash
 continuitydb embeddings-pull --home "$PWD/.continuitydb-demo"
 
 CONTINUITYDB_EMBEDDING_PROVIDER=local \
+CONTINUITYDB_LOCAL_MODEL_OFFLINE=true \
 continuitydb embeddings-index --home "$PWD/.continuitydb-demo"
 ```
 
-The first command downloads only the pinned 34.2 MB quantized model and
-vocabulary, verifies their SHA-256 digests, and caches them privately. Use
-`npm ci --omit=optional` for a smaller lexical/graph-only installation.
+The pull downloads the pinned 34.2 MB quantized model and vocabulary, verifies
+their SHA-256 digests, and caches them privately below the selected home. New
+active memories are embedded automatically whenever the running CLI, MCP, or
+HTTP process also has `CONTINUITYDB_EMBEDDING_PROVIDER=local`. Keep
+`CONTINUITYDB_LOCAL_MODEL_OFFLINE=true` after the pull to prevent runtime
+downloads. Use `npm ci --omit=optional` for a smaller lexical/graph-only
+installation that excludes the WASM inference runtime.
+
+| Retrieval mode | Setup | Text leaves the host? | Intended use |
+|---|---|---:|---|
+| Lexical + graph | Default; optional dependencies may be omitted | No | Exact identifiers, paths, symbols, citations, and dependency traversal |
+| Local hybrid | `CONTINUITYDB_EMBEDDING_PROVIDER=local` | No | Exact plus conceptual/paraphrase retrieval on one machine |
+| Ollama hybrid | Provider `ollama` with a configured model | Only to the configured endpoint | Existing local Ollama installations |
+| OpenAI-compatible hybrid | Provider `openai-compatible` with an explicit endpoint/model | Yes, to the configured endpoint | Operator-managed remote embedding services |
 
 ## Try automatic context transfer
 
@@ -257,6 +272,9 @@ continuitydb serve --home /absolute/private/path/continuitydb-data
 CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331 \
 continuitydb mcp
 ```
+
+Configure embeddings on the authoritative service only. Thin HTTP-backed MCP
+adapters do not need the model runtime, cache, or provider credentials.
 
 For a remote HTTPS service, set `CONTINUITYDB_HTTP_TOKEN_ENV` to the name of a
 host-injected credential entry. Do not put a token in the URL, MCP arguments,
@@ -460,9 +478,11 @@ credentials or raw tokens.
 ### Semantic embeddings
 
 Lexical plus graph retrieval works without an embedding model or network call.
-For zero-API-cost semantic retrieval, ContinuityDB includes a first-class local
-provider based on the MIT-licensed `bge-small-en-v1.5` model. Inference runs
-inside the process through WASM; memory and query text do not leave the host.
+Semantic retrieval is disabled by default rather than silently downloading a
+model. For zero-API-cost semantic retrieval, ContinuityDB includes a
+first-class local provider based on the MIT-licensed
+`BAAI/bge-small-en-v1.5` model. Inference runs inside the process through WASM;
+memory and query text do not leave the host.
 
 | Variable | Values / purpose |
 |---|---|
@@ -477,15 +497,57 @@ inside the process through WASM; memory and query text do not leave the host.
 | `CONTINUITYDB_LOCAL_MODEL_THREADS` | WASM threads, bounded from 1 to 8; default 1 |
 | `CONTINUITYDB_LOCAL_MODEL_BATCH_SIZE` | Local inference batch, bounded from 1 to 64; default 32 |
 
-The built-in model is pinned to repository revision
-`ea104dacec62c0de699686887e3f920caeb4f3e3`. Its 384-dimensional quantized ONNX
+#### Recommended local setup
+
+```bash
+# 1. Download and verify the two pinned artifacts.
+continuitydb embeddings-pull --home /absolute/private/path/continuitydb-data
+
+# 2. Confirm the cache location, revision, hashes, and readiness.
+continuitydb embeddings-status --home /absolute/private/path/continuitydb-data
+
+# 3. Create projections for active memories that predate local embeddings.
+CONTINUITYDB_EMBEDDING_PROVIDER=local \
+CONTINUITYDB_LOCAL_MODEL_OFFLINE=true \
+continuitydb embeddings-index --home /absolute/private/path/continuitydb-data
+
+# 4. Run every process that should capture or retrieve vectors with the same
+#    provider and home/cache configuration.
+CONTINUITYDB_EMBEDDING_PROVIDER=local \
+CONTINUITYDB_LOCAL_MODEL_OFFLINE=true \
+continuitydb serve --home /absolute/private/path/continuitydb-data
+```
+
+`embeddings-index` is idempotent: it only backfills active records missing the
+current model/content-hash projection. After that, newly activated memories are
+indexed automatically by processes using the configured provider. Switching
+models does not silently reuse incompatible vectors because every projection
+carries both the model ID and canonical content hash.
+
+#### Model, footprint, and cache
+
+The local provider uses a 384-dimensional q8 ONNX projection pinned to
+repository revision `ea104dacec62c0de699686887e3f920caeb4f3e3`. The model
 artifact and vocabulary total 34,245,934 bytes. Every first-use artifact is
 downloaded over HTTPS from the fixed Hugging Face repository, size-bounded,
 SHA-256 verified, atomically installed, and cached with private permissions.
-After `embeddings-pull`, set `CONTINUITYDB_LOCAL_MODEL_OFFLINE=true` for a
-network-independent runtime. The optional WASM runtime is materially larger
-than the weights (about 137 MB unpacked in the tested npm release); this is why
-lexical-only installs can omit optional dependencies.
+Symlinked cache directories and non-regular artifact files are rejected.
+
+The optional `onnxruntime-web` WASM dependency is about 137 MB unpacked in the
+tested npm release, while model artifacts are not included in the npm tarball
+or container image. A default install includes the runtime; a lexical-only
+install can use `npm ci --omit=optional`. In the supplied container,
+`CONTINUITYDB_HOME=/data`, so a persistent `/data` volume also persists the
+verified model cache under `/data/models`. Prefetch before enabling offline
+mode.
+
+#### Retrieval behavior
+
+Documents use normalized mean-pooled embeddings. Queries use BGE's recommended
+retrieval prefix. Code identifiers are split at acronym and camel-case
+boundaries before WordPiece tokenization; the model sequence is capped at 512
+tokens. Hybrid retrieval fuses lexical, semantic, and graph candidates before
+MMR and the final serialized context-pack budget are applied.
 
 Remote embedding endpoints must use HTTPS. Endpoint URLs cannot contain
 credentials, query strings, or fragments. ContinuityDB reads the configured
@@ -599,13 +661,24 @@ showing nonlinear canonical-ingest degradation that must be profiled and fixed.
 
 Without an embedding provider, the fixture achieves 9/9 exact Recall@5 and 0/5
 semantic Recall@5. With the pinned local BGE-small q8 model, three consecutive
-runs each achieved 9/9 exact Recall@5, 5/5 semantic Recall@5, and zero isolation
-violations. This 14-query fixture is a regression gate, not broad retrieval
-evidence; larger held-out engineering datasets are still required.
+runs each achieved 9/9 exact Recall@5, 5/5 semantic Recall@5, semantic MRR@5 of
+0.55, and zero isolation violations.
+
+On the 2026-09-10 test VM (Intel Xeon Silver 4416+, one WASM thread, Node
+25.9.0), verified-cache/session initialization took 550.001 ms, warm single-text
+p95 was 23.233 ms, 32-text batch p95 was 600.658 ms, throughput was 56.34
+texts/second, and process RSS after the suite was 363.29 MiB. The full semantic
+quality fixture also passed on Node 22.20.0.
+
+These measurements are machine-specific. The 14-query quality fixture is a
+regression gate, not broad retrieval evidence; larger held-out engineering,
+multilingual, and code-heavy datasets are still required.
 
 See the [methodology and verdict](docs/benchmark-report-2026-09-10.md),
 [raw 10k result](benchmarks/results/embedded-10k-2026-09-10.json), and
-[benchmark instructions](benchmarks/README.md).
+[benchmark instructions](benchmarks/README.md). Local model methodology and
+footprint are documented separately in
+[local embedding evidence](docs/local-embeddings.md).
 
 ## Security model
 
