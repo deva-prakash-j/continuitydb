@@ -287,6 +287,13 @@ See [`examples/mcp.remote.vscode.example.json`](examples/mcp.remote.vscode.examp
 at session start. At stop/checkpoint it saves only the explicit structured JSON
 file; it never mines raw transcripts.
 
+Historical handoff records are excluded from the general context pack. Startup
+injects exactly one separately addressed checkpoint selected by shared owner,
+project, task and applicable branch. Private checkpoints receive the configured
+working-memory TTL; sensitive and restricted checkpoints are quarantined until a
+reviewer explicitly approves them. Per-agent/project capture quotas apply to
+checkpoints as well, while exact idempotent retries remain allowed.
+
 ```bash
 export CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331
 export CONTINUITYDB_PROJECT_ID=service-a
@@ -346,7 +353,7 @@ Run `continuitydb help` for the concise built-in usage text.
 | `propose` | Create a memory that remains invisible to recall |
 | `capture` | Apply automatic capture policy as an agent identity |
 | `commit` | Activate a proposed memory through the trusted CLI/admin path |
-| `correct` | Create an active replacement and supersede the old version |
+| `correct` | Create an active replacement and supersede the old version; handoffs use `--handoff-file` so structured and rendered state change together |
 | `search` | Retrieve ranked memories |
 | `context` | Build a cited, token-budgeted context pack |
 | `handoff-save` | Validate and save a structured checkpoint JSON file |
@@ -589,8 +596,11 @@ grants tool permission or becomes executable policy.
 Embedded mode stores canonical Markdown records separately from SQLite indexes.
 The index can be rebuilt from canonical records. Audit events form a hash chain
 inside a transactionally serialized SQLite table, so processes sharing one home
-cannot append from stale cached heads. `continuitydb export` provides a portable
-JSONL snapshot.
+cannot append from stale cached heads. Legacy JSONL migration validates and
+preserves the original predecessor/event hashes. A broken historical chain or a
+chain that conflicts with existing SQLite history is retained and reported
+invalid rather than silently replaced with a newly valid-looking chain.
+`continuitydb export` provides a portable JSONL snapshot.
 
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
@@ -691,8 +701,11 @@ Important shipped controls include:
 - recursive credential-pattern rejection and repository secret-path denylist;
 - Git commit/ref/path/checksum/excerpt validation for durable Git facts;
 - committed-blob repository ingestion and branch-scoped working knowledge;
+- task/branch-scoped handoff idempotency, persisted retry responses, bounded
+  checkpoint TTLs, deterministic checkpoint sequencing, and structured correction;
 - idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
-- transactionally serialized hash-chained audit log and verifier;
+- transactionally serialized hash-chained audit log, legacy-chain preservation,
+  and verifier;
 - pinned lockfile, minimal dependencies, CI audit, and non-root container.
 
 Known gaps include static-token lifecycle, application-level encryption,

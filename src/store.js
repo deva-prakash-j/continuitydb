@@ -49,6 +49,44 @@ function hashText(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function inspectLegacyAudit(contents) {
+  const lines = contents.trim().split("\n").filter(Boolean);
+  const sourceHash = hashText(contents);
+  const events = [];
+  let previous = null;
+  for (const [index, line] of lines.entries()) {
+    let event;
+    try { event = JSON.parse(line); }
+    catch {
+      return { valid: false, events, sourceHash, sourceEvents: lines.length, brokenAt: index + 1, head: previous, reason: "legacy audit line is not valid JSON" };
+    }
+    const fields = ["event_id", "timestamp", "actor", "operation", "target_id", "result", "event_hash"];
+    if (fields.some((field) => typeof event[field] !== "string" || !event[field])) {
+      return { valid: false, events, sourceHash, sourceEvents: lines.length, brokenAt: index + 1, head: previous, reason: "legacy audit event is missing required integrity fields" };
+    }
+    if (!Object.prototype.hasOwnProperty.call(event, "previous_hash")
+      || (event.previous_hash !== null && typeof event.previous_hash !== "string")) {
+      return { valid: false, events, sourceHash, sourceEvents: lines.length, brokenAt: index + 1, head: previous, reason: "legacy audit event is missing previous_hash" };
+    }
+    const base = {
+      event_id: event.event_id,
+      timestamp: event.timestamp,
+      actor: event.actor,
+      operation: event.operation,
+      target_id: event.target_id,
+      result: event.result,
+      previous_hash: event.previous_hash,
+    };
+    if (base.previous_hash !== previous || hashText(JSON.stringify(base)) !== event.event_hash) {
+      return { valid: false, events, sourceHash, sourceEvents: lines.length, brokenAt: index + 1, head: previous, reason: "legacy audit hash chain is invalid" };
+    }
+    const normalized = { ...base, event_hash: event.event_hash };
+    events.push(normalized);
+    previous = normalized.event_hash;
+  }
+  return { valid: true, events, sourceHash, sourceEvents: lines.length, brokenAt: null, head: previous, reason: null };
+}
+
 export function estimateSerializedTokens(value) {
   return Math.ceil(Buffer.byteLength(JSON.stringify(value), "utf8") / 4);
 }
@@ -138,6 +176,107 @@ function boundedStringList(value, name, { maxItems = 64, maxLength = 2000 } = {}
   });
 }
 
+function normalizeHandoff(input, defaults = {}) {
+  const value = { ...defaults, ...input };
+  const state = value.state || "in_progress";
+  if (!["in_progress", "blocked", "completed"].includes(state)) throw new Error("handoff state is invalid");
+  if (value.git_commit && !/^[a-f0-9]{7,64}$/i.test(value.git_commit)) {
+    throw new Error("git_commit must be a 7-64 character hexadecimal object id");
+  }
+  return {
+    task_id: requiredIdentifier(value.task_id, "task_id"),
+    goal: requiredString(value.goal, "goal"),
+    current_state: requiredString(value.current_state, "current_state"),
+    completed_work: boundedStringList(value.completed_work, "completed_work"),
+    unresolved_questions: boundedStringList(value.unresolved_questions, "unresolved_questions"),
+    next_actions: boundedStringList(value.next_actions, "next_actions"),
+    relevant_files: boundedStringList(value.relevant_files, "relevant_files", { maxItems: 128, maxLength: 1024 }),
+    state,
+    branch: value.branch ? requiredIdentifier(value.branch, "branch") : null,
+    git_commit: value.git_commit || null,
+    checkpoint_id: value.checkpoint_id ? requiredIdentifier(value.checkpoint_id, "checkpoint_id") : randomUUID(),
+  };
+}
+
+function renderHandoffBody(handoff) {
+  return [
+    `Goal: ${handoff.goal}`,
+    `Current state: ${handoff.current_state}`,
+    handoff.completed_work.length ? `Completed work:\n- ${handoff.completed_work.join("\n- ")}` : null,
+    handoff.unresolved_questions.length ? `Unresolved questions:\n- ${handoff.unresolved_questions.join("\n- ")}` : null,
+    handoff.next_actions.length ? `Next actions:\n- ${handoff.next_actions.join("\n- ")}` : null,
+    handoff.relevant_files.length ? `Relevant files:\n- ${handoff.relevant_files.join("\n- ")}` : null,
+  ].filter(Boolean).join("\n\n");
+}
+
+function handoffIdempotencyKey({ task_id, branch, checkpoint_id }) {
+  return `handoff:${hashText([task_id, branch || "global", checkpoint_id].join("\u0000"))}`;
+}
+
+function handoffsEqual(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function auditEventsEqual(left, right) {
+  return ["event_id", "timestamp", "actor", "operation", "target_id", "result", "previous_hash", "event_hash"]
+    .every((field) => left?.[field] === right?.[field]);
+}
+
+function correctedHandoffFields(current, replacement) {
+  if (current.type !== "handoff") return null;
+  const metadata = JSON.parse(current.metadata_json || "{}");
+  const previous = metadata.handoff;
+  if (!previous) throw new Error("handoff metadata is missing structured checkpoint data");
+  if (replacement.project_id !== undefined && replacement.project_id !== current.project_id) {
+    throw new Error("handoff correction cannot change project_id");
+  }
+  if (replacement.namespace_id !== undefined && replacement.namespace_id !== current.namespace_id) {
+    throw new Error("handoff correction cannot change namespace_id");
+  }
+  if (replacement.type !== undefined && replacement.type !== "handoff") {
+    throw new Error("handoff correction cannot change memory type");
+  }
+  if (replacement.subject_key !== undefined && replacement.subject_key !== current.subject_key) {
+    throw new Error("handoff correction cannot change subject_key");
+  }
+  const structured = replacement.handoff;
+  const changesRenderedState = ["title", "body", "branch", "git_commit", "tags", "metadata"]
+    .some((field) => replacement[field] !== undefined);
+  if (!structured) {
+    if (changesRenderedState) {
+      throw new Error("handoff corrections must use replacement.handoff so structured fields and rendered text stay consistent");
+    }
+    return {};
+  }
+  if (!structured || Array.isArray(structured) || typeof structured !== "object") {
+    throw new Error("replacement.handoff must be an object");
+  }
+  if (structured.task_id !== undefined && structured.task_id !== previous.task_id) {
+    throw new Error("handoff correction cannot change task_id");
+  }
+  if (structured.checkpoint_id !== undefined && structured.checkpoint_id !== previous.checkpoint_id) {
+    throw new Error("handoff correction cannot change checkpoint_id");
+  }
+  const handoff = normalizeHandoff({
+    ...previous,
+    ...structured,
+    task_id: previous.task_id,
+    checkpoint_id: previous.checkpoint_id,
+  });
+  return {
+    title: `Handoff ${handoff.task_id}: ${handoff.goal}`.slice(0, 500),
+    body: renderHandoffBody(handoff),
+    branch: handoff.branch,
+    git_commit: handoff.git_commit,
+    tags: ["handoff", handoff.state],
+    metadata: {
+      ...metadata,
+      handoff,
+      provenance: { git_commit: handoff.git_commit ? "human-corrected" : "not-supplied" },
+    },
+  };
+}
+
 function encodeVector(vector) {
   if (!Array.isArray(vector) || vector.length < 8 || vector.length > 8192) {
     throw new Error("embedding must contain between 8 and 8192 dimensions");
@@ -171,6 +310,12 @@ function normalizeTags(value) {
   if (value === null || value === undefined) return [];
   if (!Array.isArray(value)) throw new Error("tags must be an array");
   return [...new Set(value.map((tag) => requiredIdentifier(String(tag).toLowerCase(), "tag")))].slice(0, 64);
+}
+
+function normalizeExcludedTypes(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 32) throw new Error("exclude_types must contain at most 32 items");
+  return [...new Set(value.map((type) => requiredIdentifier(type, "excluded memory type")))];
 }
 
 function collectStrings(value, output = [], depth = 0) {
@@ -293,6 +438,7 @@ export class ContextVault {
         version INTEGER NOT NULL DEFAULT 1,
         expires_at TEXT,
         supersedes_id TEXT,
+        handoff_sequence INTEGER,
         content_hash TEXT NOT NULL,
         idempotency_key TEXT,
         created_at TEXT NOT NULL,
@@ -433,6 +579,22 @@ export class ContextVault {
         previous_hash TEXT,
         event_hash TEXT NOT NULL UNIQUE
       );
+
+      CREATE TABLE IF NOT EXISTS handoff_sequence (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS audit_migrations (
+        source_path TEXT PRIMARY KEY,
+        source_sha256 TEXT NOT NULL,
+        source_events INTEGER NOT NULL,
+        valid INTEGER NOT NULL,
+        broken_at INTEGER,
+        head TEXT,
+        reason TEXT,
+        migrated_at TEXT NOT NULL
+      );
     `);
 
     this.migrateLegacySchema();
@@ -456,6 +618,7 @@ export class ContextVault {
       ["stale", "INTEGER NOT NULL DEFAULT 0"],
       ["version", "INTEGER NOT NULL DEFAULT 1"],
       ["subject_key", "TEXT"],
+      ["handoff_sequence", "INTEGER"],
     ];
     for (const [name, definition] of additions) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE memory_records ADD COLUMN ${name} ${definition}`);
@@ -516,11 +679,38 @@ export class ContextVault {
 
   migrateLegacyAudit() {
     if (!existsSync(this.auditPath)) return;
-    const lines = readFileSync(this.auditPath, "utf8").trim().split("\n").filter(Boolean);
-    if (!lines.length) return;
+    const contents = readFileSync(this.auditPath, "utf8");
+    if (!contents.trim()) return;
+    const inspection = inspectLegacyAudit(contents);
+    const prior = this.db.prepare("SELECT * FROM audit_migrations WHERE source_path = ?").get(this.auditPath);
+    if (prior) {
+      if (prior.source_sha256 !== inspection.sourceHash) {
+        this.db.prepare(`
+          UPDATE audit_migrations
+          SET source_sha256 = ?, source_events = ?, valid = 0, broken_at = 1,
+            reason = 'legacy audit source changed after migration', migrated_at = ?
+          WHERE source_path = ?
+        `).run(inspection.sourceHash, inspection.sourceEvents, nowIso(), this.auditPath);
+      }
+      return;
+    }
     this.runTransaction(() => {
-      const existing = Number(this.db.prepare("SELECT count(*) AS count FROM audit_events").get().count);
-      if (existing) return;
+      const existing = this.db.prepare(`
+        SELECT event_id, timestamp, actor, operation, target_id, result, previous_hash, event_hash
+        FROM audit_events ORDER BY sequence
+      `).all();
+      let valid = inspection.valid;
+      let brokenAt = inspection.brokenAt;
+      let reason = inspection.reason;
+      if (valid && existing.length) {
+        const prefix = existing.slice(0, inspection.events.length);
+        if (prefix.length !== inspection.events.length
+          || prefix.some((event, index) => !auditEventsEqual(event, inspection.events[index]))) {
+          valid = false;
+          brokenAt = 1;
+          reason = "existing SQLite audit history does not preserve the legacy hash chain";
+        }
+      }
       let previous = null;
       const insert = this.db.prepare(`
         INSERT INTO audit_events(
@@ -529,27 +719,50 @@ export class ContextVault {
           @event_id, @timestamp, @actor, @operation, @target_id, @result, @previous_hash, @event_hash
         )
       `);
-      for (const line of lines) {
-        let legacy;
-        try { legacy = JSON.parse(line); }
-        catch { throw new Error("legacy audit log is corrupt"); }
-        const base = {
-          event_id: legacy.event_id || randomUUID(),
-          timestamp: legacy.timestamp || nowIso(),
-          actor: legacy.actor || "legacy",
-          operation: legacy.operation || "legacy-import",
-          target_id: legacy.target_id || "unknown",
-          result: legacy.result || "imported",
-          previous_hash: previous,
-        };
-        const event = { ...base, event_hash: hashText(JSON.stringify(base)) };
-        insert.run(event);
-        previous = event.event_hash;
+      if (valid && !existing.length) {
+        for (const event of inspection.events) {
+          insert.run(event);
+          previous = event.event_hash;
+        }
       }
+      this.db.prepare(`
+        INSERT INTO audit_migrations(
+          source_path, source_sha256, source_events, valid, broken_at, head, reason, migrated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        this.auditPath,
+        inspection.sourceHash,
+        inspection.sourceEvents,
+        valid ? 1 : 0,
+        brokenAt,
+        inspection.head,
+        reason,
+        nowIso(),
+      );
     });
   }
 
   verifyAuditLog() {
+    const migration = this.db.prepare(`
+      SELECT source_path, source_sha256, source_events, valid, broken_at, head, reason
+      FROM audit_migrations ORDER BY migrated_at LIMIT 1
+    `).get();
+    if (migration && !migration.valid) {
+      return {
+        valid: false,
+        events: Number(this.db.prepare("SELECT count(*) AS count FROM audit_events").get().count),
+        head: this.db.prepare("SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1").get()?.event_hash || null,
+        broken_at: migration.broken_at,
+        storage: "sqlite-serialized+legacy-jsonl-preserved",
+        legacy: {
+          source_path: migration.source_path,
+          source_sha256: migration.source_sha256,
+          events: migration.source_events,
+          head: migration.head,
+          reason: migration.reason,
+        },
+      };
+    }
     const events = this.db.prepare(`
       SELECT event_id, timestamp, actor, operation, target_id, result, previous_hash, event_hash
       FROM audit_events ORDER BY sequence
@@ -562,7 +775,15 @@ export class ContextVault {
       }
       previous = eventHash;
     }
-    return { valid: true, events: events.length, head: previous, storage: "sqlite-serialized" };
+    const result = { valid: true, events: events.length, head: previous, storage: "sqlite-serialized" };
+    if (migration) result.legacy = {
+      source_path: migration.source_path,
+      source_sha256: migration.source_sha256,
+      events: migration.source_events,
+      head: migration.head,
+      valid: true,
+    };
+    return result;
   }
 
   runTransaction(operation) {
@@ -577,6 +798,12 @@ export class ContextVault {
     }
   }
 
+  nextHandoffSequence() {
+    return this.runTransaction(() => Number(this.db
+      .prepare("INSERT INTO handoff_sequence(created_at) VALUES (?)")
+      .run(nowIso()).lastInsertRowid));
+  }
+
   indexRecordUnsafe(record) {
     const normalized = {
       tenant_id: LOCAL_TENANT,
@@ -589,6 +816,7 @@ export class ContextVault {
       stale: 0,
       version: 1,
       subject_key: null,
+      handoff_sequence: null,
       ...record,
     };
     normalized.tags_json = typeof normalized.tags_json === "string"
@@ -602,13 +830,13 @@ export class ContextVault {
           id, tenant_id, owner_id, agent_id, namespace_id, project_id, type, subject_key, title, body, status,
           importance, confidence, sensitivity, source_type, source_uri,
           repo_path, symbol, git_commit, branch, tags_json, metadata_json,
-          valid_from, valid_to, observed_at, stale, version, expires_at, supersedes_id,
+          valid_from, valid_to, observed_at, stale, version, expires_at, supersedes_id, handoff_sequence,
           content_hash, idempotency_key, created_at, updated_at
         ) VALUES (
           @id, @tenant_id, @owner_id, @agent_id, @namespace_id, @project_id, @type, @subject_key, @title, @body, @status,
           @importance, @confidence, @sensitivity, @source_type, @source_uri,
           @repo_path, @symbol, @git_commit, @branch, @tags_json, @metadata_json,
-          @valid_from, @valid_to, @observed_at, @stale, @version, @expires_at, @supersedes_id,
+          @valid_from, @valid_to, @observed_at, @stale, @version, @expires_at, @supersedes_id, @handoff_sequence,
           @content_hash, @idempotency_key, @created_at, @updated_at
         )
       `).run(normalized);
@@ -633,7 +861,7 @@ export class ContextVault {
     this.runTransaction(() => this.indexRecordUnsafe(record));
   }
 
-  propose(input, { actor = "local-user" } = {}) {
+  propose(input, { actor = "local-user", handoffSequence = null } = {}) {
     assertContentLimits(input);
     assertNoCredentialLikeContent(input);
     const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
@@ -691,6 +919,7 @@ export class ContextVault {
       version: Number.isInteger(input.version) && input.version > 0 ? input.version : 1,
       expires_at: optionalIso(input.expires_at, "expires_at"),
       supersedes_id: input.supersedes_id || null,
+      handoff_sequence: handoffSequence,
       content_hash: contentHash,
       idempotency_key: idempotencyKey,
       created_at: timestamp,
@@ -720,11 +949,11 @@ export class ContextVault {
     return record;
   }
 
-  capture(assessment, { actor = "local-agent" } = {}) {
+  capture(assessment, { actor = "local-agent", handoffSequence = null } = {}) {
     if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
       throw new Error("capture assessment has an invalid disposition");
     }
-    const proposed = this.propose(assessment.record, { actor });
+    const proposed = this.propose(assessment.record, { actor, handoffSequence });
     if (proposed.duplicate) {
       return {
         duplicate: true,
@@ -888,6 +1117,7 @@ export class ContextVault {
     branch = null,
     as_of = null,
     include_stale = false,
+    exclude_types = [],
     semantic_candidates = [],
   }) {
     const match = ftsQuery(requiredString(query, "query"));
@@ -897,6 +1127,7 @@ export class ContextVault {
     const ownerId = requiredString(owner_id, "owner_id");
     const branchScope = branch ? requiredIdentifier(branch, "branch") : null;
     const sensitivities = allowed_sensitivities.filter((value) => ["public", "private", "sensitive", "restricted"].includes(value));
+    const excludedTypes = normalizeExcludedTypes(exclude_types);
     if (!sensitivities.length) return [];
     const projects = this.dependencies(
       project_id,
@@ -917,6 +1148,7 @@ export class ContextVault {
         AND r.owner_id = ?
         AND r.namespace_id IN (SELECT value FROM json_each(?))
         AND r.sensitivity IN (SELECT value FROM json_each(?))
+        AND r.type NOT IN (SELECT value FROM json_each(?))
         AND (r.expires_at IS NULL OR r.expires_at > ?)
         AND (r.valid_from IS NULL OR r.valid_from <= ?)
         AND (r.valid_to IS NULL OR r.valid_to > ?)
@@ -930,6 +1162,7 @@ export class ContextVault {
       ownerId,
       JSON.stringify(namespaces),
       JSON.stringify(sensitivities),
+      JSON.stringify(excludedTypes),
       effectiveTime,
       effectiveTime,
       effectiveTime,
@@ -945,6 +1178,7 @@ export class ContextVault {
       && row.owner_id === ownerId
       && namespaces.includes(row.namespace_id)
       && sensitivities.includes(row.sensitivity)
+      && !excludedTypes.includes(row.type)
       && row.status === ACTIVE
       && (!row.expires_at || row.expires_at > effectiveTime)
       && (!row.valid_from || row.valid_from <= effectiveTime)
@@ -965,6 +1199,7 @@ export class ContextVault {
       effectiveTime,
       includeStale: include_stale,
       branch: branchScope,
+      excludedTypes,
       limit: candidateLimit,
     });
 
@@ -1051,6 +1286,7 @@ export class ContextVault {
     effectiveTime,
     includeStale,
     branch,
+    excludedTypes,
     limit,
   }) {
     if (!seedIds.length) return [];
@@ -1080,6 +1316,7 @@ export class ContextVault {
         AND r.status = 'active'
         AND r.namespace_id IN (SELECT value FROM json_each(?))
         AND r.sensitivity IN (SELECT value FROM json_each(?))
+        AND r.type NOT IN (SELECT value FROM json_each(?))
         AND (r.expires_at IS NULL OR r.expires_at > ?)
         AND (r.valid_from IS NULL OR r.valid_from <= ?)
         AND (r.valid_to IS NULL OR r.valid_to > ?)
@@ -1101,6 +1338,7 @@ export class ContextVault {
       ownerId,
       JSON.stringify(namespaces),
       JSON.stringify(sensitivities),
+      JSON.stringify(excludedTypes),
       effectiveTime,
       effectiveTime,
       effectiveTime,
@@ -1172,6 +1410,7 @@ export class ContextVault {
     branch = null,
     as_of = null,
     include_stale = false,
+    exclude_types = [],
     limit = 64,
     max_scan = 100_000,
   }) {
@@ -1179,6 +1418,7 @@ export class ContextVault {
     const ownerId = requiredString(owner_id, "owner_id");
     const branchScope = branch ? requiredIdentifier(branch, "branch") : null;
     const model = requiredIdentifier(model_id, "model_id");
+    const excludedTypes = normalizeExcludedTypes(exclude_types);
     const encoded = encodeVector(query_embedding);
     const queryVector = decodeVector(encoded, query_embedding.length);
     const sensitivities = allowed_sensitivities.filter((value) => ["public", "private", "sensitive", "restricted"].includes(value));
@@ -1195,6 +1435,7 @@ export class ContextVault {
         AND r.owner_id = ? AND r.status = 'active'
         AND r.namespace_id IN (SELECT value FROM json_each(?))
         AND r.sensitivity IN (SELECT value FROM json_each(?))
+        AND r.type NOT IN (SELECT value FROM json_each(?))
         AND (r.expires_at IS NULL OR r.expires_at > ?)
         AND (r.valid_from IS NULL OR r.valid_from <= ?)
         AND (r.valid_to IS NULL OR r.valid_to > ?)
@@ -1208,6 +1449,7 @@ export class ContextVault {
       ownerId,
       JSON.stringify(namespaces),
       JSON.stringify(sensitivities),
+      JSON.stringify(excludedTypes),
       effectiveTime,
       effectiveTime,
       effectiveTime,
@@ -1248,67 +1490,58 @@ export class ContextVault {
         branch: input.branch || null,
         as_of: input.as_of || null,
         include_stale: Boolean(input.include_stale),
+        exclude_types: input.exclude_types || [],
       }),
     }, input.token_budget ?? 1200);
   }
 
-  saveHandoff(input) {
+  saveHandoff(input, { assessment, actor = null } = {}) {
+    if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
+      throw new Error("handoff capture assessment is required");
+    }
     const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
     const ownerId = requiredIdentifier(input.owner_id || "local-user", "owner_id");
     const agentId = input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null;
     const projectId = requiredIdentifier(input.project_id, "project_id");
-    const taskId = requiredIdentifier(input.task_id, "task_id");
-    const branch = input.branch ? requiredIdentifier(input.branch, "branch") : null;
-    const state = input.state || "in_progress";
-    if (!["in_progress", "blocked", "completed"].includes(state)) throw new Error("handoff state is invalid");
     const sensitivity = input.sensitivity || "private";
     if (!["private", "sensitive", "restricted"].includes(sensitivity)) throw new Error("handoff sensitivity is invalid");
-    if (input.git_commit && !/^[a-f0-9]{7,64}$/i.test(input.git_commit)) {
-      throw new Error("git_commit must be a 7-64 character hexadecimal object id");
+    if (["sensitive", "restricted"].includes(sensitivity) && assessment.disposition === "active") {
+      throw new Error("high-sensitivity handoff cannot activate without review");
     }
-    const handoff = {
-      task_id: taskId,
-      goal: requiredString(input.goal, "goal"),
-      current_state: requiredString(input.current_state, "current_state"),
-      completed_work: boundedStringList(input.completed_work, "completed_work"),
-      unresolved_questions: boundedStringList(input.unresolved_questions, "unresolved_questions"),
-      next_actions: boundedStringList(input.next_actions, "next_actions"),
-      relevant_files: boundedStringList(input.relevant_files, "relevant_files", { maxItems: 128, maxLength: 1024 }),
-      state,
-      branch,
-      git_commit: input.git_commit || null,
-      checkpoint_id: input.checkpoint_id ? requiredIdentifier(input.checkpoint_id, "checkpoint_id") : randomUUID(),
-    };
+    if (assessment.disposition === "active" && !assessment.expires_at) {
+      throw new Error("active handoff assessment must include a bounded expiry");
+    }
+    const handoff = normalizeHandoff(input);
     assertNoCredentialLikeContent(handoff);
-    const body = [
-      `Goal: ${handoff.goal}`,
-      `Current state: ${handoff.current_state}`,
-      handoff.completed_work.length ? `Completed work:\n- ${handoff.completed_work.join("\n- ")}` : null,
-      handoff.unresolved_questions.length ? `Unresolved questions:\n- ${handoff.unresolved_questions.join("\n- ")}` : null,
-      handoff.next_actions.length ? `Next actions:\n- ${handoff.next_actions.join("\n- ")}` : null,
-      handoff.relevant_files.length ? `Relevant files:\n- ${handoff.relevant_files.join("\n- ")}` : null,
-    ].filter(Boolean).join("\n\n");
-    const proposed = this.propose({
+    const recordInput = {
       tenant_id: tenantId,
       owner_id: ownerId,
       agent_id: agentId,
       namespace_id: `project/${projectId}`,
       project_id: projectId,
       type: "handoff",
-      subject_key: `handoff:${taskId}`,
-      title: `Handoff ${taskId}: ${handoff.goal}`.slice(0, 500),
-      body,
+      subject_key: `handoff:${handoff.task_id}`,
+      title: `Handoff ${handoff.task_id}: ${handoff.goal}`.slice(0, 500),
+      body: renderHandoffBody(handoff),
       sensitivity,
       source_type: "agent-handoff",
-      branch,
+      branch: handoff.branch,
       git_commit: handoff.git_commit,
-      tags: ["handoff", state],
+      tags: ["handoff", handoff.state],
       metadata: { handoff, provenance: { git_commit: handoff.git_commit ? "agent-asserted" : "not-supplied" } },
-      idempotency_key: `handoff:${agentId || "host"}:${handoff.checkpoint_id}`,
+      idempotency_key: handoffIdempotencyKey(handoff),
+      expires_at: assessment.expires_at || null,
       allow_duplicate_content: true,
-    }, { actor: `${input.principal_id || ownerId}/${agentId || "host"}` });
-    const record = proposed.duplicate ? proposed.record : this.commit(proposed.record.id, { actor: input.principal_id || ownerId });
-    return { duplicate: proposed.duplicate, record, handoff };
+    };
+    const captured = this.capture({ ...assessment, record: recordInput }, {
+      actor: actor || `${input.principal_id || ownerId}/${agentId || "host"}`,
+      handoffSequence: this.nextHandoffSequence(),
+    });
+    const persistedHandoff = JSON.parse(captured.record.metadata_json || "{}").handoff || null;
+    if (captured.duplicate && !handoffsEqual(persistedHandoff, handoff)) {
+      throw new Error("checkpoint_id was already used with different handoff data for this task and branch");
+    }
+    return { ...captured, handoff: persistedHandoff };
   }
 
   latestHandoff({
@@ -1324,13 +1557,19 @@ export class ContextVault {
     const projectId = requiredIdentifier(project_id, "project_id");
     const taskId = requiredIdentifier(task_id, "task_id");
     const effectiveBranch = branch ? requiredIdentifier(branch, "branch") : null;
+    const effectiveTime = nowIso();
     const row = this.db.prepare(`
       SELECT * FROM memory_records
       WHERE tenant_id = ? AND owner_id = ? AND project_id = ?
         AND type = 'handoff' AND subject_key = ? AND status = 'active'
         AND sensitivity IN (SELECT value FROM json_each(?))
+        AND (expires_at IS NULL OR expires_at > ?)
+        AND (valid_from IS NULL OR valid_from <= ?)
+        AND (valid_to IS NULL OR valid_to > ?)
+        AND stale = 0
         AND ((? IS NULL AND branch IS NULL) OR (? IS NOT NULL AND (branch = ? OR branch IS NULL)))
-      ORDER BY CASE WHEN branch = ? THEN 0 ELSE 1 END, updated_at DESC
+      ORDER BY CASE WHEN branch = ? THEN 0 ELSE 1 END,
+        COALESCE(handoff_sequence, 0) DESC, updated_at DESC, id DESC
       LIMIT 1
     `).get(
       tenantId,
@@ -1338,6 +1577,9 @@ export class ContextVault {
       projectId,
       `handoff:${taskId}`,
       JSON.stringify(allowed_sensitivities),
+      effectiveTime,
+      effectiveTime,
+      effectiveTime,
       effectiveBranch,
       effectiveBranch,
       effectiveBranch,
@@ -1403,16 +1645,22 @@ export class ContextVault {
     const confidence = replacement.confidence === undefined ? current.confidence : Number(replacement.confidence);
     const importance = replacement.importance === undefined ? current.importance : Number(replacement.importance);
     if (!Number.isFinite(confidence) || !Number.isFinite(importance)) throw new Error("confidence and importance must be finite numbers");
+    const handoffFields = correctedHandoffFields(current, replacement);
+    const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
     const next = {
       ...current,
-      title: replacement.title === undefined ? current.title : requiredString(replacement.title, "title"),
-      body: replacement.body === undefined ? current.body : requiredString(replacement.body, "body"),
-      branch: replacement.branch === undefined
+      title: effectiveReplacement.title === undefined ? current.title : requiredString(effectiveReplacement.title, "title"),
+      body: effectiveReplacement.body === undefined ? current.body : requiredString(effectiveReplacement.body, "body"),
+      branch: effectiveReplacement.branch === undefined
         ? current.branch
-        : replacement.branch ? requiredIdentifier(replacement.branch, "branch") : null,
+        : effectiveReplacement.branch ? requiredIdentifier(effectiveReplacement.branch, "branch") : null,
+      git_commit: effectiveReplacement.git_commit === undefined ? current.git_commit : effectiveReplacement.git_commit,
       confidence: clamp(confidence, 0, 1),
       importance: clamp(importance, 0, 1),
-      tags_json: replacement.tags === undefined ? current.tags_json : JSON.stringify(normalizeTags(replacement.tags)),
+      tags_json: effectiveReplacement.tags === undefined ? current.tags_json : JSON.stringify(normalizeTags(effectiveReplacement.tags)),
+      metadata_json: effectiveReplacement.metadata === undefined
+        ? current.metadata_json
+        : JSON.stringify(effectiveReplacement.metadata),
       status: PROPOSED,
       source_type: "human-reviewed-proposal",
       updated_at: nowIso(),
@@ -1433,6 +1681,8 @@ export class ContextVault {
     if (!current) throw new Error(`active memory ${id} not found`);
     const correctionReason = requiredString(reason, "reason");
     assertNoCredentialLikeContent({ body: correctionReason });
+    const handoffFields = correctedHandoffFields(current, replacement);
+    const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
     const proposal = this.propose({
       title: current.title,
       body: current.body,
@@ -1449,17 +1699,19 @@ export class ContextVault {
       expires_at: current.expires_at,
       importance: current.importance,
       confidence: current.confidence,
-      ...replacement,
+      ...effectiveReplacement,
       tenant_id: current.tenant_id,
       owner_id: current.owner_id,
+      agent_id: current.agent_id,
       namespace_id: replacement.namespace_id || current.namespace_id,
       project_id: replacement.project_id ?? current.project_id,
       type: replacement.type || current.type,
+      subject_key: current.subject_key,
       source_type: "user-correction",
       supersedes_id: id,
       version: Number(current.version || 1) + 1,
       allow_duplicate_content: true,
-    });
+    }, { handoffSequence: current.type === "handoff" ? this.nextHandoffSequence() : null });
     const committed = this.commit(proposal.record.id);
     const updatedOld = { ...current, status: "superseded", updated_at: nowIso() };
     this.writeCanonical(updatedOld);

@@ -33,6 +33,9 @@ review inbox ------------------------------------------------+          +-> seri
   TTL caps, recursive credential rejection and conflict quarantine.
 - Structured handoffs have enforced task identity, state, completed work,
   unresolved questions, next actions, branch/commit and relevant-file fields.
+  They pass through capture policy: private checkpoints are active only with a
+  bounded TTL, per-agent/project quotas apply, and sensitive/restricted
+  checkpoints wait for review.
 
 ## Distributed runtime target
 
@@ -90,13 +93,18 @@ Typed project and memory edges carry weight, provenance and validity windows.
 - Local canonical files are written atomically before the rebuildable index.
 - Tenant/owner/namespace-scoped idempotency keys prevent duplicate proposals on
   retries without colliding across project boundaries.
+- Handoff idempotency additionally includes task and branch. Retries return the
+  persisted checkpoint, conflicting payload reuse is rejected, and a SQLite
+  AUTOINCREMENT sequence gives latest-checkpoint lookup a deterministic order.
 - Embeddings must match canonical content hash; stale projections are ignored.
 - Forgetting tombstones the record and removes it from all local retrieval paths.
 - Distributed mode uses canonical transaction + outbox/log; projectors are
   idempotent and query responses expose index generation/freshness.
 - Audit entries form a SHA-256 hash chain in a SQLite `BEGIN IMMEDIATE`
   transaction, preventing separate local processes from appending against stale
-  heads. Production still needs remote signed checkpoints.
+  heads. Legacy JSONL hashes are validated and preserved; broken or divergent
+  history remains visible as an invalid migration instead of being re-hashed.
+  Production still needs remote signed checkpoints.
 
 ## Stable surfaces
 

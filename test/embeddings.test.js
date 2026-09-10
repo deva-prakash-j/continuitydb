@@ -80,3 +80,54 @@ test("hybrid indexing batches active memories that do not have the current model
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("hybrid retrieval excludes historical handoffs before semantic fusion", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-embedding-handoff-test-"));
+  const vault = new ContextVault(root);
+  const embedder = {
+    id: "fixture:handoff-exclusion",
+    async embedDocuments(texts) { return texts.map(() => [0, 1, 0, 0, 0, 0, 0, 0]); },
+    async embedQuery() { return [0, 1, 0, 0, 0, 0, 0, 0]; },
+  };
+  try {
+    const saved = vault.saveHandoff({
+      tenant_id: "local",
+      owner_id: "local-user",
+      agent_id: "agent-a",
+      project_id: "api",
+      task_id: "old-task",
+      goal: "Retire an obsolete migration",
+      current_state: "Delete the legacy database",
+      checkpoint_id: "old-checkpoint",
+      branch: "main",
+    }, {
+      assessment: {
+        disposition: "active",
+        reason: "test policy",
+        expires_at: "2099-01-01T00:00:00.000Z",
+      },
+    });
+    const engine = new HybridEngine(vault, embedder);
+    await engine.indexMemory(saved.record.id);
+
+    const visible = await engine.search({
+      query: "What should I do next?",
+      project_id: "api",
+      allowed_projects: ["api"],
+      branch: "main",
+    });
+    assert.equal(visible[0].id, saved.record.id);
+
+    const excluded = await engine.search({
+      query: "What should I do next?",
+      project_id: "api",
+      allowed_projects: ["api"],
+      branch: "main",
+      exclude_types: ["handoff"],
+    });
+    assert.equal(excluded.length, 0);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

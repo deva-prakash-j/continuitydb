@@ -5,6 +5,19 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Routed structured handoffs through capture policy so private checkpoints receive
+  bounded TTLs, per-agent/project quotas apply, and sensitive/restricted checkpoints
+  remain quarantined for review.
+- Excluded historical handoff records from lifecycle context packs; startup now
+  injects only the latest task/project/branch-applicable structured checkpoint.
+- Scoped checkpoint idempotency to task and branch, returned the persisted payload
+  on retries, and rejected conflicting reuse of a checkpoint identity.
+- Preserved handoff subject identity during correction, rebuilt structured metadata
+  and rendered text together, and added a transactionally allocated checkpoint sequence.
+- Made local embedding commands consistently resolve model caches from the effective
+  CLI `--home`.
+- Changed legacy audit migration to validate and preserve existing event hashes and
+  report historical corruption or SQLite/JSONL divergence instead of rewriting evidence.
 - Distributed store/query adapters and large-scale load harness.
 - Sandboxed Tree-sitter workers and Git staleness projector.
 - OIDC/mTLS identity adapter and compliance purge coordinator.

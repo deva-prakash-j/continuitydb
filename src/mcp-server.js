@@ -198,12 +198,16 @@ server.registerTool(
     }
     if (!identity.allowed_projects.includes(input.project_id)) throw new Error(`project ${input.project_id} is not allowed for this caller`);
     if (!identity.allowed_sensitivities.includes(input.sensitivity)) throw new Error(`sensitivity ${input.sensitivity} is not allowed for this caller`);
-    return response(vault.saveHandoff({
+    const handoffInput = {
       ...input,
       tenant_id: identity.tenant_id,
       owner_id: identity.owner_id,
       principal_id: identity.principal_id,
       agent_id: identity.agent_id,
+    };
+    return response(vault.saveHandoff(handoffInput, {
+      assessment: capturePolicy.evaluateHandoff(handoffInput, identity, vault),
+      actor: `${identity.principal_id}/${identity.agent_id}`,
     }));
   },
 );

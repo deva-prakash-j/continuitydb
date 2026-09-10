@@ -66,6 +66,7 @@ try {
       task,
       branch,
       token_budget: Number(flags.token_budget || process.env.CONTINUITYDB_TOKEN_BUDGET || 1200),
+      exclude_types: ["handoff"],
     });
     writeStartup(renderStartup({ handoff, context }), flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "claude");
   } else if (command === "checkpoint") {

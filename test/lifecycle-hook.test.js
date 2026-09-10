@@ -44,8 +44,30 @@ test("lifecycle hook injects startup context and saves explicit structured check
       CONTINUITYDB_PROJECT_ID: "api",
       CONTINUITYDB_TASK_ID: "schema-v2",
       CONTINUITYDB_BRANCH: "main",
-      CONTINUITYDB_TASK: "Continue SchemaV2 rollout",
+      CONTINUITYDB_TASK: "Continue SchemaV2 rollout shared context",
     };
+    for (const handoff of [{
+      project_id: "api",
+      task_id: "schema-v2",
+      goal: "Ship SchemaV2",
+      current_state: "OBSOLETE_SAME_TASK_CHECKPOINT shared context",
+      branch: "main",
+      checkpoint_id: "old-checkpoint",
+    }, {
+      project_id: "api",
+      task_id: "other-task",
+      goal: "Unrelated work",
+      current_state: "OTHER_TASK_CHECKPOINT shared context",
+      branch: "main",
+      checkpoint_id: "other-checkpoint",
+    }]) {
+      const seeded = await fetch(`http://127.0.0.1:${address.port}/v1/handoffs`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(handoff),
+      });
+      assert.equal(seeded.status, 201);
+    }
     const checkpoint = join(root, "handoff.json");
     writeFileSync(checkpoint, JSON.stringify({
       project_id: "api",
@@ -61,6 +83,8 @@ test("lifecycle hook injects startup context and saves explicit structured check
     const startup = await runHook(["session-start"], env);
     assert.match(startup, /Latest structured handoff/);
     assert.match(startup, /Regenerate the client/);
+    assert.doesNotMatch(startup, /OBSOLETE_SAME_TASK_CHECKPOINT/);
+    assert.doesNotMatch(startup, /OTHER_TASK_CHECKPOINT/);
     const cursor = JSON.parse(await runHook(["session-start", "--client", "cursor"], env));
     assert.match(cursor.additional_context, /Schema published/);
   } finally {

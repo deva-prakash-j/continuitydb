@@ -65,6 +65,7 @@ paths:
                 branch: { type: string }
                 as_of: { type: string, format: date-time }
                 include_stale: { type: boolean, default: false }
+                exclude_types: { type: array, maxItems: 32, items: { type: string } }
       responses:
         "200": { description: Token-bounded cited context pack }
   /v1/memories/proposals:
@@ -157,6 +158,7 @@ paths:
                     confidence: { type: number, minimum: 0, maximum: 1 }
                     importance: { type: number, minimum: 0, maximum: 1 }
                     tags: { type: array, maxItems: 64, items: { type: string } }
+                    handoff: { $ref: "#/components/schemas/HandoffPatch" }
       responses:
         "200": { description: Held memory corrected and returned to proposed status }
   /v1/memories/{id}/corrections:
@@ -173,7 +175,17 @@ paths:
               required: [replacement]
               properties:
                 reason: { type: string }
-                replacement: { $ref: "#/components/schemas/MemoryInput" }
+                replacement:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    body: { type: string, minLength: 1, maxLength: 1000000 }
+                    title: { type: string, minLength: 1, maxLength: 500 }
+                    branch: { type: [string, "null"], maxLength: 200 }
+                    confidence: { type: number, minimum: 0, maximum: 1 }
+                    importance: { type: number, minimum: 0, maximum: 1 }
+                    tags: { type: array, maxItems: 64, items: { type: string } }
+                    handoff: { $ref: "#/components/schemas/HandoffPatch" }
       responses:
         "200": { description: New active version created; prior version superseded }
   /v1/memories/{id}/feedback:
@@ -217,7 +229,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/HandoffRequest" }
       responses:
-        "201": { description: Structured checkpoint saved and activated }
+        "201": { description: Structured checkpoint evaluated by capture policy and saved as active, proposed, or quarantined }
         "200": { description: Existing idempotent checkpoint returned }
   /v1/handoffs/latest:
     get:
@@ -269,6 +281,7 @@ components:
         branch: { type: string }
         as_of: { type: string, format: date-time }
         include_stale: { type: boolean, default: false }
+        exclude_types: { type: array, maxItems: 32, items: { type: string } }
     MemoryInput:
       type: object
       required: [body, namespace_id]
@@ -331,6 +344,22 @@ components:
         git_commit: { type: string, maxLength: 64 }
         checkpoint_id: { type: string, maxLength: 200 }
         sensitivity: { type: string, enum: [private, sensitive, restricted], default: private }
+    HandoffPatch:
+      type: object
+      additionalProperties: false
+      description: Partial structured handoff correction. Task and checkpoint identity cannot change.
+      properties:
+        task_id: { type: string, minLength: 1, maxLength: 200 }
+        goal: { type: string, minLength: 1, maxLength: 4000 }
+        current_state: { type: string, minLength: 1, maxLength: 8000 }
+        completed_work: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        unresolved_questions: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        next_actions: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        relevant_files: { type: array, maxItems: 128, items: { type: string, minLength: 1, maxLength: 1024 } }
+        state: { type: string, enum: [in_progress, blocked, completed] }
+        branch: { type: [string, "null"], maxLength: 200 }
+        git_commit: { type: [string, "null"], maxLength: 64 }
+        checkpoint_id: { type: string, maxLength: 200 }
     MemoryResult:
       type: object
       required: [id, title, body, namespace_id, confidence, score, citation]

@@ -76,6 +76,7 @@ function boundedSearch(body, identity) {
     branch: body.branch || null,
     as_of: body.as_of || null,
     include_stale: Boolean(body.include_stale),
+    exclude_types: body.exclude_types || [],
     tenant_id: identity.tenant_id,
     owner_id: identity.owner_id,
     allowed_projects: identity.allowed_projects,
@@ -268,13 +269,18 @@ export function createContinuityServer({
         requireScope(identity, "memory:capture");
         const body = await readJson(request);
         validateWriteScope({ project_id: body.project_id, sensitivity: body.sensitivity || "private" }, identity);
-        const result = vault.saveHandoff({
+        const handoffInput = {
           ...body,
           tenant_id: identity.tenant_id,
           owner_id: identity.owner_id,
           principal_id: identity.principal_id,
           agent_id: identity.agent_id,
           checkpoint_id: body.checkpoint_id || request.headers["idempotency-key"] || undefined,
+        };
+        const assessment = capturePolicy.evaluateHandoff(handoffInput, identity, vault);
+        const result = vault.saveHandoff(handoffInput, {
+          assessment,
+          actor: `${identity.principal_id}/${identity.agent_id || "agent"}`,
         });
         return json(response, result.duplicate ? 200 : 201, result, requestId);
       }

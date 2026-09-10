@@ -1,10 +1,22 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { ContextVault, estimateSerializedTokens } from "../src/store.js";
+
+const ACTIVE_HANDOFF = Object.freeze({
+  disposition: "active",
+  reason: "test policy",
+  expires_at: "2099-01-01T00:00:00.000Z",
+});
+
+function auditEvent(input) {
+  const base = { ...input };
+  return { ...base, event_hash: createHash("sha256").update(JSON.stringify(base)).digest("hex") };
+}
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "context-vault-test-"));
@@ -302,7 +314,7 @@ test("structured handoffs return the latest checkpoint for the applicable branch
       goal: "Roll out SchemaV2",
       current_state: "Started",
     };
-    f.vault.saveHandoff({ ...shared, branch: "main", checkpoint_id: "main-1" });
+    f.vault.saveHandoff({ ...shared, branch: "main", checkpoint_id: "main-1" }, { assessment: ACTIVE_HANDOFF });
     f.vault.saveHandoff({
       ...shared,
       branch: "feature/schema-v2",
@@ -310,7 +322,7 @@ test("structured handoffs return the latest checkpoint for the applicable branch
       current_state: "Client regenerated",
       completed_work: ["Generated client"],
       next_actions: ["Run contract tests"],
-    });
+    }, { assessment: ACTIVE_HANDOFF });
     const latest = f.vault.latestHandoff({
       tenant_id: "tenant-a",
       owner_id: "owner-a",
@@ -329,6 +341,157 @@ test("structured handoffs return the latest checkpoint for the applicable branch
       branch: "other",
       allowed_sensitivities: ["private"],
     }), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("handoffs require policy assessment and scope checkpoint idempotency by task and branch", () => {
+  const f = fixture();
+  try {
+    const shared = {
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      project_id: "api",
+      goal: "Continue rollout",
+      current_state: "Started",
+      checkpoint_id: "checkpoint-1",
+    };
+    assert.throws(() => f.vault.saveHandoff({ ...shared, task_id: "task-a" }), /assessment is required/);
+    assert.throws(() => f.vault.saveHandoff({
+      ...shared,
+      task_id: "sensitive-task",
+      sensitivity: "sensitive",
+    }, { assessment: ACTIVE_HANDOFF }), /high-sensitivity handoff cannot activate/);
+    const first = f.vault.saveHandoff({ ...shared, task_id: "task-a", branch: "main" }, { assessment: ACTIVE_HANDOFF });
+    const otherTask = f.vault.saveHandoff({ ...shared, task_id: "task-b", branch: "main" }, { assessment: ACTIVE_HANDOFF });
+    const otherBranch = f.vault.saveHandoff({ ...shared, task_id: "task-a", branch: "feature" }, { assessment: ACTIVE_HANDOFF });
+    assert.notEqual(first.record.id, otherTask.record.id);
+    assert.notEqual(first.record.id, otherBranch.record.id);
+
+    const retry = f.vault.saveHandoff({ ...shared, task_id: "task-a", branch: "main" }, { assessment: ACTIVE_HANDOFF });
+    assert.equal(retry.duplicate, true);
+    assert.equal(retry.record.id, first.record.id);
+    assert.deepEqual(retry.handoff, first.handoff);
+    assert.throws(() => f.vault.saveHandoff({
+      ...shared,
+      task_id: "task-a",
+      branch: "main",
+      current_state: "Unsaved conflicting response",
+    }, { assessment: ACTIVE_HANDOFF }), /already used with different handoff data/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("latest handoff uses a monotonic checkpoint sequence when timestamps tie", () => {
+  const f = fixture();
+  try {
+    const shared = {
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      project_id: "api",
+      task_id: "same-millisecond",
+      goal: "Resume deterministically",
+      branch: "main",
+    };
+    const first = f.vault.saveHandoff({ ...shared, checkpoint_id: "first", current_state: "Earlier" }, { assessment: ACTIVE_HANDOFF });
+    const second = f.vault.saveHandoff({ ...shared, checkpoint_id: "second", current_state: "Later" }, { assessment: ACTIVE_HANDOFF });
+    f.vault.db.prepare("UPDATE memory_records SET updated_at = ? WHERE id IN (?, ?)")
+      .run("2026-01-01T00:00:00.000Z", first.record.id, second.record.id);
+    const latest = f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "same-millisecond",
+      branch: "main",
+      allowed_sensitivities: ["private"],
+    });
+    assert.ok(second.record.handoff_sequence > first.record.handoff_sequence);
+    assert.equal(latest.record.id, second.record.id);
+    assert.equal(latest.handoff.current_state, "Later");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("handoff correction preserves task identity and rebuilds structured and rendered state", () => {
+  const f = fixture();
+  try {
+    const saved = f.vault.saveHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      project_id: "api",
+      task_id: "correct-me",
+      checkpoint_id: "checkpoint-1",
+      goal: "Finish the migration",
+      current_state: "Old state",
+      branch: "main",
+    }, { assessment: ACTIVE_HANDOFF });
+    assert.throws(() => f.vault.correct(saved.record.id, { body: "Raw replacement" }, "unsafe correction"), /replacement\.handoff/);
+    const corrected = f.vault.correct(saved.record.id, {
+      handoff: {
+        current_state: "Corrected state",
+        completed_work: ["Migration complete"],
+        next_actions: ["Run verification"],
+      },
+    }, "fix checkpoint state");
+    const metadata = JSON.parse(corrected.metadata_json);
+    assert.equal(corrected.subject_key, saved.record.subject_key);
+    assert.equal(metadata.handoff.task_id, "correct-me");
+    assert.equal(metadata.handoff.checkpoint_id, "checkpoint-1");
+    assert.equal(metadata.handoff.current_state, "Corrected state");
+    assert.match(corrected.body, /Current state: Corrected state/);
+    assert.match(corrected.body, /Migration complete/);
+    const latest = f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "correct-me",
+      branch: "main",
+      allowed_sensitivities: ["private"],
+    });
+    assert.equal(latest.record.id, corrected.id);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("held handoff review also requires structured correction", () => {
+  const f = fixture();
+  try {
+    const saved = f.vault.saveHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      project_id: "api",
+      task_id: "review-me",
+      checkpoint_id: "checkpoint-1",
+      goal: "Review sensitive state",
+      current_state: "Needs correction",
+      sensitivity: "sensitive",
+    }, {
+      assessment: {
+        disposition: "quarantined",
+        reason: "high-sensitivity handoff requires review",
+        expires_at: null,
+      },
+    });
+    assert.equal(saved.record.status, "quarantined");
+    assert.throws(() => f.vault.revisePending(
+      saved.record.id,
+      { body: "Raw inconsistent correction" },
+      "review",
+    ), /replacement\.handoff/);
+    const revised = f.vault.revisePending(saved.record.id, {
+      handoff: { current_state: "Corrected before approval" },
+    }, "review");
+    assert.equal(revised.status, "proposed");
+    assert.equal(JSON.parse(revised.metadata_json).handoff.current_state, "Corrected before approval");
+    assert.match(revised.body, /Current state: Corrected before approval/);
   } finally {
     f.cleanup();
   }
@@ -356,24 +519,97 @@ test("multiple processes serialize one authoritative audit hash chain", () => {
 test("legacy JSONL audit events migrate once into the serialized audit table", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-audit-migration-"));
   try {
-    writeFileSync(join(root, "audit.jsonl"), `${JSON.stringify({
+    const legacy = auditEvent({
       event_id: "legacy-1",
       timestamp: "2026-01-01T00:00:00.000Z",
       actor: "legacy-user",
       operation: "propose",
       target_id: "memory-1",
       result: "created",
-    })}\n`);
-    const vault = new ContextVault(root);
-    assert.deepEqual(vault.verifyAuditLog(), {
-      valid: true,
-      events: 1,
-      head: vault.db.prepare("SELECT event_hash FROM audit_events").get().event_hash,
-      storage: "sqlite-serialized",
+      previous_hash: null,
     });
+    writeFileSync(join(root, "audit.jsonl"), `${JSON.stringify(legacy)}\n`);
+    const vault = new ContextVault(root);
+    const verification = vault.verifyAuditLog();
+    assert.equal(verification.valid, true);
+    assert.equal(verification.events, 1);
+    assert.equal(verification.head, legacy.event_hash);
+    assert.equal(verification.legacy.valid, true);
+    assert.equal(vault.db.prepare("SELECT event_hash FROM audit_events").get().event_hash, legacy.event_hash);
     vault.close();
     const reopened = new ContextVault(root);
     assert.equal(reopened.verifyAuditLog().events, 1);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy audit migration preserves and reports a broken historical chain", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-audit-corruption-"));
+  try {
+    const first = auditEvent({
+      event_id: "legacy-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      actor: "legacy-user",
+      operation: "propose",
+      target_id: "memory-1",
+      result: "created",
+      previous_hash: null,
+    });
+    const corrupted = auditEvent({
+      event_id: "legacy-2",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      actor: "legacy-user",
+      operation: "commit",
+      target_id: "memory-1",
+      result: "active",
+      previous_hash: "f".repeat(64),
+    });
+    const source = `${JSON.stringify(first)}\n${JSON.stringify(corrupted)}\n`;
+    writeFileSync(join(root, "audit.jsonl"), source);
+    const vault = new ContextVault(root);
+    const verification = vault.verifyAuditLog();
+    assert.equal(verification.valid, false);
+    assert.equal(verification.broken_at, 2);
+    assert.match(verification.legacy.reason, /legacy audit/);
+    assert.equal(verification.legacy.source_sha256, createHash("sha256").update(source).digest("hex"));
+    assert.equal(vault.db.prepare("SELECT count(*) AS count FROM audit_events").get().count, 0);
+    assert.equal(readFileSync(join(root, "audit.jsonl"), "utf8"), source);
+    vault.close();
+
+    const reopened = new ContextVault(root);
+    assert.equal(reopened.verifyAuditLog().valid, false);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy audit migration reports a chain that conflicts with existing SQLite history", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-audit-mismatch-"));
+  try {
+    const initial = new ContextVault(root);
+    initial.propose({ body: "Existing SQLite event", namespace_id: "personal/global" });
+    initial.close();
+
+    const legacy = auditEvent({
+      event_id: "different-legacy-event",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      actor: "legacy-user",
+      operation: "propose",
+      target_id: "memory-legacy",
+      result: "created",
+      previous_hash: null,
+    });
+    const source = `${JSON.stringify(legacy)}\n`;
+    writeFileSync(join(root, "audit.jsonl"), source);
+
+    const reopened = new ContextVault(root);
+    const verification = reopened.verifyAuditLog();
+    assert.equal(verification.valid, false);
+    assert.match(verification.legacy.reason, /does not preserve the legacy hash chain/);
+    assert.equal(readFileSync(join(root, "audit.jsonl"), "utf8"), source);
     reopened.close();
   } finally {
     rmSync(root, { recursive: true, force: true });

@@ -23,7 +23,7 @@ function fixture() {
       agent_id: "test-agent",
       scopes: ["memory:read", "memory:capture", "memory:feedback", "memory:propose", "memory:approve", "memory:admin", "metrics:read"],
       allowed_projects: ["api", "schema"],
-      allowed_sensitivities: ["public", "private"],
+      allowed_sensitivities: ["public", "private", "sensitive"],
     },
     enableReviewUi: true,
   });
@@ -84,6 +84,24 @@ test("HTTP API binds identity server-side and supports approved lifecycle", asyn
     const latestHandoff = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=schema-v2&branch=main`);
     assert.equal(latestHandoff.status, 200);
     assert.equal((await latestHandoff.json()).handoff.current_state, "Schema committed");
+
+    const sensitiveHandoffResponse = await fetch(`${base}/v1/handoffs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "sensitive-handoff-1" },
+      body: JSON.stringify({
+        project_id: "api",
+        task_id: "sensitive-task",
+        goal: "Review restricted details",
+        current_state: "Sensitive checkpoint",
+        sensitivity: "sensitive",
+      }),
+    });
+    assert.equal(sensitiveHandoffResponse.status, 201);
+    const sensitiveHandoff = await sensitiveHandoffResponse.json();
+    assert.equal(sensitiveHandoff.disposition, "quarantined");
+    assert.equal(sensitiveHandoff.record.status, "quarantined");
+    const hiddenSensitive = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=sensitive-task`);
+    assert.equal(hiddenSensitive.status, 404);
 
     const ui = await fetch(`${base}/ui`);
     assert.equal(ui.status, 200);

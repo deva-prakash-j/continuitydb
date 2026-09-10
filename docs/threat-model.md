@@ -22,6 +22,7 @@ or become a tool instruction.
 | Cross-tenant/owner retrieval | tenant and shared owner included in every local lookup; project/sensitivity ACLs centralized; adversarial tests | owner-aware DB row-level security, per-backend filter assertions, tenant-router tests |
 | Agent self-approval | capture/propose/approve/admin scopes are split; MCP has no approve/admin tools; server chooses status and TTL | OIDC workload claims and organization policy distribution |
 | Memory poisoning | project allowlists, bounded TTLs, confidence caps, per-agent quota, conflict quarantine and idempotency | anomaly detection, reputation and organization review queues |
+| Sensitive handoff bypass | every checkpoint passes capture policy and per-agent/project quota; private checkpoints expire and sensitive/restricted checkpoints remain held for review | organization-specific classification and DLP |
 | Prompt injection in memory | warning on every context pack; content never interpreted as policy | provenance UI, content-risk labels, tool planner separation |
 | Credential ingestion | recursive common-pattern rejection before persistence and secret-path denylist | DLP provider, organization policy and incident flow |
 | SSRF through embedding config | endpoints come from server config; remote endpoints opt-in and HTTPS-only | egress allowlist/proxy and DNS rebinding protection |
@@ -30,8 +31,8 @@ or become a tool instruction.
 | DoS / memory exhaustion | request/body/candidate/vector/depth limits, timeouts, HTTP and MCP capture rate limits, per-agent/project record quota | distributed quotas, queue limits, circuit breakers and WAF |
 | Symlink/path escape or dirty-worktree misattribution during repo scan | committed Git blobs only; symlink tree entries denied; secret paths filtered | sandboxed workers, read-only mounts, resource limits |
 | Forged Git grounding | configured read-only root, allowed-ref ancestry, path, full-file SHA-256 and exact excerpt verification | signed ingest workers and organization-controlled repository attestations |
-| Stale or contradicted context | valid-time, expiry, stale state, supersession and citations | Git ancestor/symbol revalidation and contradiction projector |
-| Audit tampering/racing writers | SQLite-serialized hash chain with verifier; no cached per-process head | append-only remote sink, signed checkpoints/WORM retention |
+| Stale or contradicted context | lifecycle startup excludes historical handoffs from general retrieval and separately selects one latest task/project/branch checkpoint; valid-time, expiry, stale state, supersession and citations | Git ancestor/symbol revalidation and contradiction projector |
+| Audit tampering/racing writers | SQLite-serialized hash chain with verifier; no cached per-process head; legacy hashes are validated and corruption is preserved/reported | append-only remote sink, signed checkpoints/WORM retention |
 | Deletion incompleteness | tombstone removes local recall and invalidates embeddings by status/hash | purge coordinator with per-projection acknowledgements and SLO |
 | Supply-chain compromise | pinned lockfile, minimal dependencies, CI audit, non-root container | provenance attestations, signed releases, dependency review, SBOM |
 

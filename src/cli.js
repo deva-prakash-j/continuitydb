@@ -51,7 +51,7 @@ Usage:
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
   continuitydb capture --body TEXT --project ID [--kind working|inference|git-fact|decision]
   continuitydb commit MEMORY_ID
-  continuitydb correct MEMORY_ID --body TEXT [--reason TEXT]
+  continuitydb correct MEMORY_ID [--body TEXT | --handoff-file HANDOFF.json] [--reason TEXT]
   continuitydb search QUERY [--project ID] [--allow-projects A,B] [--top-k N]
   continuitydb context TASK [--project ID] [--allow-projects A,B] [--token-budget N]
   continuitydb handoff-save --file HANDOFF.json
@@ -141,7 +141,11 @@ try {
     await import("./mcp-server.js");
   } else {
     const vault = new ContextVault(home);
-    const embedder = createEmbedderFromEnv();
+    const embedder = createEmbedderFromEnv({
+      ...process.env,
+      CONTINUITYDB_HOME: home,
+      CONTEXT_VAULT_HOME: home,
+    });
     const engine = new HybridEngine(vault, embedder);
     try {
       if (command === "propose") {
@@ -218,6 +222,9 @@ try {
           confidence: flags.confidence === undefined ? undefined : numberFlag(flags.confidence),
           importance: flags.importance === undefined ? undefined : numberFlag(flags.importance),
           tags: flags.tags === undefined ? undefined : listFlag(flags.tags),
+          handoff: flags.handoff_file === undefined
+            ? undefined
+            : JSON.parse(readFileSync(resolve(flags.handoff_file), "utf8")),
         }).filter(([, value]) => value !== undefined));
         output(vault.correct(positional[0], replacement, flags.reason || "cli-correction"));
       } else if (command === "search") {
@@ -252,12 +259,26 @@ try {
       } else if (command === "handoff-save") {
         if (!flags.file) throw new Error("handoff-save requires --file");
         const checkpoint = JSON.parse(readFileSync(resolve(flags.file), "utf8"));
-        output(vault.saveHandoff({
+        const identity = normalizeIdentity({
+          tenant_id: cliTenantId,
+          principal_id: cliPrincipalId,
+          owner_id: cliOwnerId,
+          agent_id: cliAgentId || cliPrincipalId,
+          scopes: ["memory:capture"],
+          allowed_projects: listFlag(process.env.CONTINUITYDB_ALLOWED_PROJECTS || checkpoint.project_id),
+          allowed_sensitivities: listFlag(process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private"),
+        });
+        const handoffInput = {
           ...checkpoint,
           tenant_id: cliTenantId,
           owner_id: cliOwnerId,
           principal_id: cliPrincipalId,
           agent_id: cliAgentId,
+        };
+        const policy = new CapturePolicy(loadCapturePolicy(flags.policy || process.env.CONTINUITYDB_CAPTURE_POLICY_FILE || null));
+        output(vault.saveHandoff(handoffInput, {
+          assessment: policy.evaluateHandoff(handoffInput, identity, vault),
+          actor: `${identity.principal_id}/${identity.agent_id}`,
         }));
       } else if (command === "handoff-latest") {
         output(vault.latestHandoff({

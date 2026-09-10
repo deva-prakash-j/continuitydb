@@ -330,3 +330,54 @@ test("capture policy rejects group-readable files and invalid numeric limits", (
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("handoff capture policy quarantines sensitive content and bounds private lifetime", () => {
+  const f = fixture();
+  try {
+    const policy = new CapturePolicy(loadCapturePolicy(null));
+    const sensitive = policy.evaluateHandoff({ project_id: "api", sensitivity: "sensitive" }, f.identity, f.vault);
+    assert.equal(sensitive.disposition, "quarantined");
+    assert.equal(sensitive.expires_at, null);
+    const privateHandoff = policy.evaluateHandoff({ project_id: "api", sensitivity: "private" }, f.identity, f.vault);
+    assert.equal(privateHandoff.disposition, "active");
+    assert.ok(Date.parse(privateHandoff.expires_at) <= Date.now() + 86_401_000);
+    assert.throws(() => policy.evaluateHandoff({ project_id: "other", sensitivity: "private" }, f.identity, f.vault), /not allowed/);
+  } finally {
+    f.vault.close();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("handoff capture policy enforces per-agent project quota but permits idempotent retries", () => {
+  const f = fixture();
+  try {
+    const policy = new CapturePolicy({
+      ...loadCapturePolicy(null),
+      max_records_per_project_per_agent: 1,
+    });
+    const input = {
+      project_id: "api",
+      task_id: "quota-task",
+      checkpoint_id: "checkpoint-1",
+      branch: "main",
+      goal: "Preserve retry safety",
+      current_state: "First checkpoint",
+      tenant_id: f.identity.tenant_id,
+      owner_id: f.identity.owner_id,
+      principal_id: f.identity.principal_id,
+      agent_id: f.identity.agent_id,
+      sensitivity: "private",
+    };
+    const assessment = policy.evaluateHandoff(input, f.identity, f.vault);
+    f.vault.saveHandoff(input, { assessment });
+
+    assert.doesNotThrow(() => policy.evaluateHandoff(input, f.identity, f.vault));
+    assert.throws(() => policy.evaluateHandoff({
+      ...input,
+      checkpoint_id: "checkpoint-2",
+    }, f.identity, f.vault), /capture quota exceeded/);
+  } finally {
+    f.vault.close();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
