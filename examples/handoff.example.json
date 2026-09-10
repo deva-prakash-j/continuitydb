@@ -21,5 +21,6 @@
   "state": "in_progress",
   "branch": "feature/schema-v2",
   "git_commit": "0123456789abcdef",
-  "checkpoint_id": "schema-v2-rollout-3"
+  "checkpoint_id": "schema-v2-rollout-3",
+  "previous_checkpoint_id": "schema-v2-rollout-2"
 }

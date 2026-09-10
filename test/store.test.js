@@ -398,7 +398,12 @@ test("latest handoff uses a monotonic checkpoint sequence when timestamps tie", 
       branch: "main",
     };
     const first = f.vault.saveHandoff({ ...shared, checkpoint_id: "first", current_state: "Earlier" }, { assessment: ACTIVE_HANDOFF });
-    const second = f.vault.saveHandoff({ ...shared, checkpoint_id: "second", current_state: "Later" }, { assessment: ACTIVE_HANDOFF });
+    const second = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "second",
+      previous_checkpoint_id: "first",
+      current_state: "Later",
+    }, { assessment: ACTIVE_HANDOFF });
     f.vault.db.prepare("UPDATE memory_records SET updated_at = ? WHERE id IN (?, ?)")
       .run("2026-01-01T00:00:00.000Z", first.record.id, second.record.id);
     const latest = f.vault.latestHandoff({
@@ -412,6 +417,48 @@ test("latest handoff uses a monotonic checkpoint sequence when timestamps tie", 
     assert.ok(second.record.handoff_sequence > first.record.handoff_sequence);
     assert.equal(latest.record.id, second.record.id);
     assert.equal(latest.handoff.current_state, "Later");
+    assert.equal(f.vault.get(first.record.id, { includeInactive: true }).status, "superseded");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("stale or missing handoff lineage is quarantined and cannot replace latest context", () => {
+  const f = fixture();
+  try {
+    const shared = {
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      project_id: "api",
+      task_id: "conflicting-rollout",
+      goal: "Roll out safely",
+      branch: "main",
+    };
+    const first = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-1",
+      current_state: "Schema first",
+    }, { assessment: ACTIVE_HANDOFF });
+    const conflict = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-2",
+      current_state: "API first",
+    }, { assessment: ACTIVE_HANDOFF });
+    assert.equal(first.disposition, "active");
+    assert.equal(conflict.disposition, "quarantined");
+    assert.match(conflict.reason, /lineage conflict/);
+    assert.equal(f.vault.get(conflict.record.id), null);
+    const latest = f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "conflicting-rollout",
+      branch: "main",
+      allowed_sensitivities: ["private"],
+    });
+    assert.equal(latest.record.id, first.record.id);
+    assert.equal(latest.handoff.current_state, "Schema first");
   } finally {
     f.cleanup();
   }

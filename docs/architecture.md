@@ -35,7 +35,10 @@ review inbox ------------------------------------------------+          +-> seri
   unresolved questions, next actions, branch/commit and relevant-file fields.
   They pass through capture policy: private checkpoints are active only with a
   bounded TTL, per-agent/project quotas apply, and sensitive/restricted
-  checkpoints wait for review.
+  checkpoints wait for review. Successor checkpoints use
+  `previous_checkpoint_id` as an optimistic compare-and-set token. A stale or
+  missing predecessor is quarantined; an accepted successor atomically
+  supersedes the prior active checkpoint.
 
 ## Distributed runtime target
 
@@ -96,6 +99,9 @@ Typed project and memory edges carry weight, provenance and validity windows.
 - Handoff idempotency additionally includes task and branch. Retries return the
   persisted checkpoint, conflicting payload reuse is rejected, and a SQLite
   AUTOINCREMENT sequence gives latest-checkpoint lookup a deterministic order.
+  Handoff lineage validation, quota calculation, sequence allocation, insert,
+  and prior-checkpoint supersession run under one `BEGIN IMMEDIATE` transaction,
+  so concurrent processes cannot exceed quota or publish two active successors.
 - Embeddings must match canonical content hash; stale projections are ignored.
 - Forgetting tombstones the record and removes it from all local retrieval paths.
 - Distributed mode uses canonical transaction + outbox/log; projectors are

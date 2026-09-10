@@ -71,6 +71,18 @@ try {
     writeStartup(renderStartup({ handoff, context }), flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "claude");
   } else if (command === "checkpoint") {
     const value = readCheckpoint(flags.file || process.env.CONTINUITYDB_HANDOFF_FILE);
+    if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
+      try {
+        const latest = await client.latestHandoff({
+          project_id: value.project_id,
+          task_id: value.task_id,
+          branch: value.branch || null,
+        });
+        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      } catch (error) {
+        if (error.statusCode !== 404) throw error;
+      }
+    }
     const result = await client.saveHandoff(value);
     process.stdout.write(`${JSON.stringify(flags.verbose
       ? { saved: true, memory_id: result.record.id, checkpoint_id: result.handoff.checkpoint_id }

@@ -5,6 +5,12 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Added compare-and-set handoff lineage with `previous_checkpoint_id`; stale or
+  concurrent successors are quarantined and accepted successors supersede the
+  prior active checkpoint.
+- Made handoff quota checks, lineage validation, sequence allocation,
+  persistence, and supersession one SQLite `BEGIN IMMEDIATE` transaction, with
+  an eight-process concurrency regression test.
 - Routed structured handoffs through capture policy so private checkpoints receive
   bounded TTLs, per-agent/project quotas apply, and sensitive/restricted checkpoints
   remain quarantined for review.

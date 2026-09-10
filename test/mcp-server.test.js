@@ -70,11 +70,36 @@ test("MCP exposes policy-controlled capture and feedback without admin tools", a
       },
     });
     assert.equal(handoff.structuredContent.handoff.task_id, "schema-v2");
+    const conflict = await client.callTool({
+      name: "handoff_checkpoint",
+      arguments: {
+        project_id: "api",
+        task_id: "schema-v2",
+        goal: "Roll out SchemaV2",
+        current_state: "Deploy API before schema",
+        checkpoint_id: "schema-v2-conflict",
+        branch: "main",
+      },
+    });
+    assert.equal(conflict.structuredContent.disposition, "quarantined");
     const latest = await client.callTool({
       name: "handoff_latest",
       arguments: { project_id: "api", task_id: "schema-v2", branch: "main" },
     });
     assert.equal(latest.structuredContent.handoff.current_state, "Schema is published");
+    const continued = await client.callTool({
+      name: "handoff_checkpoint",
+      arguments: {
+        project_id: "api",
+        task_id: "schema-v2",
+        goal: "Roll out SchemaV2",
+        current_state: "Client regenerated",
+        checkpoint_id: "schema-v2-next",
+        previous_checkpoint_id: handoff.structuredContent.handoff.checkpoint_id,
+        branch: "main",
+      },
+    });
+    assert.equal(continued.structuredContent.disposition, "active");
   } finally {
     await client.close();
     rmSync(root, { recursive: true, force: true });

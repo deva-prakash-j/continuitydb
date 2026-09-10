@@ -188,6 +188,7 @@ server.registerTool(
       branch: z.string().max(200).optional(),
       git_commit: z.string().max(64).optional(),
       checkpoint_id: z.string().max(200).optional(),
+      previous_checkpoint_id: z.string().max(200).optional(),
       sensitivity: z.enum(["private", "sensitive", "restricted"]).default("private"),
     },
   },

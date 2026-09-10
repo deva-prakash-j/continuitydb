@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +22,62 @@ function fixture() {
     allowed_sensitivities: ["private", "sensitive"],
   });
   return { root, vault, identity };
+}
+
+const concurrentWriterScript = `
+  import { ContextVault } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+  const [root, checkpointId, startAtValue] = process.argv.slice(1);
+  const vault = new ContextVault(root);
+  try {
+    const startAt = Number(startAtValue);
+    while (Date.now() < startAt) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    const result = vault.saveHandoff({
+      tenant_id: "tenant-a", owner_id: "owner-a", principal_id: "principal-a", agent_id: "agent-a",
+      project_id: "api", task_id: "atomic-quota", checkpoint_id: checkpointId,
+      goal: "Enforce an atomic handoff quota", current_state: \`Writer \${checkpointId}\`,
+      branch: "main", sensitivity: "private",
+    }, {
+      assessment: {
+        disposition: "active", reason: "concurrency fixture",
+        expires_at: "2099-01-01T00:00:00.000Z", quota_limit: 1,
+      },
+      actor: \`fixture/\${checkpointId}\`,
+    });
+    process.stdout.write(JSON.stringify({ ok: true, disposition: result.disposition }));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, message: error.message }));
+  } finally { vault.close(); }
+`;
+
+function runConcurrentWriter(root, checkpointId, startAt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      concurrentWriterScript,
+      root,
+      checkpointId,
+      String(startAt),
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`writer ${checkpointId} exceeded 10 second timeout`));
+    }, 10_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) return reject(new Error(`writer exited ${code}: ${stderr}`));
+      try { resolve(JSON.parse(stdout)); }
+      catch { reject(new Error(`writer returned invalid JSON: ${stdout}\n${stderr}`)); }
+    });
+  });
 }
 
 test("working capture auto-activates with bounded TTL and transfers across agents sharing an owner", () => {
@@ -348,7 +404,7 @@ test("handoff capture policy quarantines sensitive content and bounds private li
   }
 });
 
-test("handoff capture policy enforces per-agent project quota but permits idempotent retries", () => {
+test("handoff persistence enforces per-agent project quota but permits idempotent retries", () => {
   const f = fixture();
   try {
     const policy = new CapturePolicy({
@@ -371,13 +427,67 @@ test("handoff capture policy enforces per-agent project quota but permits idempo
     const assessment = policy.evaluateHandoff(input, f.identity, f.vault);
     f.vault.saveHandoff(input, { assessment });
 
-    assert.doesNotThrow(() => policy.evaluateHandoff(input, f.identity, f.vault));
-    assert.throws(() => policy.evaluateHandoff({
+    const retryAssessment = policy.evaluateHandoff(input, f.identity, f.vault);
+    assert.equal(f.vault.saveHandoff(input, { assessment: retryAssessment }).duplicate, true);
+    const next = {
       ...input,
       checkpoint_id: "checkpoint-2",
-    }, f.identity, f.vault), /capture quota exceeded/);
+      previous_checkpoint_id: "checkpoint-1",
+      current_state: "Replacement checkpoint",
+    };
+    const nextAssessment = policy.evaluateHandoff(next, f.identity, f.vault);
+    assert.doesNotThrow(() => f.vault.saveHandoff(next, { assessment: nextAssessment }));
+    assert.equal(f.vault.captureCount({
+      tenant_id: f.identity.tenant_id,
+      owner_id: f.identity.owner_id,
+      agent_id: f.identity.agent_id,
+      project_id: "api",
+    }), 1);
+    const unrelated = {
+      ...input,
+      task_id: "quota-task-2",
+      checkpoint_id: "checkpoint-3",
+      current_state: "Would exceed quota",
+    };
+    assert.throws(() => f.vault.saveHandoff(unrelated, {
+      assessment: policy.evaluateHandoff(unrelated, f.identity, f.vault),
+    }), /capture quota exceeded/);
   } finally {
     f.vault.close();
     rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("handoff quota remains atomic across concurrent processes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-handoff-quota-test-"));
+  try {
+    const startAt = Date.now() + 500;
+    const results = await Promise.all(Array.from({ length: 8 }, (_, index) => (
+      runConcurrentWriter(root, `writer-${index}`, startAt)
+    )));
+    assert.equal(results.filter((result) => result.ok).length, 1);
+    assert.equal(results.filter((result) => /capture quota exceeded/.test(result.message || "")).length, 7);
+    const vault = new ContextVault(root);
+    try {
+      assert.equal(vault.captureCount({
+        tenant_id: "tenant-a",
+        owner_id: "owner-a",
+        agent_id: "agent-a",
+        project_id: "api",
+      }), 1);
+      assert.ok(vault.latestHandoff({
+        tenant_id: "tenant-a",
+        owner_id: "owner-a",
+        project_id: "api",
+        task_id: "atomic-quota",
+        branch: "main",
+        allowed_sensitivities: ["private"],
+      }));
+      assert.equal(vault.verifyAuditLog().valid, true);
+    } finally {
+      vault.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

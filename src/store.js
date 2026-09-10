@@ -183,6 +183,13 @@ function normalizeHandoff(input, defaults = {}) {
   if (value.git_commit && !/^[a-f0-9]{7,64}$/i.test(value.git_commit)) {
     throw new Error("git_commit must be a 7-64 character hexadecimal object id");
   }
+  const checkpointId = value.checkpoint_id ? requiredIdentifier(value.checkpoint_id, "checkpoint_id") : randomUUID();
+  const previousCheckpointId = value.previous_checkpoint_id
+    ? requiredIdentifier(value.previous_checkpoint_id, "previous_checkpoint_id")
+    : null;
+  if (previousCheckpointId === checkpointId) {
+    throw new Error("previous_checkpoint_id must differ from checkpoint_id");
+  }
   return {
     task_id: requiredIdentifier(value.task_id, "task_id"),
     goal: requiredString(value.goal, "goal"),
@@ -194,7 +201,8 @@ function normalizeHandoff(input, defaults = {}) {
     state,
     branch: value.branch ? requiredIdentifier(value.branch, "branch") : null,
     git_commit: value.git_commit || null,
-    checkpoint_id: value.checkpoint_id ? requiredIdentifier(value.checkpoint_id, "checkpoint_id") : randomUUID(),
+    checkpoint_id: checkpointId,
+    previous_checkpoint_id: previousCheckpointId,
   };
 }
 
@@ -256,6 +264,10 @@ function correctedHandoffFields(current, replacement) {
   }
   if (structured.checkpoint_id !== undefined && structured.checkpoint_id !== previous.checkpoint_id) {
     throw new Error("handoff correction cannot change checkpoint_id");
+  }
+  if (structured.previous_checkpoint_id !== undefined
+    && structured.previous_checkpoint_id !== previous.previous_checkpoint_id) {
+    throw new Error("handoff correction cannot change previous_checkpoint_id");
   }
   const handoff = normalizeHandoff({
     ...previous,
@@ -398,6 +410,7 @@ export class ContextVault {
     this.indexDir = join(rootDir, "index");
     this.linksPath = join(rootDir, "project-links.json");
     this.auditPath = join(rootDir, "audit.jsonl");
+    this.transactionDepth = 0;
     mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
 
@@ -787,7 +800,9 @@ export class ContextVault {
   }
 
   runTransaction(operation) {
+    if (this.transactionDepth > 0) return operation();
     this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth += 1;
     try {
       const result = operation();
       this.db.exec("COMMIT");
@@ -795,6 +810,8 @@ export class ContextVault {
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
@@ -1501,7 +1518,7 @@ export class ContextVault {
     }
     const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
     const ownerId = requiredIdentifier(input.owner_id || "local-user", "owner_id");
-    const agentId = input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null;
+    const agentId = requiredIdentifier(input.agent_id || input.principal_id || ownerId, "agent_id");
     const projectId = requiredIdentifier(input.project_id, "project_id");
     const sensitivity = input.sensitivity || "private";
     if (!["private", "sensitive", "restricted"].includes(sensitivity)) throw new Error("handoff sensitivity is invalid");
@@ -1513,35 +1530,127 @@ export class ContextVault {
     }
     const handoff = normalizeHandoff(input);
     assertNoCredentialLikeContent(handoff);
-    const recordInput = {
-      tenant_id: tenantId,
-      owner_id: ownerId,
-      agent_id: agentId,
-      namespace_id: `project/${projectId}`,
-      project_id: projectId,
-      type: "handoff",
-      subject_key: `handoff:${handoff.task_id}`,
-      title: `Handoff ${handoff.task_id}: ${handoff.goal}`.slice(0, 500),
-      body: renderHandoffBody(handoff),
-      sensitivity,
-      source_type: "agent-handoff",
-      branch: handoff.branch,
-      git_commit: handoff.git_commit,
-      tags: ["handoff", handoff.state],
-      metadata: { handoff, provenance: { git_commit: handoff.git_commit ? "agent-asserted" : "not-supplied" } },
-      idempotency_key: handoffIdempotencyKey(handoff),
-      expires_at: assessment.expires_at || null,
-      allow_duplicate_content: true,
-    };
-    const captured = this.capture({ ...assessment, record: recordInput }, {
-      actor: actor || `${input.principal_id || ownerId}/${agentId || "host"}`,
-      handoffSequence: this.nextHandoffSequence(),
-    });
-    const persistedHandoff = JSON.parse(captured.record.metadata_json || "{}").handoff || null;
-    if (captured.duplicate && !handoffsEqual(persistedHandoff, handoff)) {
-      throw new Error("checkpoint_id was already used with different handoff data for this task and branch");
+    const namespaceId = `project/${projectId}`;
+    const idempotencyKey = handoffIdempotencyKey(handoff);
+    const quotaLimit = Number(assessment.quota_limit ?? 10_000);
+    if (!Number.isInteger(quotaLimit) || quotaLimit < 1 || quotaLimit > 1_000_000) {
+      throw new Error("handoff assessment quota_limit must be an integer between 1 and 1000000");
     }
-    return { ...captured, handoff: persistedHandoff };
+    const effectiveActor = actor || `${input.principal_id || ownerId}/${agentId || "host"}`;
+
+    return this.runTransaction(() => {
+      const existing = this.findByIdempotency({
+        tenant_id: tenantId,
+        owner_id: ownerId,
+        namespace_id: namespaceId,
+        agent_id: agentId,
+        idempotency_key: idempotencyKey,
+      });
+      if (existing) {
+        const persistedHandoff = JSON.parse(existing.metadata_json || "{}").handoff || null;
+        if (!handoffsEqual(persistedHandoff, handoff)) {
+          throw new Error("checkpoint_id was already used with different handoff data for this task and branch");
+        }
+        return {
+          duplicate: true,
+          disposition: existing.status,
+          reason: "matching handoff checkpoint already exists",
+          record: existing,
+          handoff: persistedHandoff,
+        };
+      }
+
+      const effectiveTime = nowIso();
+      const previousRecord = this.db.prepare(`
+        SELECT * FROM memory_records
+        WHERE tenant_id = ? AND owner_id = ? AND project_id = ?
+          AND type = 'handoff' AND subject_key = ? AND status = 'active'
+          AND ((? IS NULL AND branch IS NULL) OR branch = ?)
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND (valid_from IS NULL OR valid_from <= ?)
+          AND (valid_to IS NULL OR valid_to > ?)
+          AND stale = 0
+        ORDER BY COALESCE(handoff_sequence, 0) DESC, updated_at DESC, id DESC
+        LIMIT 1
+      `).get(
+        tenantId,
+        ownerId,
+        projectId,
+        `handoff:${handoff.task_id}`,
+        handoff.branch,
+        handoff.branch,
+        effectiveTime,
+        effectiveTime,
+        effectiveTime,
+      ) || null;
+      const previousHandoff = previousRecord
+        ? JSON.parse(previousRecord.metadata_json || "{}").handoff || null
+        : null;
+      const continuesLatest = Boolean(
+        previousRecord
+        && previousHandoff
+        && handoff.previous_checkpoint_id === previousHandoff.checkpoint_id,
+      );
+      let effectiveAssessment = assessment;
+      if ((previousRecord && !continuesLatest) || (!previousRecord && handoff.previous_checkpoint_id)) {
+        effectiveAssessment = {
+          ...assessment,
+          disposition: "quarantined",
+          expires_at: null,
+          reason: previousRecord
+            ? `handoff lineage conflict: previous_checkpoint_id must equal latest checkpoint ${previousHandoff?.checkpoint_id || "unknown"}`
+            : "handoff lineage conflict: previous_checkpoint_id does not reference an active checkpoint",
+        };
+      }
+
+      const replacesPrevious = Boolean(previousRecord && continuesLatest && effectiveAssessment.disposition === ACTIVE);
+      const currentCount = this.captureCount({
+        tenant_id: tenantId,
+        owner_id: ownerId,
+        agent_id: agentId,
+        project_id: projectId,
+      });
+      const projectedCount = currentCount + 1 - (replacesPrevious ? 1 : 0);
+      if (projectedCount > quotaLimit) {
+        const error = new Error("capture quota exceeded for this agent and project");
+        error.code = "FORBIDDEN";
+        throw error;
+      }
+
+      const recordInput = {
+        tenant_id: tenantId,
+        owner_id: ownerId,
+        agent_id: agentId,
+        namespace_id: namespaceId,
+        project_id: projectId,
+        type: "handoff",
+        subject_key: `handoff:${handoff.task_id}`,
+        title: `Handoff ${handoff.task_id}: ${handoff.goal}`.slice(0, 500),
+        body: renderHandoffBody(handoff),
+        sensitivity,
+        source_type: "agent-handoff",
+        branch: handoff.branch,
+        git_commit: handoff.git_commit,
+        tags: ["handoff", handoff.state],
+        metadata: { handoff, provenance: { git_commit: handoff.git_commit ? "agent-asserted" : "not-supplied" } },
+        idempotency_key: idempotencyKey,
+        expires_at: effectiveAssessment.expires_at || null,
+        supersedes_id: replacesPrevious ? previousRecord.id : null,
+        allow_duplicate_content: true,
+      };
+      const captured = this.capture({ ...effectiveAssessment, record: recordInput }, {
+        actor: effectiveActor,
+        handoffSequence: this.nextHandoffSequence(),
+      });
+      if (replacesPrevious) {
+        const superseded = { ...previousRecord, status: "superseded", updated_at: nowIso() };
+        this.writeCanonical(superseded);
+        this.indexRecordUnsafe(superseded);
+        this.audit("handoff-supersede", previousRecord.id, `superseded-by:${captured.record.id}`, effectiveActor);
+      }
+      const persistedHandoff = JSON.parse(captured.record.metadata_json || "{}").handoff || null;
+      return { ...captured, handoff: persistedHandoff };
+    });
   }
 
   latestHandoff({

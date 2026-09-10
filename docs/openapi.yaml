@@ -343,6 +343,7 @@ components:
         branch: { type: string, maxLength: 200 }
         git_commit: { type: string, maxLength: 64 }
         checkpoint_id: { type: string, maxLength: 200 }
+        previous_checkpoint_id: { type: string, maxLength: 200 }
         sensitivity: { type: string, enum: [private, sensitive, restricted], default: private }
     HandoffPatch:
       type: object
@@ -360,6 +361,7 @@ components:
         branch: { type: [string, "null"], maxLength: 200 }
         git_commit: { type: [string, "null"], maxLength: 64 }
         checkpoint_id: { type: string, maxLength: 200 }
+        previous_checkpoint_id: { type: [string, "null"], maxLength: 200 }
     MemoryResult:
       type: object
       required: [id, title, body, namespace_id, confidence, score, citation]

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,6 +33,48 @@ test("CLI --home overrides environment home for local embedding cache resolution
     assert.equal(result.status, 1);
     assert.match(result.stderr, /not cached and offline mode is enabled/);
     assert.doesNotMatch(result.stderr, /real directory, not a symlink/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI handoff-save quarantines a checkpoint without latest-checkpoint lineage", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-handoff-test-"));
+  const firstPath = join(root, "first.json");
+  const conflictPath = join(root, "conflict.json");
+  writeFileSync(firstPath, JSON.stringify({
+    project_id: "api",
+    task_id: "cli-rollout",
+    checkpoint_id: "first",
+    goal: "Ship safely",
+    current_state: "Schema first",
+    branch: "main",
+  }));
+  writeFileSync(conflictPath, JSON.stringify({
+    project_id: "api",
+    task_id: "cli-rollout",
+    checkpoint_id: "conflict",
+    goal: "Ship safely",
+    current_state: "API first",
+    branch: "main",
+  }));
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const env = {
+    ...process.env,
+    CONTINUITYDB_ALLOWED_PROJECTS: "api",
+    CONTINUITYDB_OWNER_ID: "owner-a",
+    CONTINUITYDB_AGENT_ID: "agent-a",
+  };
+  try {
+    const first = spawnSync(process.execPath, [cli, "handoff-save", "--home", root, "--file", firstPath], { encoding: "utf8", env });
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(JSON.parse(first.stdout).disposition, "active");
+    const conflict = spawnSync(process.execPath, [cli, "handoff-save", "--home", root, "--file", conflictPath], { encoding: "utf8", env });
+    assert.equal(conflict.status, 0, conflict.stderr);
+    assert.equal(JSON.parse(conflict.stdout).disposition, "quarantined");
+    const latest = spawnSync(process.execPath, [cli, "handoff-latest", "cli-rollout", "--home", root, "--project", "api", "--branch", "main"], { encoding: "utf8", env });
+    assert.equal(latest.status, 0, latest.stderr);
+    assert.equal(JSON.parse(latest.stdout).handoff.current_state, "Schema first");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -81,9 +81,40 @@ test("HTTP API binds identity server-side and supports approved lifecycle", asyn
       }),
     });
     assert.equal(handoffResponse.status, 201);
+    const firstHandoff = await handoffResponse.json();
+    const conflictingHandoffResponse = await fetch(`${base}/v1/handoffs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "handoff-2" },
+      body: JSON.stringify({
+        project_id: "api",
+        task_id: "schema-v2",
+        goal: "Ship SchemaV2",
+        current_state: "Deploy API before schema",
+        branch: "main",
+      }),
+    });
+    assert.equal(conflictingHandoffResponse.status, 201);
+    assert.equal((await conflictingHandoffResponse.json()).disposition, "quarantined");
     const latestHandoff = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=schema-v2&branch=main`);
     assert.equal(latestHandoff.status, 200);
     assert.equal((await latestHandoff.json()).handoff.current_state, "Schema committed");
+
+    const continuedHandoffResponse = await fetch(`${base}/v1/handoffs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "handoff-3" },
+      body: JSON.stringify({
+        project_id: "api",
+        task_id: "schema-v2",
+        goal: "Ship SchemaV2",
+        current_state: "Client regenerated",
+        previous_checkpoint_id: firstHandoff.handoff.checkpoint_id,
+        branch: "main",
+      }),
+    });
+    assert.equal(continuedHandoffResponse.status, 201);
+    assert.equal((await continuedHandoffResponse.json()).disposition, "active");
+    const continuedLatest = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=schema-v2&branch=main`);
+    assert.equal((await continuedLatest.json()).handoff.current_state, "Client regenerated");
 
     const sensitiveHandoffResponse = await fetch(`${base}/v1/handoffs`, {
       method: "POST",

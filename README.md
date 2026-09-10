@@ -292,7 +292,10 @@ injects exactly one separately addressed checkpoint selected by shared owner,
 project, task and applicable branch. Private checkpoints receive the configured
 working-memory TTL; sensitive and restricted checkpoints are quarantined until a
 reviewer explicitly approves them. Per-agent/project capture quotas apply to
-checkpoints as well, while exact idempotent retries remain allowed.
+checkpoints as well, while exact idempotent retries remain allowed. After the
+first checkpoint for a task and branch, every successor must name the current
+latest checkpoint in `previous_checkpoint_id`. This compare-and-set lineage
+quarantines stale or concurrent writers instead of replacing startup context.
 
 ```bash
 export CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331
@@ -702,7 +705,8 @@ Important shipped controls include:
 - Git commit/ref/path/checksum/excerpt validation for durable Git facts;
 - committed-blob repository ingestion and branch-scoped working knowledge;
 - task/branch-scoped handoff idempotency, persisted retry responses, bounded
-  checkpoint TTLs, deterministic checkpoint sequencing, and structured correction;
+  checkpoint TTLs, deterministic checkpoint sequencing, compare-and-set lineage,
+  atomic quota enforcement, and structured correction;
 - idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
 - transactionally serialized hash-chained audit log, legacy-chain preservation,
   and verifier;

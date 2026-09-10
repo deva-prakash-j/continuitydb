@@ -301,42 +301,19 @@ export class CapturePolicy {
       throw error;
     }
     if (!vault) throw new Error("handoff capture policy requires a vault for quota enforcement");
-    const agentId = identity.agent_id || identity.principal_id;
-    let idempotentRetry = null;
-    if (input.checkpoint_id) {
-      const taskId = requiredIdentifier(input.task_id, "task_id");
-      const branch = input.branch ? requiredIdentifier(input.branch, "branch") : null;
-      const checkpointId = requiredIdentifier(input.checkpoint_id, "checkpoint_id");
-      const key = `handoff:${createHash("sha256").update([taskId, branch || "global", checkpointId].join("\u0000")).digest("hex")}`;
-      idempotentRetry = vault.findByIdempotency({
-        tenant_id: identity.tenant_id,
-        owner_id: identity.owner_id,
-        namespace_id: `project/${projectId}`,
-        agent_id: agentId,
-        idempotency_key: key,
-      });
-    }
-    if (!idempotentRetry && vault.captureCount({
-      tenant_id: identity.tenant_id,
-      owner_id: identity.owner_id,
-      agent_id: agentId,
-      project_id: projectId,
-    }) >= this.config.max_records_per_project_per_agent) {
-      const error = new Error("capture quota exceeded for this agent and project");
-      error.code = "FORBIDDEN";
-      throw error;
-    }
     if (["sensitive", "restricted"].includes(sensitivity)) {
       return {
         disposition: "quarantined",
         reason: "high-sensitivity handoff requires review before recall",
         expires_at: null,
+        quota_limit: this.config.max_records_per_project_per_agent,
       };
     }
     return {
       disposition: "active",
       reason: "project-scoped handoff with capture-policy-bounded TTL",
       expires_at: futureIso(this.config.working_ttl_seconds),
+      quota_limit: this.config.max_records_per_project_per_agent,
     };
   }
 }
