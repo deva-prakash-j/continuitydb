@@ -104,3 +104,20 @@ output for each gate:
 
 Until those gates run on a distributed adapter, the repository must say
 “designed for horizontal scale,” not “billion-scale proven.”
+
+## Reproducible benchmark ladder
+
+Run `npm run benchmark:scale` at 10k, 100k, 250k and 1M records to locate the
+embedded-mode ceiling. Use at least three repetitions and publish raw runs; do
+not report only the best result. The benchmark mixes reads, context packing and
+automatic agent capture, records tail latency and checks tenant isolation.
+
+The next ladder requires the production PostgreSQL/pgvector adapter:
+
+1. 10M records and 100-1,000 clients for the team envelope.
+2. 100M records with routed shards, replicas and projection workers.
+3. One billion real metadata rows and vectors with 20,000 clients, realistic
+   think time, skewed tenants and injected node/shard failures.
+
+At every rung, run retrieval quality and adversarial isolation suites alongside
+load. Latency without correct, authorized results is a failed benchmark.

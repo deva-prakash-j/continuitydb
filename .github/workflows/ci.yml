@@ -28,6 +28,7 @@ jobs:
       - run: npm test
       - run: npm run validate:openapi
       - run: npm run benchmark:quality
+      - run: npm run benchmark:scale -- --records=100 --queries=50 --operations=40 --repetitions=1 --concurrency=1,4 --warmup=10
       - run: npm audit --omit=dev
       - run: npm pack --dry-run
 

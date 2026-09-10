@@ -193,6 +193,7 @@ permission or becomes executable policy.
 npm test
 npm run benchmark
 npm run benchmark:quality
+npm run benchmark:scale
 # With a configured real embedding provider:
 npm run benchmark:hybrid
 npm run release:check
@@ -208,6 +209,16 @@ equivalent run, including feedback aggregation, measured p50 **2.098 ms**, p95
 additional isolation, temporal, graph-fusion and audit work is visible in the
 latency rather than hidden. A configured real embedding model and a distributed
 load harness are required before publishing semantic or billion-scale claims.
+
+The first repeatable v0.3 mixed-workload run used 10k memories, four tenants,
+three repetitions and 1/8/32 concurrent HTTP clients. It produced zero misses,
+zero isolation violations and zero HTTP failures. Median throughput plateaued at
+roughly 130 operations/second; at 32 clients, search p95 was **284.101 ms**,
+context-pack p95 **506.872 ms**, and automatic-capture p95 **743.367 ms**. This
+is evidence that the synchronous embedded service saturates under write-mixed
+concurrency, not a distributed-scale claim. See the
+[benchmark report](docs/benchmark-report-2026-09-10.md) and
+[raw result](benchmarks/results/embedded-10k-2026-09-10.json).
 
 Raw baseline output is under [`benchmarks/`](benchmarks/). Required global-scale
 gates are defined in [Scalability](docs/scalability.md).

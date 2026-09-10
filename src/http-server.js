@@ -129,6 +129,7 @@ export function createContinuityServer({
   localIdentity = null,
   embedder = createEmbedderFromEnv(),
   capturePolicy = new CapturePolicy(loadCapturePolicy(process.env.CONTINUITYDB_CAPTURE_POLICY_FILE || null)),
+  limiter = new TokenBucketLimiter(),
 } = {}) {
   const entries = loadTokenPolicy(tokenPolicyPath);
   if (!isLoopback(host) && (!entries.length || !trustProxyTls)) {
@@ -144,7 +145,6 @@ export function createContinuityServer({
     allowed_projects: (process.env.CONTINUITYDB_ALLOWED_PROJECTS || "").split(",").filter(Boolean),
     allowed_sensitivities: (process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private").split(",").filter(Boolean),
   });
-  const limiter = new TokenBucketLimiter();
   const engine = new HybridEngine(vault, embedder);
   const metrics = { requests: 0, errors: 0, rate_limited: 0, started_at: Date.now() };
 
