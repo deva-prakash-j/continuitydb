@@ -403,6 +403,25 @@ function parseRecord(contents) {
   return { ...JSON.parse(match[1]), body: match[2].trimEnd() };
 }
 
+const SQLITE_INIT_WAIT = new Int32Array(new SharedArrayBuffer(4));
+
+function withSqliteBusyRetry(operation, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let delayMs = 5;
+  while (true) {
+    try {
+      return operation();
+    } catch (error) {
+      const busy = error?.errcode === 5 || error?.errcode === 6
+        || error?.code === "SQLITE_BUSY" || error?.code === "SQLITE_LOCKED"
+        || /database (?:is )?(?:locked|busy)/i.test(error?.message || "");
+      if (!busy || Date.now() >= deadline) throw error;
+      Atomics.wait(SQLITE_INIT_WAIT, 0, 0, delayMs);
+      delayMs = Math.min(delayMs * 2, 100);
+    }
+  }
+}
+
 export class ContextVault {
   constructor(rootDir = process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb")) {
     this.rootDir = rootDir;
@@ -415,11 +434,15 @@ export class ContextVault {
     mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
 
     this.db = new DatabaseSync(join(this.indexDir, "context-vault.db"));
-    this.db.exec(`
+    // Configure the busy handler before WAL or schema initialization. WAL mode
+    // takes an exclusive lock the first time a database is opened, so putting
+    // busy_timeout in the same batch after journal_mode allowed concurrent
+    // first-open processes to fail immediately with SQLITE_BUSY.
+    this.db.exec("PRAGMA busy_timeout = 15000;");
+    withSqliteBusyRetry(() => this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA synchronous = NORMAL;
       PRAGMA foreign_keys = ON;
-      PRAGMA busy_timeout = 5000;
 
       CREATE TABLE IF NOT EXISTS memory_records (
         id TEXT PRIMARY KEY,
@@ -608,10 +631,15 @@ export class ContextVault {
         reason TEXT,
         migrated_at TEXT NOT NULL
       );
-    `);
+    `));
 
-    this.migrateLegacySchema();
-    this.migrateLegacyAudit();
+    // Schema upgrades and legacy evidence import must be one serialized
+    // bootstrap unit. Without this transaction, concurrent processes can both
+    // observe an old schema and race the same ALTER/import operation.
+    this.runTransaction(() => {
+      this.migrateLegacySchema();
+      this.migrateLegacyAudit();
+    });
     const indexed = this.db.prepare("SELECT count(*) AS count FROM memory_records").get().count;
     const canonicalCount = readdirSync(this.recordsDir).filter((name) => name.endsWith(".md")).length;
     if (Number(indexed) === 0 && canonicalCount > 0) this.rebuildIndex();

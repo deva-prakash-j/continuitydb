@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,6 +7,41 @@ import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { ContextVault, estimateSerializedTokens } from "../src/store.js";
+
+const firstOpenScript = `
+  import { ContextVault } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+  const [root, startAtValue] = process.argv.slice(1);
+  const startAt = Number(startAtValue);
+  while (Date.now() < startAt) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+  const vault = new ContextVault(root);
+  try {
+    const result = vault.verifyAuditLog();
+    process.stdout.write(JSON.stringify({ ok: true, audit_valid: result.valid }));
+  } finally { vault.close(); }
+`;
+
+function runFirstOpen(root, startAt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module", "--eval", firstOpenScript, root, String(startAt),
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("concurrent first-open process exceeded 20 second timeout"));
+    }, 20_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) return reject(new Error(`first-open process exited ${code}: ${stderr}`));
+      try { resolve(JSON.parse(stdout)); }
+      catch { reject(new Error(`first-open process returned invalid JSON: ${stdout}\n${stderr}`)); }
+    });
+  });
+}
 
 const ACTIVE_HANDOFF = Object.freeze({
   disposition: "active",
@@ -30,6 +66,22 @@ function fixture() {
     },
   };
 }
+
+test("concurrent processes can initialize the same empty vault", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-first-open-test-"));
+  try {
+    const startAt = Date.now() + 500;
+    const results = await Promise.all(Array.from({ length: 24 }, () => runFirstOpen(root, startAt)));
+    assert.equal(results.length, 24);
+    assert.ok(results.every((result) => result.ok && result.audit_valid));
+
+    const reopened = new ContextVault(root);
+    assert.equal(reopened.verifyAuditLog().valid, true);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("proposals are invisible until committed and retries are idempotent", () => {
   const f = fixture();
