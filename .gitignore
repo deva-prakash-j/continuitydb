@@ -1,6 +1,7 @@
 node_modules/
 .context-vault/
 .continuitydb/
+.continuitydb-handoff.json
 .env
 .env.*
 !.env.example

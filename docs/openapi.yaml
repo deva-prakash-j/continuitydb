@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ContinuityDB API
-  version: 0.3.0
+  version: 0.4.0
   description: Versioned API for governed, portable agent memory and context packs.
 servers:
   - url: http://127.0.0.1:7331
@@ -19,6 +19,13 @@ paths:
       operationId: readiness
       responses:
         "200": { description: Storage is queryable }
+  /ui:
+    get:
+      operationId: reviewInboxUi
+      description: Opt-in same-origin review inbox. Disabled unless CONTINUITYDB_ENABLE_REVIEW_UI=true.
+      responses:
+        "200": { description: Review inbox HTML }
+        "404": { description: Review UI is disabled }
   /v1/search:
     post:
       operationId: searchMemories
@@ -75,6 +82,21 @@ paths:
       responses:
         "201": { description: Proposal created }
         "200": { description: Existing idempotent proposal returned }
+  /v1/memories:
+    get:
+      operationId: listReviewMemories
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, default: "proposed,quarantined" }
+        - name: project_id
+          in: query
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200": { description: Caller-visible memories for governance review }
   /v1/memories/captures:
     post:
       operationId: captureMemory
@@ -110,7 +132,33 @@ paths:
       parameters:
         - $ref: "#/components/parameters/MemoryId"
       responses:
-        "200": { description: Proposal activated and optional embedding indexed }
+        "200": { description: Proposed or quarantined memory explicitly approved and optionally indexed }
+  /v1/memories/{id}/revisions:
+    post:
+      operationId: reviseHeldMemory
+      parameters:
+        - $ref: "#/components/parameters/MemoryId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [replacement]
+              properties:
+                reason: { type: string }
+                replacement:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    title: { type: string, minLength: 1, maxLength: 500 }
+                    body: { type: string, minLength: 1, maxLength: 1000000 }
+                    branch: { type: [string, "null"], maxLength: 200 }
+                    confidence: { type: number, minimum: 0, maximum: 1 }
+                    importance: { type: number, minimum: 0, maximum: 1 }
+                    tags: { type: array, maxItems: 64, items: { type: string } }
+      responses:
+        "200": { description: Held memory corrected and returned to proposed status }
   /v1/memories/{id}/corrections:
     post:
       operationId: correctMemory
@@ -156,6 +204,39 @@ paths:
       operationId: linkMemories
       responses:
         "201": { description: Temporal memory graph edge created }
+  /v1/handoffs:
+    post:
+      operationId: saveHandoffCheckpoint
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          schema: { type: string, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HandoffRequest" }
+      responses:
+        "201": { description: Structured checkpoint saved and activated }
+        "200": { description: Existing idempotent checkpoint returned }
+  /v1/handoffs/latest:
+    get:
+      operationId: getLatestHandoff
+      parameters:
+        - name: project_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: task_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: branch
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { description: Latest owner/project/task/branch-applicable checkpoint }
+        "404": { description: No applicable checkpoint }
   /v1/stats:
     get:
       operationId: getTenantStats
@@ -227,11 +308,29 @@ components:
         repo_path: { type: string, maxLength: 1024 }
         symbol: { type: string, maxLength: 500 }
         git_commit: { type: string, maxLength: 64 }
-        branch: { type: string, maxLength: 500 }
+        branch: { type: string, maxLength: 200 }
         content_checksum: { type: string, pattern: "^[A-Fa-f0-9]{64}$" }
         tags: { type: array, maxItems: 64, items: { type: string, maxLength: 200 } }
         idempotency_key: { type: string, maxLength: 512 }
         observed_at: { type: string, format: date-time }
+    HandoffRequest:
+      type: object
+      required: [project_id, task_id, goal, current_state]
+      additionalProperties: false
+      properties:
+        project_id: { type: string, minLength: 1, maxLength: 200 }
+        task_id: { type: string, minLength: 1, maxLength: 200 }
+        goal: { type: string, minLength: 1, maxLength: 4000 }
+        current_state: { type: string, minLength: 1, maxLength: 8000 }
+        completed_work: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        unresolved_questions: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        next_actions: { type: array, maxItems: 64, items: { type: string, minLength: 1, maxLength: 2000 } }
+        relevant_files: { type: array, maxItems: 128, items: { type: string, minLength: 1, maxLength: 1024 } }
+        state: { type: string, enum: [in_progress, blocked, completed], default: in_progress }
+        branch: { type: string, maxLength: 200 }
+        git_commit: { type: string, maxLength: 64 }
+        checkpoint_id: { type: string, maxLength: 200 }
+        sensitivity: { type: string, enum: [private, sensitive, restricted], default: private }
     MemoryResult:
       type: object
       required: [id, title, body, namespace_id, confidence, score, citation]

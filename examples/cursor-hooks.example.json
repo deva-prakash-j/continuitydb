@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "continuitydb-hook session-start --client cursor"
+      }
+    ],
+    "stop": [
+      {
+        "command": "continuitydb-hook checkpoint --client cursor --file .continuitydb-handoff.json"
+      }
+    ]
+  }
+}

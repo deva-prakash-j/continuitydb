@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { extname, join, relative, resolve, sep } from "node:path";
+import { realpathSync } from "node:fs";
+import { extname, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
 
 const CODE_EXTENSIONS = new Set([
@@ -21,10 +21,6 @@ function git(root, args) {
     maxBuffer: 64 * 1024 * 1024,
     stdio: ["ignore", "pipe", "pipe"],
   }).trim();
-}
-
-function isWithin(root, candidate) {
-  return candidate === root || candidate.startsWith(`${root}${sep}`);
 }
 
 function sanitizeRemote(value) {
@@ -102,29 +98,44 @@ export function scanRepository(inputPath, {
     try { return sanitizeRemote(git(root, ["remote", "get-url", "origin"])); } catch { return null; }
   })();
   const inferredProject = projectId || root.split(sep).at(-1);
-  const fileOutput = since
-    ? git(root, ["diff", "--name-only", "-z", `${since}..HEAD`])
-    : execFileSync("git", ["-C", root, "ls-files", "-z"], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
-  const tracked = fileOutput.split("\0").filter(Boolean).slice(0, maxFiles);
+  const changed = since
+    ? new Set(execFileSync("git", ["-C", root, "diff", "--name-only", "-z", `${since}..HEAD`], {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    }).split("\0").filter(Boolean))
+    : null;
+  const tree = execFileSync("git", ["-C", root, "ls-tree", "-r", "-z", commit], {
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  }).split("\0").filter(Boolean).map((line) => {
+    const match = line.match(/^(\d+)\s+(\w+)\s+([a-f0-9]+)\t([\s\S]+)$/);
+    if (!match) throw new Error("Git returned an invalid tree entry");
+    return { mode: match[1], objectType: match[2], objectId: match[3], repoPath: match[4] };
+  }).filter((entry) => !changed || changed.has(entry.repoPath));
+  const tracked = tree.slice(0, maxFiles);
   const records = [];
   const skipped = { denied: 0, symlink: 0, too_large: 0, unsupported: 0, unreadable: 0 };
 
-  for (const repoPath of tracked) {
+  for (const entry of tracked) {
+    const { repoPath } = entry;
     if (DENIED_BASENAMES.test(repoPath)) { skipped.denied += 1; continue; }
+    if (entry.objectType !== "blob" || entry.mode === "120000") { skipped.symlink += 1; continue; }
     const extension = extname(repoPath);
     const supported = CODE_EXTENSIONS.has(extension)
       || (includeDocs && DOC_EXTENSIONS.has(extension))
       || /(?:package\.json|pom\.xml|requirements[^/]*\.txt|go\.mod|Cargo\.toml)$/.test(repoPath);
     if (!supported) { skipped.unsupported += 1; continue; }
     try {
-      const candidate = join(root, repoPath);
-      if (lstatSync(candidate).isSymbolicLink()) { skipped.symlink += 1; continue; }
-      const canonical = realpathSync(candidate);
-      if (!isWithin(root, canonical)) { skipped.symlink += 1; continue; }
-      if (statSync(canonical).size > maxFileBytes) { skipped.too_large += 1; continue; }
-      const text = readFileSync(canonical, "utf8");
+      const objectSize = Number(git(root, ["cat-file", "-s", entry.objectId]));
+      if (!Number.isSafeInteger(objectSize) || objectSize < 0) throw new Error("invalid Git blob size");
+      if (objectSize > maxFileBytes) { skipped.too_large += 1; continue; }
+      const contents = execFileSync("git", ["-C", root, "cat-file", "blob", entry.objectId], {
+        encoding: "buffer",
+        maxBuffer: Math.max(objectSize + 1, 64 * 1024),
+      });
+      const text = contents.toString("utf8");
       if (text.includes("\u0000")) { skipped.unsupported += 1; continue; }
-      const checksum = createHash("sha256").update(text).digest("hex");
+      const checksum = createHash("sha256").update(contents).digest("hex");
       const symbols = CODE_EXTENSIONS.has(extension) ? extractSymbols(text) : [];
       const dependencies = extractManifestFacts(repoPath, text);
       if (symbols.length || dependencies.length || DOC_EXTENSIONS.has(extension)) {
@@ -141,11 +152,11 @@ export function scanRepository(inputPath, {
           body: summary,
           source_type: "git",
           source_uri: remote ? `${remote}#${commit}:${repoPath}` : `git://${inferredProject}/${repoPath}`,
-          repo_path: relative(root, canonical),
+          repo_path: repoPath,
           git_commit: commit,
           branch,
           tags: ["git-grounded", symbols.length ? "code" : dependencies.length ? "dependency" : "docs"],
-          metadata: { checksum, symbols, dependencies },
+          metadata: { checksum, symbols, dependencies, provenance_mode: "committed-blob", git_object: entry.objectId },
           idempotency_key: `git:${inferredProject}:${commit}:${repoPath}:${checksum}`,
         });
       }
@@ -157,7 +168,7 @@ export function scanRepository(inputPath, {
     repository: { project_id: inferredProject, root, remote, commit, branch },
     scanned_files: tracked.length,
     produced_records: records.length,
-    truncated: tracked.length === maxFiles,
+    truncated: tree.length > tracked.length,
     skipped,
     records,
   };

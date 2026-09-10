@@ -1,16 +1,18 @@
 {
   "name": "continuitydb",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": false,
   "description": "Portable, Git-grounded context graph for AI agents",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": ["ai", "agent", "memory", "mcp", "rag", "code-graph", "context-engine"],
   "bin": {
-    "continuitydb": "src/cli.js"
+    "continuitydb": "src/cli.js",
+    "continuitydb-hook": "src/lifecycle-hook.js"
   },
   "exports": {
     ".": "./src/store.js",
+    "./http-client": "./src/http-client.js",
     "./capture-policy": "./src/capture-policy.js",
     "./security": "./src/security.js",
     "./ranking": "./src/ranking.js"

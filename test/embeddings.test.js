@@ -23,6 +23,7 @@ test("hybrid engine returns ACL-filtered semantic candidates when lexical search
       namespace_id: "project/billing",
       title: "Outbox relay",
       body: "Persist the invoice and publication record atomically, then relay later.",
+      branch: "feature/outbox",
     });
     vault.commit(proposal.record.id);
     vectors.set(`${proposal.record.title}\n${proposal.record.body}`, [0, 1, 0, 0, 0, 0, 0, 0]);
@@ -33,9 +34,18 @@ test("hybrid engine returns ACL-filtered semantic candidates when lexical search
       query: "avoid inconsistent dual writes",
       project_id: "billing",
       allowed_projects: ["billing"],
+      branch: "feature/outbox",
     });
     assert.equal(results[0].id, proposal.record.id);
     assert.ok(results[0].score_signals.semantic > 0);
+
+    const wrongBranch = await engine.search({
+      query: "avoid inconsistent dual writes",
+      project_id: "billing",
+      allowed_projects: ["billing"],
+      branch: "main",
+    });
+    assert.equal(wrongBranch.length, 0);
 
     const denied = await engine.search({
       query: "avoid inconsistent dual writes",

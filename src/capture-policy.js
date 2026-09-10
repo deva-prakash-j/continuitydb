@@ -61,7 +61,7 @@ export function loadCapturePolicy(path) {
   });
 }
 
-export function verifyGitEvidence({ project_id, git_commit, repo_path, content_checksum, body }, policy) {
+export function verifyGitEvidence({ project_id, git_commit, repo_path, content_checksum, body, branch = null }, policy) {
   const project = policy.project_roots[project_id];
   if (!project) return { verified: false, reason: "project root is not configured" };
   if (typeof git_commit !== "string" || !/^[a-f0-9]{7,64}$/i.test(git_commit)) {
@@ -93,6 +93,26 @@ export function verifyGitEvidence({ project_id, git_commit, repo_path, content_c
       }
     });
     if (!reachable) return { verified: false, reason: "commit is not reachable from an allowed ref" };
+    let verifiedBranch = null;
+    if (branch) {
+      verifiedBranch = requiredIdentifier(branch, "branch");
+      try {
+        execFileSync("git", ["rev-parse", "--verify", `${verifiedBranch}^{commit}`], {
+          cwd: project.root,
+          stdio: "ignore",
+          timeout: 5_000,
+          maxBuffer: 64 * 1024,
+        });
+        execFileSync("git", ["merge-base", "--is-ancestor", git_commit, verifiedBranch], {
+          cwd: project.root,
+          stdio: "ignore",
+          timeout: 5_000,
+          maxBuffer: 64 * 1024,
+        });
+      } catch {
+        return { verified: false, reason: "git_commit is not reachable from the claimed branch" };
+      }
+    }
     const contents = execFileSync("git", ["show", `${git_commit}:${path}`], {
       cwd: project.root,
       stdio: ["ignore", "pipe", "ignore"],
@@ -105,7 +125,11 @@ export function verifyGitEvidence({ project_id, git_commit, repo_path, content_c
     if (!excerpt || !contents.toString("utf8").includes(excerpt)) {
       return { verified: false, reason: "git-fact body must be an exact excerpt from the verified file" };
     }
-    return { verified: true, reason: "commit, path, checksum and exact excerpt verified in configured project root" };
+    return {
+      verified: true,
+      branch: verifiedBranch,
+      reason: "commit, path, checksum, branch and exact excerpt verified in configured project root",
+    };
   } catch {
     return { verified: false, reason: "commit or path was not found in configured project root" };
   }
@@ -132,6 +156,7 @@ export class CapturePolicy {
       throw error;
     }
     const confidence = boundedNumber(input.confidence, 0.5, 0, 0.9, "confidence");
+    const branch = input.branch ? requiredIdentifier(input.branch, "branch") : null;
     const gitSubjectSymbol = input.symbol && typeof input.body === "string" && input.body.includes(input.symbol)
       ? input.symbol
       : "";
@@ -167,7 +192,7 @@ export class CapturePolicy {
       repo_path: null,
       symbol: null,
       git_commit: null,
-      branch: null,
+      branch,
       tags: input.tags,
       subject_key: subjectKey,
       idempotency_key: captureIdempotencyKey,
@@ -215,6 +240,7 @@ export class CapturePolicy {
         repo_path: input.repo_path,
         content_checksum: input.content_checksum,
         body: input.body,
+        branch,
       }, this.config);
       if (git.verified) {
         const verifiedSymbol = input.symbol && input.body.includes(input.symbol) ? input.symbol : null;
@@ -224,7 +250,7 @@ export class CapturePolicy {
         base.repo_path = input.repo_path;
         base.symbol = verifiedSymbol;
         base.git_commit = input.git_commit;
-        base.branch = null;
+        base.branch = git.branch;
         base.metadata.git_content_sha256 = input.content_checksum.toLowerCase();
       } else {
         base.metadata.claimed_git = {

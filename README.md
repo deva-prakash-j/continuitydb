@@ -15,7 +15,7 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.3 alpha. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.4 alpha. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
 > production adapter and billion-record proof do not exist yet.
@@ -84,7 +84,7 @@ Tenant, project, sensitivity, lifecycle, temporal, and provenance controls keep
 retrieval bounded. Personal and employer data should still use separate stores
 and credentials when their trust domains differ.
 
-## Implemented in v0.3
+## Implemented in v0.4
 
 ### Retrieval
 
@@ -108,16 +108,20 @@ and credentials when their trust domains differ.
 - tenant/owner/namespace/agent-scoped idempotency keys;
 - canonical human-readable records and rebuildable indexes;
 - JSONL export and index rebuild support;
-- SHA-256 hash-chained local audit log with verification.
+- structured, task-addressable handoff checkpoints with branch-aware latest retrieval;
+- SHA-256 hash-chained audit events serialized transactionally in SQLite.
 
 ### Interfaces and operations
 
-- four agent-facing MCP tools;
+- six agent-facing MCP tools, including structured handoff save/retrieval;
+- HTTP-backed stdio MCP mode so many clients can share one authoritative service;
+- lifecycle hook adapter plus Claude Code and Cursor configuration examples;
+- opt-in local review inbox for approval, correction, provenance inspection, and context preview;
 - versioned HTTP API with server-bound identity and scoped authorization;
 - CLI for setup, health checks, capture, lifecycle, retrieval, graph links,
   repository scanning, export, statistics, and audit verification;
-- Git tracked-file scanner with incremental mode, path containment, symlink
-  rejection, file limits, and a secret-path denylist;
+- Git committed-blob scanner with incremental mode, symlink rejection, file
+  limits, and a secret-path denylist; dirty worktree content is never attributed to `HEAD`;
 - OpenAPI contract, tests, benchmarks, CI, non-root container, threat model,
   security policy, contribution guide, and governance document;
 - 64-partition PostgreSQL/pgvector reference migrations with owner-aware row-level security.
@@ -219,10 +223,59 @@ The MCP surface is intentionally small:
 | `memory_context_pack` | Build a cited, token-budgeted pack for a task | No |
 | `memory_capture` | Submit memory through server-side risk policy | Cannot approve, delete, correct, or change scope |
 | `memory_feedback` | Mark a visible memory helpful, incorrect, or outdated | No; ranking influence is bounded |
+| `handoff_checkpoint` | Save goal/state/completed work/questions/next actions/files as one checkpoint | Cannot approve other memories or change permissions |
+| `handoff_latest` | Retrieve the latest task/project/branch-applicable checkpoint | No |
 
 Use [`examples/mcp.vscode.example.json`](examples/mcp.vscode.example.json) as a
 VS Code/Copilot-compatible starting point. Other clients can launch the same
 stdio command using their MCP configuration format.
+
+### Use one central store from many MCP clients
+
+Run one authoritative service, then make each local stdio MCP process a thin
+HTTP adapter instead of constructing its own `ContextVault`:
+
+```bash
+# Authoritative service
+CONTINUITYDB_ALLOWED_PROJECTS=service-a,schema-a \
+continuitydb serve --home /absolute/private/path/continuitydb-data
+
+# MCP process launched by each client
+CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331 \
+continuitydb mcp
+```
+
+For a remote HTTPS service, set `CONTINUITYDB_HTTP_TOKEN_ENV` to the name of a
+host-injected credential entry. Do not put a token in the URL, MCP arguments,
+repository, or visible logs. The client rejects plaintext non-loopback URLs.
+See [`examples/mcp.remote.vscode.example.json`](examples/mcp.remote.vscode.example.json).
+
+### Automatic session lifecycle adapters
+
+`continuitydb-hook` retrieves the latest structured handoff plus a context pack
+at session start. At stop/checkpoint it saves only the explicit structured JSON
+file; it never mines raw transcripts.
+
+```bash
+export CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331
+export CONTINUITYDB_PROJECT_ID=service-a
+export CONTINUITYDB_TASK_ID=schema-v2-rollout
+export CONTINUITYDB_BRANCH=feature/schema-v2
+
+continuitydb-hook session-start
+continuitydb-hook checkpoint --file .continuitydb-handoff.json --verbose
+```
+
+Start from [`examples/handoff.example.json`](examples/handoff.example.json).
+Copy the relevant hook shape into Claude Code or Cursor:
+
+- [`examples/claude-code-hooks.example.json`](examples/claude-code-hooks.example.json)
+- [`examples/cursor-hooks.example.json`](examples/cursor-hooks.example.json)
+
+The examples follow the clients' command-hook contracts: Claude Code receives
+plain `SessionStart` stdout as context, while Cursor receives
+`additional_context` JSON. Cursor cloud agents currently do not run
+`sessionStart`; use its MCP surface or a self-hosted/local session there.
 
 Employers may disable custom MCP servers. Do not ingest employer repositories
 or context unless organizational policy explicitly permits it.
@@ -265,6 +318,8 @@ Run `continuitydb help` for the concise built-in usage text.
 | `correct` | Create an active replacement and supersede the old version |
 | `search` | Retrieve ranked memories |
 | `context` | Build a cited, token-budgeted context pack |
+| `handoff-save` | Validate and save a structured checkpoint JSON file |
+| `handoff-latest` | Retrieve the newest checkpoint for a task and branch |
 | `link-project` | Add a typed project dependency edge |
 | `link-memory` | Add a typed memory edge |
 | `feedback` | Record bounded helpful/incorrect/outdated feedback |
@@ -300,7 +355,9 @@ continuitydb repo-scan /absolute/path/to/repo \
 for incremental scans. Limits can be set with `--max-files` and
 `--max-file-bytes`; use `--no-docs` to omit documentation files.
 
-The scanner does not execute repository code. v0.3 uses bounded pattern-based
+The scanner reads blobs from the resolved commit tree, not working-directory
+files, so an uncommitted edit cannot be cited as committed `HEAD` evidence. It
+does not execute repository code. v0.4 uses bounded pattern-based
 symbol and manifest extraction; sandboxed Tree-sitter workers remain planned.
 
 ## HTTP API
@@ -312,8 +369,16 @@ CONTINUITYDB_ALLOWED_PROJECTS=charge-api,charge-schema \
 continuitydb serve \
   --home "$PWD/.continuitydb-demo" \
   --host 127.0.0.1 \
-  --port 7331
+  --port 7331 \
+  --review-ui
 ```
+
+With `--review-ui`, open `http://127.0.0.1:7331/ui`. The opt-in loopback UI
+lists proposed/quarantined memories, exposes citations and metadata, supports
+correction/approval/rejection, and renders the exact context pack another agent
+would receive. Enabling it grants the implicit loopback identity local review
+authority; shared/network deployments should use an authenticated identity
+policy and a trusted frontend boundary instead.
 
 | Endpoint | Required scope |
 |---|---|
@@ -324,7 +389,9 @@ continuitydb serve \
 | `POST /v1/memories/{id}/feedback` | `memory:feedback` |
 | `POST /v1/memories/proposals` | `memory:propose` |
 | `POST /v1/memories/{id}/commit` | `memory:approve` |
-| corrections, deletion, graph links, and stats | `memory:admin` |
+| `GET /v1/memories` | `memory:approve` |
+| `POST /v1/handoffs`, `GET /v1/handoffs/latest` | `memory:capture`, `memory:read` |
+| corrections, held-memory revisions, deletion, graph links, and stats | `memory:admin` |
 | `GET /metrics` | `metrics:read` |
 
 The complete request and response contract is in
@@ -358,9 +425,16 @@ checks; do not assign it to agent identities.
 | `CONTINUITYDB_CAPTURE_POLICY_FILE` | unset | Private JSON capture-policy path |
 | `CONTINUITYDB_TOKEN_POLICY_FILE` | unset | Private HTTP token-policy path containing token digests |
 | `CONTINUITYDB_TRUST_PROXY_TLS` | `false` | Assert trusted TLS termination for non-loopback service |
+| `CONTINUITYDB_ENABLE_REVIEW_UI` | `false` | Enable the loopback approval/provenance/context-preview UI |
 | `CONTINUITYDB_MAX_BODY_BYTES` | `1048576` | Maximum HTTP request body size |
 | `CONTINUITYDB_MCP_CAPTURE_BURST` | `30` | MCP capture/feedback token-bucket capacity |
 | `CONTINUITYDB_MCP_CAPTURE_PER_SECOND` | `0.5` | MCP capture limiter refill rate |
+| `CONTINUITYDB_HTTP_URL` | unset | Make stdio MCP/lifecycle hooks use one authoritative HTTP service |
+| `CONTINUITYDB_HTTP_TOKEN_ENV` | `CONTINUITYDB_HTTP_TOKEN` | Name of the host-injected service credential entry |
+| `CONTINUITYDB_HTTP_TIMEOUT_MS` | `15000` | HTTP adapter request timeout |
+| `CONTINUITYDB_PROJECT_ID`, `CONTINUITYDB_TASK_ID`, `CONTINUITYDB_BRANCH` | unset | Lifecycle hook scope |
+| `CONTINUITYDB_HANDOFF_FILE` | unset | Explicit structured checkpoint file used by the stop hook |
+| `CONTINUITYDB_HOOK_CLIENT` | `claude` | Lifecycle startup output shape; set `cursor` for Cursor JSON |
 
 Policy files must not be readable or writable by group or other users. See the
 [capture-policy](examples/capture-policy.example.json) and inert
@@ -409,7 +483,8 @@ Retrieval follows this order:
 5. Expand bounded graph neighbors.
 6. Fuse ranks with RRF and apply scope, trust, freshness, exact-score, and feedback signals.
 7. Remove redundant evidence with MMR.
-8. Pack within the caller's token budget and return citations plus score signals.
+8. Pack within the caller's token budget using the full serialized envelope,
+   titles, citations, metadata, and response structure—not memory bodies alone.
 
 Every context pack warns that recalled memory is untrusted evidence. It never
 grants tool permission or becomes executable policy.
@@ -417,12 +492,14 @@ grants tool permission or becomes executable policy.
 ## Storage and recovery
 
 Embedded mode stores canonical Markdown records separately from SQLite indexes.
-The index can be rebuilt from canonical records. Audit events are appended to a
-hash-chained JSONL file. `continuitydb export` provides a portable JSONL snapshot.
+The index can be rebuilt from canonical records. Audit events form a hash chain
+inside a transactionally serialized SQLite table, so processes sharing one home
+cannot append from stale cached heads. `continuitydb export` provides a portable
+JSONL snapshot.
 
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
-encryption and remote signed audit checkpoints are not implemented in v0.3.
+encryption and remote signed audit checkpoints are not implemented in v0.4.
 
 ## Deployment and scale
 
@@ -499,8 +576,9 @@ Important shipped controls include:
 - bounded request size, graph depth, candidate counts, vector dimensions, timeouts, and capture rates;
 - recursive credential-pattern rejection and repository secret-path denylist;
 - Git commit/ref/path/checksum/excerpt validation for durable Git facts;
+- committed-blob repository ingestion and branch-scoped working knowledge;
 - idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
-- hash-chained audit log and verifier;
+- transactionally serialized hash-chained audit log and verifier;
 - pinned lockfile, minimal dependencies, CI audit, and non-root container.
 
 Known gaps include static-token lifecycle, application-level encryption,
@@ -518,7 +596,10 @@ issue.
 - Embedded writes and queries share one synchronous process.
 - Semantic retrieval is opt-in and has no default model bundled.
 - The local vector path is an exact bounded scan, not billion-scale ANN.
-- PostgreSQL migrations are a reference contract; no production adapter is wired yet.
+- The centralized service still uses the embedded SQLite runtime; PostgreSQL
+  migrations are a reference contract and no production adapter is wired yet.
+- Claude Code/Cursor hooks require an explicit structured checkpoint file; raw
+  transcript mining and passive screen capture remain intentionally excluded.
 - Repository symbol extraction is pattern-based rather than AST-precise.
 - Regex credential detection reduces common accidents but is not complete DLP.
 - Local data relies on host/volume encryption.
@@ -536,6 +617,7 @@ that close a documented limitation with tests and evidence are especially welcom
 | [Scalability](docs/scalability.md) | Deployment envelopes, invariants, sharding plan, scale gates |
 | [Threat model](docs/threat-model.md) | Assets, boundaries, threats, shipped controls, production requirements |
 | [Benchmark report](docs/benchmark-report-2026-09-10.md) | Reproduction, hardware, raw metrics, saturation verdict |
+| [v0.4 verification](docs/build-verification-2026-09-10-v0.4.md) | Central MCP, handoff, UI, provenance, branch, budget and audit gates |
 | [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
 | [Security policy](SECURITY.md) | Supported line and private reporting process |
 | [Contributing](CONTRIBUTING.md) | Development and pull-request expectations |

@@ -9,6 +9,17 @@ after the first stable release.
 - Sandboxed Tree-sitter workers and Git staleness projector.
 - OIDC/mTLS identity adapter and compliance purge coordinator.
 
+## [0.4.0] - 2026-09-10
+
+- Added HTTP-backed stdio MCP mode for one authoritative store across clients and machines.
+- Added first-class structured handoff checkpoints with task and branch-aware latest retrieval.
+- Added automatic lifecycle hook adapter and Claude Code/Cursor examples without raw transcript capture.
+- Added an opt-in loopback review inbox for approval, correction, rejection, provenance inspection and context preview.
+- Fixed Git provenance by scanning committed blobs rather than dirty working-tree files.
+- Fixed branch handling across capture, conflict detection, lexical/vector/graph retrieval and content deduplication.
+- Made token budgets account for the complete serialized context-pack response.
+- Moved the audit hash chain into transactionally serialized SQLite events for safe multi-process append ordering.
+
 ## [0.3.0] - 2026-09-10
 
 - Added policy-controlled automatic agent capture over MCP, HTTP and CLI.

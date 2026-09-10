@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
+import { ContinuityApiClient } from "../src/http-client.js";
+import { sha256 } from "../src/security.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-http-test-"));
@@ -22,6 +25,7 @@ function fixture() {
       allowed_projects: ["api", "schema"],
       allowed_sensitivities: ["public", "private"],
     },
+    enableReviewUi: true,
   });
   return { root, vault, service };
 }
@@ -63,9 +67,129 @@ test("HTTP API binds identity server-side and supports approved lifecycle", asyn
       body: JSON.stringify({ project_id: "payroll", namespace_id: "project/payroll", body: "Should be denied" }),
     });
     assert.equal(denied.status, 403);
+
+    const handoffResponse = await fetch(`${base}/v1/handoffs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "handoff-1" },
+      body: JSON.stringify({
+        project_id: "api",
+        task_id: "schema-v2",
+        goal: "Ship SchemaV2",
+        current_state: "Schema committed",
+        next_actions: ["Regenerate client"],
+        branch: "main",
+      }),
+    });
+    assert.equal(handoffResponse.status, 201);
+    const latestHandoff = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=schema-v2&branch=main`);
+    assert.equal(latestHandoff.status, 200);
+    assert.equal((await latestHandoff.json()).handoff.current_state, "Schema committed");
+
+    const ui = await fetch(`${base}/ui`);
+    assert.equal(ui.status, 200);
+    assert.match(ui.headers.get("content-security-policy"), /connect-src 'self'/);
+    assert.match(await ui.text(), /review inbox/i);
   } finally {
     await f.service.close().catch(() => f.vault.close());
     rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("review inbox exposes held memories and can explicitly approve quarantined captures", async () => {
+  const f = fixture();
+  try {
+    const held = f.vault.propose({
+      tenant_id: "tenant-a",
+      owner_id: "shared-owner",
+      namespace_id: "project/api",
+      project_id: "api",
+      body: "Review this proposed context.",
+    });
+    const quarantined = { ...held.record, id: randomUUID(), status: "quarantined", idempotency_key: null, body: "Review quarantined context.", content_hash: "b".repeat(64) };
+    f.vault.writeCanonical(quarantined);
+    f.vault.indexRecord(quarantined);
+    const address = await f.service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    const inbox = await fetch(`${base}/v1/memories?status=proposed,quarantined`);
+    assert.equal(inbox.status, 200);
+    const memories = (await inbox.json()).memories;
+    assert.deepEqual(new Set(memories.map((memory) => memory.status)), new Set(["proposed", "quarantined"]));
+    const revised = await fetch(`${base}/v1/memories/${held.record.id}/revisions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "review correction", replacement: { body: "Corrected proposed context.", branch: "main" } }),
+    });
+    assert.equal(revised.status, 200);
+    const revisedMemory = await revised.json();
+    assert.equal(revisedMemory.body, "Corrected proposed context.");
+    assert.equal(revisedMemory.branch, "main");
+    assert.equal(revisedMemory.status, "proposed");
+    const approved = await fetch(`${base}/v1/memories/${quarantined.id}/commit`, { method: "POST" });
+    assert.equal(approved.status, 200);
+    assert.equal((await approved.json()).status, "active");
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("HTTP client uses the central service instead of constructing a local vault", async () => {
+  const f = fixture();
+  try {
+    const address = await f.service.listen();
+    const client = new ContinuityApiClient({ baseUrl: `http://127.0.0.1:${address.port}` });
+    const captured = await client.capture({
+      project_id: "api",
+      memory_kind: "working",
+      body: "CentralServiceContext is shared.",
+      branch: "main",
+      idempotency_key: "central-context-1",
+    });
+    assert.equal(captured.disposition, "active");
+    const results = await client.search({ query: "CentralServiceContext", project_id: "api", branch: "main" });
+    assert.equal(results.length, 1);
+    const handoff = await client.saveHandoff({
+      project_id: "api",
+      task_id: "central-task",
+      goal: "Continue centrally",
+      current_state: "Checkpoint stored",
+      checkpoint_id: "central-checkpoint-1",
+    });
+    assert.equal(handoff.handoff.task_id, "central-task");
+    assert.equal((await client.latestHandoff({ project_id: "api", task_id: "central-task" })).handoff.current_state, "Checkpoint stored");
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("central HTTP adapter authenticates with a host-injected bearer value", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-http-token-test-"));
+  const vault = new ContextVault(root);
+  const token = "fixture-token-value-that-is-long-enough";
+  const policy = join(root, "tokens.json");
+  writeFileSync(policy, JSON.stringify({ tokens: [{
+    token_sha256: sha256(token),
+    tenant_id: "tenant-a",
+    principal_id: "agent-a",
+    owner_id: "owner-a",
+    agent_id: "remote-agent",
+    scopes: ["memory:read", "memory:capture"],
+    allowed_projects: ["api"],
+    allowed_sensitivities: ["private"],
+  }] }));
+  chmodSync(policy, 0o600);
+  const service = createContinuityServer({ vault, host: "127.0.0.1", port: 0, tokenPolicyPath: policy });
+  try {
+    const address = await service.listen();
+    const baseUrl = `http://127.0.0.1:${address.port}`;
+    assert.equal((await fetch(`${baseUrl}/v1/search`, { method: "POST" })).status, 401);
+    const client = new ContinuityApiClient({ baseUrl, token });
+    await client.capture({ project_id: "api", memory_kind: "working", body: "AuthenticatedCentralContext" });
+    assert.equal((await client.search({ query: "AuthenticatedCentralContext", project_id: "api" })).length, 1);
+  } finally {
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -205,4 +329,9 @@ test("non-loopback service refuses insecure startup", () => {
     vault.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("HTTP adapter rejects credentials in URLs and plaintext remote transport", () => {
+  assert.throws(() => new ContinuityApiClient({ baseUrl: "http://example.com" }), /must use HTTPS/);
+  assert.throws(() => new ContinuityApiClient({ baseUrl: "https://user:secret@example.com" }), /must not contain credentials/);
 });

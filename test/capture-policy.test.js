@@ -44,12 +44,20 @@ test("working capture auto-activates with bounded TTL and transfers across agent
     assert.equal(result.record.agent_id, "coding-agent-a");
     assert.equal(result.record.repo_path, null);
     assert.equal(result.record.git_commit, null);
-    assert.equal(result.record.branch, null);
+    assert.equal(result.record.branch, "main");
     assert.equal(result.record.symbol, null);
     assert.ok(Date.parse(result.record.expires_at) <= Date.now() + 86_401_000);
     assert.equal(f.vault.search({
       query: "schema",
       project_id: "api",
+      tenant_id: "tenant-a",
+      owner_id: "deva",
+      allowed_projects: ["api"],
+    }).length, 0);
+    assert.equal(f.vault.search({
+      query: "schema",
+      project_id: "api",
+      branch: "main",
       tenant_id: "tenant-a",
       owner_id: "deva",
       allowed_projects: ["api"],
@@ -118,6 +126,7 @@ test("Git facts activate only when commit, reachable path, and checksum verify",
     execFileSync("git", ["add", "schema.js"], { cwd: repo });
     execFileSync("git", ["commit", "-qm", "fixture"], { cwd: repo });
     const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+    const branch = execFileSync("git", ["branch", "--show-current"], { cwd: repo, encoding: "utf8" }).trim();
     const checksum = createHash("sha256").update(contents).digest("hex");
     const configPath = join(f.root, "capture-policy.json");
     writeFileSync(configPath, JSON.stringify({ project_roots: { api: { root: repo, allowed_refs: ["HEAD"] } } }), { mode: 0o600 });
@@ -143,15 +152,27 @@ test("Git facts activate only when commit, reachable path, and checksum verify",
       repo_path: "schema.js",
       symbol: "NotInVerifiedExcerpt",
       git_commit: commit,
-      branch: "forged-main",
+      branch,
       content_checksum: checksum,
     }, f.identity, f.vault), { actor: f.identity.principal_id });
     assert.equal(verified.disposition, "active");
     assert.equal(verified.record.source_type, "git-verified-agent");
     assert.equal(verified.record.symbol, null);
-    assert.equal(verified.record.branch, null);
+    assert.equal(verified.record.branch, branch);
     assert.equal(verified.record.title, "schema.js");
     assert.match(verified.record.source_uri, /^git:\/\/api@/);
+
+    const forgedBranch = f.vault.capture(policy.evaluate({
+      project_id: "api",
+      memory_kind: "git-fact",
+      confidence: 0.95,
+      body: "export const schemaVersion = 2;",
+      repo_path: "schema.js",
+      git_commit: commit,
+      branch: "forged-main",
+      content_checksum: checksum,
+    }, f.identity, f.vault), { actor: f.identity.principal_id });
+    assert.equal(forgedBranch.disposition, "quarantined");
 
     const forged = f.vault.capture(policy.evaluate({
       project_id: "api",

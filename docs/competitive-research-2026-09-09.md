@@ -39,7 +39,7 @@ but its core memory service was not treated as an open-source building block.
 
 ## Consolidated capability map
 
-| Capability | Why users need it | ContinuityDB v0.3 status |
+| Capability | Why users need it | ContinuityDB status |
 |---|---|---|
 | Explicit remember/search/get/correct/forget | predictable user control | implemented in embedded store; MCP capture/feedback is policy-bounded while approval/admin remain separate |
 | User, agent, tenant, session, project scopes | share only the intended context | tenant/owner/agent/project/sensitivity fields and server-bound policies implemented |
@@ -57,7 +57,7 @@ but its core memory service was not treated as an open-source building block.
 | HTTP, MCP, CLI | work across agents and deployment shapes | implemented |
 | Tamper evidence and audit | investigate changes and drift | hash-chained local JSONL audit and verification implemented |
 | Multimodal ingestion | memory for PDFs/audio/images | deliberately not in engineering-memory core; connector contract is future work |
-| Dashboard/editor extension | review and manage memory visually | not implemented; API/CLI are the v0.3 management surface |
+| Dashboard/editor extension | review and manage memory visually | v0.4 includes an opt-in local approval/correction/provenance/context-preview inbox; editor-native UX remains future work |
 | Multi-language AST graph | precise code impact | safe regex symbol baseline implemented; Tree-sitter workers are next |
 | Billion-record deployment | stable tail latency at global scale | architecture and PostgreSQL partition schema supplied; not performance-proven and not claimed complete |
 

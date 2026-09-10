@@ -24,5 +24,6 @@ backups, monitoring and a reviewed secret-management path. Read
 [the threat model](docs/threat-model.md).
 
 No stored memory grants authority to tools or agents. Agent-facing MCP can make
-bounded capture and feedback calls, but cannot approve, correct, delete, change
-scope, link graphs or administer storage. Promotion is decided by server policy.
+bounded capture, feedback, and structured handoff calls, but cannot approve,
+correct, delete, change scope, link graphs or administer storage. Promotion is
+decided by server policy or an explicit review identity.

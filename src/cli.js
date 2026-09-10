@@ -44,7 +44,7 @@ function usage() {
 Usage:
   continuitydb init [--home PATH]
   continuitydb doctor [--home PATH]
-  continuitydb serve [--home PATH] [--host HOST] [--port PORT]
+  continuitydb serve [--home PATH] [--host HOST] [--port PORT] [--review-ui]
   continuitydb mcp [--home PATH]
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
   continuitydb capture --body TEXT --project ID [--kind working|inference|git-fact|decision]
@@ -52,6 +52,8 @@ Usage:
   continuitydb correct MEMORY_ID --body TEXT [--reason TEXT]
   continuitydb search QUERY [--project ID] [--allow-projects A,B] [--top-k N]
   continuitydb context TASK [--project ID] [--allow-projects A,B] [--token-budget N]
+  continuitydb handoff-save --file HANDOFF.json
+  continuitydb handoff-latest TASK_ID --project ID [--branch REF]
   continuitydb link-project SOURCE TARGET --provenance TEXT [--relation depends-on]
   continuitydb link-memory SOURCE_ID TARGET_ID --relation RELATION --provenance TEXT
   continuitydb forget MEMORY_ID
@@ -113,9 +115,11 @@ try {
     if (!checks.every((check) => check.ok)) process.exitCode = 1;
   } else if (command === "serve") {
     process.env.CONTINUITYDB_HOME = home;
+    if (flags.review_ui) process.env.CONTINUITYDB_ENABLE_REVIEW_UI = "true";
     const service = createContinuityServer({
       host: flags.host || process.env.CONTINUITYDB_HOST || "127.0.0.1",
       port: numberFlag(flags.port, Number(process.env.CONTINUITYDB_PORT || 7331)),
+      enableReviewUi: Boolean(flags.review_ui) || process.env.CONTINUITYDB_ENABLE_REVIEW_UI === "true",
     });
     const address = await service.listen();
     process.stderr.write(`ContinuityDB ready at ${typeof address === "string" ? address : `${address.address}:${address.port}`}\n`);
@@ -221,6 +225,25 @@ try {
           as_of: flags.as_of || null,
           tenant_id: cliTenantId,
           owner_id: cliOwnerId,
+        }));
+      } else if (command === "handoff-save") {
+        if (!flags.file) throw new Error("handoff-save requires --file");
+        const checkpoint = JSON.parse(readFileSync(resolve(flags.file), "utf8"));
+        output(vault.saveHandoff({
+          ...checkpoint,
+          tenant_id: cliTenantId,
+          owner_id: cliOwnerId,
+          principal_id: cliPrincipalId,
+          agent_id: cliAgentId,
+        }));
+      } else if (command === "handoff-latest") {
+        output(vault.latestHandoff({
+          tenant_id: cliTenantId,
+          owner_id: cliOwnerId,
+          project_id: flags.project,
+          task_id: positional[0],
+          branch: flags.branch || null,
+          allowed_sensitivities: listFlag(flags.sensitivities || "public,private"),
         }));
       } else if (command === "link-project") {
         output(vault.linkProjects({

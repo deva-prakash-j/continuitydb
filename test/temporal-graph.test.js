@@ -26,14 +26,31 @@ test("temporal recall and memory graph expansion are tenant scoped", () => {
       title: "Client generation",
       body: "Regenerate the Java client before deployment.",
     });
+    const otherBranch = vault.propose({
+      tenant_id: "acme",
+      owner_id: "alice",
+      project_id: "api",
+      namespace_id: "project/api",
+      title: "Experimental client generation",
+      body: "Use the experimental generator only on feature/new-generator.",
+      branch: "feature/new-generator",
+    });
     vault.commit(seed.record.id);
     vault.commit(related.record.id);
+    vault.commit(otherBranch.record.id);
     vault.linkMemories({
       tenant_id: "acme",
       source_memory_id: seed.record.id,
       target_memory_id: related.record.id,
       relation: "requires",
       provenance: "ADR-42",
+    });
+    vault.linkMemories({
+      tenant_id: "acme",
+      source_memory_id: seed.record.id,
+      target_memory_id: otherBranch.record.id,
+      relation: "experimental-alternative",
+      provenance: "branch experiment",
     });
     const results = vault.search({
       tenant_id: "acme",
@@ -46,6 +63,7 @@ test("temporal recall and memory graph expansion are tenant scoped", () => {
     });
     assert.deepEqual(new Set(results.map((item) => item.id)), new Set([seed.record.id, related.record.id]));
     assert.equal(results.find((item) => item.id === related.record.id).score_signals.graph > 0, true);
+    assert.equal(results.some((item) => item.id === otherBranch.record.id), false);
 
     const before = vault.search({
       tenant_id: "acme",

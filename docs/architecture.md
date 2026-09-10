@@ -1,4 +1,4 @@
-# ContinuityDB architecture v0.3
+# ContinuityDB architecture v0.4
 
 ## Design principles
 
@@ -14,12 +14,12 @@
 ## Embedded runtime
 
 ```text
-CLI admin ------------------------------------+
-                                                v
-MCP read/capture -> identity + capture policy -> SQLite records/FTS5/vectors/edges
-HTTP v1 ---------> auth/rate limit -----------+          |
-                                                +-> canonical Markdown
-                                                +-> hash-chained audit JSONL
+CLI admin ----------------------------------------------------+
+                                                               v
+local MCP --------> identity + capture policy ----------------> SQLite records/FTS5/vectors/edges
+remote stdio MCP -> authenticated HTTP v1 -> authoritative API          |
+lifecycle hooks ---------------------------------------------+          +-> canonical Markdown
+review inbox ------------------------------------------------+          +-> serialized audit table
 ```
 
 - SQLite WAL is the query/index engine for one host.
@@ -30,6 +30,8 @@ HTTP v1 ---------> auth/rate limit -----------+          |
 - RRF fuses lexical, semantic and graph ranks; MMR reduces repeated context.
 - Automatic capture has a separate write-rate limit, per-agent/project quota,
   TTL caps, recursive credential rejection and conflict quarantine.
+- Structured handoffs have enforced task identity, state, completed work,
+  unresolved questions, next actions, branch/commit and relevant-file fields.
 
 ## Distributed runtime target
 
@@ -50,7 +52,7 @@ ingest API -> canonical transaction + outbox -> durable log
 ```
 
 The repository includes the first PostgreSQL/pgvector partition schema under
-`deploy/postgres`; v0.3 changes are an additive `002` migration with owner-aware
+`deploy/postgres`; v0.3 changes included an additive `002` migration with owner-aware
 row-level security. Runtime adapters and distributed load evidence are release
 gates, not implied by the schema. See [scalability](scalability.md).
 
@@ -80,7 +82,7 @@ Typed project and memory edges carry weight, provenance and validity windows.
 6. Fuse ranks using weighted Reciprocal Rank Fusion.
 7. Apply project proximity, confidence, importance, freshness and exact-score boosts.
 8. Use Maximal Marginal Relevance to reduce duplicate evidence.
-9. Pack within the caller budget and return citations plus score signals.
+9. Pack the full serialized envelope within the caller budget and return citations plus score signals.
 
 ## Consistency and failure behavior
 
@@ -91,17 +93,20 @@ Typed project and memory edges carry weight, provenance and validity windows.
 - Forgetting tombstones the record and removes it from all local retrieval paths.
 - Distributed mode uses canonical transaction + outbox/log; projectors are
   idempotent and query responses expose index generation/freshness.
-- Audit entries form a SHA-256 hash chain. Production needs remote signed checkpoints.
+- Audit entries form a SHA-256 hash chain in a SQLite `BEGIN IMMEDIATE`
+  transaction, preventing separate local processes from appending against stale
+  heads. Production still needs remote signed checkpoints.
 
 ## Stable surfaces
 
 - JavaScript library: `ContextVault`, `HybridEngine` and security/ranking helpers.
 - CLI: `continuitydb` lifecycle, graph, export, repo scan, doctor and serve commands.
 - HTTP: versioned `/v1` API described by `docs/openapi.yaml`.
-- MCP: `memory_search`, `memory_context_pack`, `memory_capture` and
-  `memory_feedback`; no approval or administration tools.
+- MCP: memory search/context/capture/feedback plus structured handoff checkpoint/latest;
+  no approval or administration tools. It can run against local storage or proxy
+  to the authoritative HTTP service.
 
-## Explicit non-goals for v0.3
+## Explicit non-goals for v0.4
 
 - passive screen, clipboard or raw-chat surveillance;
 - treating retrieved text as policy or authorization;

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { ContextVault } from "../src/store.js";
+import { ContextVault, estimateSerializedTokens } from "../src/store.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "context-vault-test-"));
@@ -220,6 +220,161 @@ test("v0.2 SQLite schema upgrades before subject indexes are created", () => {
     const indexes = upgraded.db.prepare("PRAGMA index_list(memory_records)").all().map((row) => row.name);
     assert.equal(indexes.includes("idx_memory_subject"), true);
     upgraded.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("branch-scoped memory never leaks into an unspecified or different branch", () => {
+  const f = fixture();
+  try {
+    const proposal = f.vault.propose({
+      body: "FeatureBranchOnly uses the new contract.",
+      namespace_id: "project/api",
+      project_id: "api",
+      branch: "feature/schema-v2",
+    });
+    f.vault.commit(proposal.record.id);
+    const input = {
+      query: "FeatureBranchOnly",
+      project_id: "api",
+      allowed_projects: ["api"],
+    };
+    assert.equal(f.vault.search(input).length, 0);
+    assert.equal(f.vault.search({ ...input, branch: "main" }).length, 0);
+    assert.equal(f.vault.search({ ...input, branch: "feature/schema-v2" }).length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("token budgets include titles, citations and serialized response structure", () => {
+  const f = fixture();
+  try {
+    const proposal = f.vault.propose({
+      title: "Long citation fixture ".repeat(8),
+      body: "BudgetedMemory ".repeat(1000),
+      namespace_id: "project/api",
+      project_id: "api",
+      source_uri: `git://api/${"a".repeat(300)}`,
+      repo_path: `src/${"nested/".repeat(20)}ApiClient.java`,
+    });
+    f.vault.commit(proposal.record.id);
+    const results = f.vault.search({
+      query: "BudgetedMemory",
+      project_id: "api",
+      allowed_projects: ["api"],
+      token_budget: 300,
+    });
+    assert.ok(results[0].body.length < proposal.record.body.length);
+    assert.ok(estimateSerializedTokens({ results }) <= 300);
+    const pack = f.vault.contextPack({
+      task: "BudgetedMemory",
+      project_id: "api",
+      allowed_projects: ["api"],
+      token_budget: 300,
+    });
+    assert.ok(estimateSerializedTokens(pack) <= 300);
+    assert.equal(pack.budget.requested_tokens, 300);
+    assert.equal(pack.budget.estimated_tokens, estimateSerializedTokens(pack));
+    const tinyPack = f.vault.contextPack({
+      task: "x".repeat(10_000),
+      project_id: "api",
+      allowed_projects: ["api"],
+      token_budget: 64,
+    });
+    assert.ok(estimateSerializedTokens(tinyPack) <= 64);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("structured handoffs return the latest checkpoint for the applicable branch", () => {
+  const f = fixture();
+  try {
+    const shared = {
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      principal_id: "principal-a",
+      project_id: "api",
+      task_id: "schema-v2",
+      goal: "Roll out SchemaV2",
+      current_state: "Started",
+    };
+    f.vault.saveHandoff({ ...shared, branch: "main", checkpoint_id: "main-1" });
+    f.vault.saveHandoff({
+      ...shared,
+      branch: "feature/schema-v2",
+      checkpoint_id: "feature-1",
+      current_state: "Client regenerated",
+      completed_work: ["Generated client"],
+      next_actions: ["Run contract tests"],
+    });
+    const latest = f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "schema-v2",
+      branch: "feature/schema-v2",
+      allowed_sensitivities: ["private"],
+    });
+    assert.equal(latest.handoff.current_state, "Client regenerated");
+    assert.deepEqual(latest.handoff.next_actions, ["Run contract tests"]);
+    assert.equal(f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "schema-v2",
+      branch: "other",
+      allowed_sensitivities: ["private"],
+    }), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("multiple processes serialize one authoritative audit hash chain", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-audit-writers-"));
+  const first = new ContextVault(root);
+  const second = new ContextVault(root);
+  try {
+    first.propose({ body: "Writer one event." });
+    second.propose({ body: "Writer two event." });
+    first.propose({ body: "Writer one second event." });
+    const verification = second.verifyAuditLog();
+    assert.equal(verification.valid, true);
+    assert.equal(verification.events, 3);
+    assert.equal(verification.storage, "sqlite-serialized");
+  } finally {
+    first.close();
+    second.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("legacy JSONL audit events migrate once into the serialized audit table", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-audit-migration-"));
+  try {
+    writeFileSync(join(root, "audit.jsonl"), `${JSON.stringify({
+      event_id: "legacy-1",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      actor: "legacy-user",
+      operation: "propose",
+      target_id: "memory-1",
+      result: "created",
+    })}\n`);
+    const vault = new ContextVault(root);
+    assert.deepEqual(vault.verifyAuditLog(), {
+      valid: true,
+      events: 1,
+      head: vault.db.prepare("SELECT event_hash FROM audit_events").get().event_hash,
+      storage: "sqlite-serialized",
+    });
+    vault.close();
+    const reopened = new ContextVault(root);
+    assert.equal(reopened.verifyAuditLog().events, 1);
+    reopened.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

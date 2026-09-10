@@ -1,0 +1,25 @@
+{
+  "project_id": "order-service",
+  "task_id": "schema-v2-rollout",
+  "goal": "Roll out SchemaV2 without breaking existing consumers",
+  "current_state": "Producer is updated; consumer regeneration is pending",
+  "completed_work": [
+    "Published the additive schema change",
+    "Added producer compatibility tests"
+  ],
+  "unresolved_questions": [
+    "Does the legacy consumer ignore the new field?"
+  ],
+  "next_actions": [
+    "Regenerate the API client",
+    "Run consumer contract tests"
+  ],
+  "relevant_files": [
+    "schemas/order-v2.json",
+    "src/clients/OrderClient.java"
+  ],
+  "state": "in_progress",
+  "branch": "feature/schema-v2",
+  "git_commit": "0123456789abcdef",
+  "checkpoint_id": "schema-v2-rollout-3"
+}

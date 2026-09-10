@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "continuitydb": {
+      "type": "stdio",
+      "command": "continuitydb",
+      "args": ["mcp"],
+      "env": {
+        "CONTINUITYDB_HTTP_URL": "http://127.0.0.1:7331"
+      }
+    }
+  }
+}

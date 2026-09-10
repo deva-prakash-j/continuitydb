@@ -22,11 +22,14 @@ test("repository scanner indexes tracked symbols and dependencies but denies sec
     git(root, "config", "user.email", "fixture@example.invalid");
     git(root, "add", ".");
     git(root, "commit", "-m", "fixture");
+    writeFileSync(join(root, "src", "ApiClient.java"), "public class DirtyWorktreeOnly {}\n");
 
     const result = scanRepository(root, { projectId: "api" });
     assert.equal(result.scanned_files, 3);
     assert.equal(result.skipped.denied, 1);
     assert.ok(result.records.some((record) => record.repo_path === "src/ApiClient.java" && record.body.includes("ApiClient")));
+    assert.equal(JSON.stringify(result).includes("DirtyWorktreeOnly"), false);
+    assert.ok(result.records.every((record) => record.metadata.provenance_mode === "committed-blob"));
     assert.ok(result.records.some((record) => record.repo_path === "package.json" && record.body.includes("npm:zod@4.5.4")));
     assert.equal(JSON.stringify(result).includes("SHOULD_NOT_BE_READ"), false);
   } finally {
