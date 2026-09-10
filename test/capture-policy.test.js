@@ -458,6 +458,70 @@ test("handoff persistence enforces per-agent project quota but permits idempoten
   }
 });
 
+test("cross-agent lineage replacement cannot borrow the previous agent's quota slot", () => {
+  const f = fixture();
+  try {
+    const assessment = {
+      disposition: "active",
+      reason: "cross-agent quota fixture",
+      expires_at: "2099-01-01T00:00:00.000Z",
+      quota_limit: 1,
+    };
+    const base = {
+      tenant_id: f.identity.tenant_id,
+      owner_id: f.identity.owner_id,
+      project_id: "api",
+      branch: "main",
+      sensitivity: "private",
+      goal: "Preserve bounded cross-agent continuity",
+    };
+    f.vault.saveHandoff({
+      ...base,
+      principal_id: "principal-a",
+      agent_id: "agent-a",
+      task_id: "shared-task",
+      checkpoint_id: "agent-a-checkpoint",
+      current_state: "Agent A checkpoint",
+    }, { assessment });
+    f.vault.saveHandoff({
+      ...base,
+      principal_id: "principal-b",
+      agent_id: "agent-b",
+      task_id: "agent-b-existing-task",
+      checkpoint_id: "agent-b-existing",
+      current_state: "Agent B already consumed its only slot",
+    }, { assessment });
+
+    assert.throws(() => f.vault.saveHandoff({
+      ...base,
+      principal_id: "principal-b",
+      agent_id: "agent-b",
+      task_id: "shared-task",
+      checkpoint_id: "agent-b-replacement",
+      previous_checkpoint_id: "agent-a-checkpoint",
+      current_state: "Must not borrow Agent A's quota slot",
+    }, { assessment }), /capture quota exceeded/);
+
+    assert.equal(f.vault.captureCount({
+      tenant_id: f.identity.tenant_id,
+      owner_id: f.identity.owner_id,
+      agent_id: "agent-b",
+      project_id: "api",
+    }), 1);
+    assert.equal(f.vault.latestHandoff({
+      tenant_id: f.identity.tenant_id,
+      owner_id: f.identity.owner_id,
+      project_id: "api",
+      task_id: "shared-task",
+      branch: "main",
+      allowed_sensitivities: ["private"],
+    }).handoff.checkpoint_id, "agent-a-checkpoint");
+  } finally {
+    f.vault.close();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("handoff quota remains atomic across concurrent processes", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-handoff-quota-test-"));
   try {

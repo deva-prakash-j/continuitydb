@@ -1638,7 +1638,12 @@ export class ContextVault {
         agent_id: agentId,
         project_id: projectId,
       });
-      const projectedCount = currentCount + 1 - (replacesPrevious ? 1 : 0);
+      // A replacement frees a slot only for the agent that owns the record
+      // being superseded. Cross-agent handoff progression is valid, but it is
+      // still a new active capture for the receiving agent and must consume
+      // that agent's quota.
+      const replacesOwnPrevious = replacesPrevious && previousRecord.agent_id === agentId;
+      const projectedCount = currentCount + 1 - (replacesOwnPrevious ? 1 : 0);
       if (projectedCount > quotaLimit) {
         const error = new Error("capture quota exceeded for this agent and project");
         error.code = "FORBIDDEN";
