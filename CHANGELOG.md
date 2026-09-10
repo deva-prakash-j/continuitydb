@@ -5,6 +5,11 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Revalidated held handoff lineage inside the approval transaction, returning
+  HTTP 409 for stale successors and allowing exactly one winner under concurrent
+  reviews; valid approvals receive a fresh sequence and bounded activation TTL.
+- Blocked direct store commit/capture calls from activating handoffs outside the
+  governed save or review paths.
 - Added compare-and-set handoff lineage with `previous_checkpoint_id`; stale or
   concurrent successors are quarantined and accepted successors supersede the
   prior active checkpoint.

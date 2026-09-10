@@ -134,6 +134,7 @@ paths:
         - $ref: "#/components/parameters/MemoryId"
       responses:
         "200": { description: Proposed or quarantined memory explicitly approved and optionally indexed }
+        "409": { description: Handoff approval rejected because its predecessor is no longer the latest active checkpoint }
   /v1/memories/{id}/revisions:
     post:
       operationId: reviseHeldMemory

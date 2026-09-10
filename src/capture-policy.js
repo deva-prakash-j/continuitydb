@@ -306,6 +306,7 @@ export class CapturePolicy {
         disposition: "quarantined",
         reason: "high-sensitivity handoff requires review before recall",
         expires_at: null,
+        activation_ttl_seconds: this.config.working_ttl_seconds,
         quota_limit: this.config.max_records_per_project_per_agent,
       };
     }
@@ -313,6 +314,7 @@ export class CapturePolicy {
       disposition: "active",
       reason: "project-scoped handoff with capture-policy-bounded TTL",
       expires_at: futureIso(this.config.working_ttl_seconds),
+      activation_ttl_seconds: this.config.working_ttl_seconds,
       quota_limit: this.config.max_records_per_project_per_agent,
     };
   }

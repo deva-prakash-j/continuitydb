@@ -22,6 +22,8 @@ const PROPOSED = "proposed";
 const PERSONAL_NAMESPACE = "personal/global";
 const LOCAL_TENANT = "local";
 const MAX_BODY_BYTES = 1_000_000;
+const HANDOFF_TRANSITION = Symbol("validated-handoff-transition");
+const DEFAULT_HANDOFF_ACTIVATION_TTL_SECONDS = 86_400;
 
 function nowIso() {
   return new Date().toISOString();
@@ -981,11 +983,14 @@ export class ContextVault {
     return { duplicate: false, record };
   }
 
-  commit(id, { actor = "local-user" } = {}) {
+  commit(id, { actor = "local-user", handoffTransition = null } = {}) {
     const current = this.get(id, { includeInactive: true });
     if (!current) throw new Error(`memory ${id} not found`);
     if (current.status === ACTIVE) return current;
     if (current.status !== PROPOSED) throw new Error(`memory ${id} is ${current.status}, not proposed`);
+    if (current.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
+      throw new Error("handoff transitions must use saveHandoff or approve so lineage and quota policy is enforced");
+    }
 
     const record = { ...current, status: ACTIVE, updated_at: nowIso() };
     this.writeCanonical(record);
@@ -994,9 +999,12 @@ export class ContextVault {
     return record;
   }
 
-  capture(assessment, { actor = "local-agent", handoffSequence = null } = {}) {
+  capture(assessment, { actor = "local-agent", handoffSequence = null, handoffTransition = null } = {}) {
     if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
       throw new Error("capture assessment has an invalid disposition");
+    }
+    if (assessment.record?.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
+      throw new Error("handoff captures must use saveHandoff so lineage and quota policy is enforced");
     }
     const proposed = this.propose(assessment.record, { actor, handoffSequence });
     if (proposed.duplicate) {
@@ -1008,7 +1016,7 @@ export class ContextVault {
       };
     }
     let record = proposed.record;
-    if (assessment.disposition === ACTIVE) record = this.commit(record.id, { actor });
+    if (assessment.disposition === ACTIVE) record = this.commit(record.id, { actor, handoffTransition });
     else if (assessment.disposition === "quarantined") {
       record = { ...record, status: "quarantined", updated_at: nowIso() };
       this.writeCanonical(record);
@@ -1564,6 +1572,14 @@ export class ContextVault {
     if (!Number.isInteger(quotaLimit) || quotaLimit < 1 || quotaLimit > 1_000_000) {
       throw new Error("handoff assessment quota_limit must be an integer between 1 and 1000000");
     }
+    const activationTtlSeconds = Number(
+      assessment.activation_ttl_seconds ?? DEFAULT_HANDOFF_ACTIVATION_TTL_SECONDS,
+    );
+    if (!Number.isInteger(activationTtlSeconds)
+      || activationTtlSeconds < 300
+      || activationTtlSeconds > 604_800) {
+      throw new Error("handoff assessment activation_ttl_seconds must be an integer between 300 and 604800");
+    }
     const effectiveActor = actor || `${input.principal_id || ownerId}/${agentId || "host"}`;
 
     return this.runTransaction(() => {
@@ -1665,7 +1681,14 @@ export class ContextVault {
         branch: handoff.branch,
         git_commit: handoff.git_commit,
         tags: ["handoff", handoff.state],
-        metadata: { handoff, provenance: { git_commit: handoff.git_commit ? "agent-asserted" : "not-supplied" } },
+        metadata: {
+          handoff,
+          provenance: { git_commit: handoff.git_commit ? "agent-asserted" : "not-supplied" },
+          governance: {
+            quota_limit: quotaLimit,
+            activation_ttl_seconds: activationTtlSeconds,
+          },
+        },
         idempotency_key: idempotencyKey,
         expires_at: effectiveAssessment.expires_at || null,
         supersedes_id: replacesPrevious ? previousRecord.id : null,
@@ -1674,6 +1697,7 @@ export class ContextVault {
       const captured = this.capture({ ...effectiveAssessment, record: recordInput }, {
         actor: effectiveActor,
         handoffSequence: this.nextHandoffSequence(),
+        handoffTransition: HANDOFF_TRANSITION,
       });
       if (replacesPrevious) {
         const superseded = { ...previousRecord, status: "superseded", updated_at: nowIso() };
@@ -1764,17 +1788,110 @@ export class ContextVault {
   }
 
   approve(id, { actor = "local-user" } = {}) {
-    const current = this.get(id, { includeInactive: true });
-    if (!current) throw new Error(`memory ${id} not found`);
-    if (current.status === ACTIVE) return current;
-    if (![PROPOSED, "quarantined"].includes(current.status)) {
-      throw new Error(`memory ${id} is ${current.status}, not reviewable`);
-    }
-    const record = { ...current, status: ACTIVE, updated_at: nowIso() };
-    this.writeCanonical(record);
-    this.indexRecord(record);
-    this.audit("approve", id, `active:from-${current.status}`, actor);
-    return record;
+    return this.runTransaction(() => {
+      const current = this.get(id, { includeInactive: true });
+      if (!current) throw new Error(`memory ${id} not found`);
+      if (current.status === ACTIVE) return current;
+      if (![PROPOSED, "quarantined"].includes(current.status)) {
+        throw new Error(`memory ${id} is ${current.status}, not reviewable`);
+      }
+
+      if (current.type !== "handoff") {
+        const record = { ...current, status: ACTIVE, updated_at: nowIso() };
+        this.writeCanonical(record);
+        this.indexRecordUnsafe(record);
+        this.audit("approve", id, `active:from-${current.status}`, actor);
+        return record;
+      }
+
+      const metadata = JSON.parse(current.metadata_json || "{}");
+      const handoff = normalizeHandoff(metadata.handoff || {});
+      const governance = metadata.governance || {};
+      const quotaLimit = Number(governance.quota_limit ?? 10_000);
+      const activationTtlSeconds = Number(
+        governance.activation_ttl_seconds ?? DEFAULT_HANDOFF_ACTIVATION_TTL_SECONDS,
+      );
+      if (!Number.isInteger(quotaLimit) || quotaLimit < 1 || quotaLimit > 1_000_000) {
+        throw new Error("stored handoff quota_limit is invalid");
+      }
+      if (!Number.isInteger(activationTtlSeconds)
+        || activationTtlSeconds < 300
+        || activationTtlSeconds > 604_800) {
+        throw new Error("stored handoff activation_ttl_seconds is invalid");
+      }
+
+      const effectiveTime = nowIso();
+      const previousRecord = this.db.prepare(`
+        SELECT * FROM memory_records
+        WHERE tenant_id = ? AND owner_id = ? AND project_id = ?
+          AND type = 'handoff' AND subject_key = ? AND status = 'active'
+          AND id != ?
+          AND ((? IS NULL AND branch IS NULL) OR branch = ?)
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND (valid_from IS NULL OR valid_from <= ?)
+          AND (valid_to IS NULL OR valid_to > ?)
+          AND stale = 0
+        ORDER BY COALESCE(handoff_sequence, 0) DESC, updated_at DESC, id DESC
+        LIMIT 1
+      `).get(
+        current.tenant_id,
+        current.owner_id,
+        current.project_id,
+        current.subject_key,
+        current.id,
+        handoff.branch,
+        handoff.branch,
+        effectiveTime,
+        effectiveTime,
+        effectiveTime,
+      ) || null;
+      const previousHandoff = previousRecord
+        ? JSON.parse(previousRecord.metadata_json || "{}").handoff || null
+        : null;
+      const continuesLatest = Boolean(
+        previousRecord
+        && previousHandoff
+        && handoff.previous_checkpoint_id === previousHandoff.checkpoint_id,
+      );
+      if ((previousRecord && !continuesLatest) || (!previousRecord && handoff.previous_checkpoint_id)) {
+        const error = new Error(previousRecord
+          ? `handoff approval lineage conflict: previous_checkpoint_id must equal latest checkpoint ${previousHandoff?.checkpoint_id || "unknown"}`
+          : "handoff approval lineage conflict: previous_checkpoint_id does not reference an active checkpoint");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      const currentCount = this.captureCount({
+        tenant_id: current.tenant_id,
+        owner_id: current.owner_id,
+        agent_id: current.agent_id,
+        project_id: current.project_id,
+      });
+      if (currentCount > quotaLimit) {
+        const error = new Error("capture quota exceeded for this agent and project");
+        error.code = "FORBIDDEN";
+        throw error;
+      }
+
+      const record = {
+        ...current,
+        status: ACTIVE,
+        expires_at: new Date(Date.now() + activationTtlSeconds * 1000).toISOString(),
+        supersedes_id: previousRecord?.id || null,
+        handoff_sequence: this.nextHandoffSequence(),
+        updated_at: nowIso(),
+      };
+      this.writeCanonical(record);
+      this.indexRecordUnsafe(record);
+      if (previousRecord) {
+        const superseded = { ...previousRecord, status: "superseded", updated_at: nowIso() };
+        this.writeCanonical(superseded);
+        this.indexRecordUnsafe(superseded);
+        this.audit("handoff-supersede", previousRecord.id, `superseded-by:${record.id}`, actor);
+      }
+      this.audit("approve", id, `active:from-${current.status}`, actor);
+      return record;
+    });
   }
 
   revisePending(id, replacement, reason, { actor = "local-user" } = {}) {
@@ -1854,7 +1971,9 @@ export class ContextVault {
       version: Number(current.version || 1) + 1,
       allow_duplicate_content: true,
     }, { handoffSequence: current.type === "handoff" ? this.nextHandoffSequence() : null });
-    const committed = this.commit(proposal.record.id);
+    const committed = this.commit(proposal.record.id, {
+      handoffTransition: current.type === "handoff" ? HANDOFF_TRANSITION : null,
+    });
     const updatedOld = { ...current, status: "superseded", updated_at: nowIso() };
     this.writeCanonical(updatedOld);
     this.indexRecord(updatedOld);

@@ -208,7 +208,7 @@ try {
         }
         output({ ...captured, semantic_index });
       } else if (command === "commit") {
-        const committed = vault.commit(positional[0]);
+        const committed = vault.approve(positional[0], { actor: "cli-reviewer" });
         let semantic_index = { indexed: false, reason: "semantic retrieval disabled" };
         if (embedder) {
           try { semantic_index = await engine.indexMemory(committed.id); }

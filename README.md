@@ -296,6 +296,11 @@ checkpoints as well, while exact idempotent retries remain allowed. After the
 first checkpoint for a task and branch, every successor must name the current
 latest checkpoint in `previous_checkpoint_id`. This compare-and-set lineage
 quarantines stale or concurrent writers instead of replacing startup context.
+Review approval repeats that comparison inside the same write transaction: a
+held successor whose predecessor is no longer latest receives HTTP `409` and
+remains held. A valid approval supersedes its predecessor, receives a fresh
+monotonic sequence and activates with the configured bounded TTL. Direct store
+commit/capture calls cannot activate a handoff without these governance checks.
 
 ```bash
 export CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331

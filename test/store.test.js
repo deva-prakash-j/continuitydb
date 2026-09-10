@@ -20,6 +20,20 @@ const firstOpenScript = `
   } finally { vault.close(); }
 `;
 
+const concurrentApprovalScript = `
+  import { ContextVault } from ${JSON.stringify(new URL("../src/store.js", import.meta.url).href)};
+  const [root, memoryId, startAtValue] = process.argv.slice(1);
+  const vault = new ContextVault(root);
+  try {
+    const startAt = Number(startAtValue);
+    while (Date.now() < startAt) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+    const result = vault.approve(memoryId, { actor: \`reviewer/\${memoryId}\` });
+    process.stdout.write(JSON.stringify({ ok: true, id: result.id }));
+  } catch (error) {
+    process.stdout.write(JSON.stringify({ ok: false, statusCode: error.statusCode || null, message: error.message }));
+  } finally { vault.close(); }
+`;
+
 function runFirstOpen(root, startAt) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [
@@ -39,6 +53,29 @@ function runFirstOpen(root, startAt) {
       if (code !== 0) return reject(new Error(`first-open process exited ${code}: ${stderr}`));
       try { resolve(JSON.parse(stdout)); }
       catch { reject(new Error(`first-open process returned invalid JSON: ${stdout}\n${stderr}`)); }
+    });
+  });
+}
+
+function runConcurrentApproval(root, memoryId, startAt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [
+      "--input-type=module", "--eval", concurrentApprovalScript, root, memoryId, String(startAt),
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("concurrent approval process exceeded 20 second timeout"));
+    }, 20_000);
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", (error) => { clearTimeout(timeout); reject(error); });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) return reject(new Error(`approval process exited ${code}: ${stderr}`));
+      try { resolve(JSON.parse(stdout)); }
+      catch { reject(new Error(`approval process returned invalid JSON: ${stdout}\n${stderr}`)); }
     });
   });
 }
@@ -593,6 +630,207 @@ test("held handoff review also requires structured correction", () => {
     assert.match(revised.body, /Current state: Corrected before approval/);
   } finally {
     f.cleanup();
+  }
+});
+
+test("review approval atomically revalidates handoff lineage and applies bounded activation", () => {
+  const f = fixture();
+  const activeAssessment = {
+    ...ACTIVE_HANDOFF,
+    activation_ttl_seconds: 3_600,
+    quota_limit: 10,
+  };
+  const heldAssessment = {
+    disposition: "quarantined",
+    reason: "high-sensitivity handoff requires review",
+    expires_at: null,
+    activation_ttl_seconds: 3_600,
+    quota_limit: 10,
+  };
+  const shared = {
+    tenant_id: "tenant-a",
+    owner_id: "owner-a",
+    agent_id: "agent-a",
+    project_id: "api",
+    task_id: "review-lineage",
+    goal: "Approve only the current successor",
+    branch: "main",
+  };
+  try {
+    const first = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-1",
+      current_state: "Initial active checkpoint",
+    }, { assessment: activeAssessment });
+    const validHeld = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-2",
+      previous_checkpoint_id: "checkpoint-1",
+      current_state: "Reviewed successor",
+      sensitivity: "sensitive",
+    }, { assessment: heldAssessment });
+    const approved = f.vault.approve(validHeld.record.id, { actor: "reviewer-a" });
+    assert.equal(approved.status, "active");
+    assert.equal(approved.supersedes_id, first.record.id);
+    assert.ok(Date.parse(approved.expires_at) > Date.now());
+    assert.ok(Date.parse(approved.expires_at) <= Date.now() + 3_605_000);
+    assert.equal(f.vault.get(first.record.id, { includeInactive: true }).status, "superseded");
+
+    const staleHeld = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-3",
+      previous_checkpoint_id: "checkpoint-2",
+      current_state: "Held while another writer advances",
+      sensitivity: "sensitive",
+    }, { assessment: heldAssessment });
+    const winner = f.vault.saveHandoff({
+      ...shared,
+      checkpoint_id: "checkpoint-4",
+      previous_checkpoint_id: "checkpoint-2",
+      current_state: "Concurrent winning successor",
+    }, { assessment: activeAssessment });
+
+    assert.throws(
+      () => f.vault.approve(staleHeld.record.id, { actor: "reviewer-a" }),
+      (error) => error.statusCode === 409 && /approval lineage conflict/.test(error.message),
+    );
+    assert.equal(f.vault.get(staleHeld.record.id, { includeInactive: true }).status, "quarantined");
+    assert.equal(f.vault.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "review-lineage",
+      branch: "main",
+      allowed_sensitivities: ["private", "sensitive"],
+    }).record.id, winner.record.id);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("low-level commit and capture APIs cannot bypass handoff governance", () => {
+  const f = fixture();
+  try {
+    const handoff = {
+      task_id: "bypass-attempt",
+      checkpoint_id: "checkpoint-1",
+      goal: "Bypass policy",
+      current_state: "Unreviewed",
+      completed_work: [],
+      unresolved_questions: [],
+      next_actions: [],
+      relevant_files: [],
+      state: "in_progress",
+      branch: "main",
+      git_commit: null,
+      previous_checkpoint_id: null,
+    };
+    const proposed = f.vault.propose({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      agent_id: "agent-a",
+      namespace_id: "project/api",
+      project_id: "api",
+      type: "handoff",
+      subject_key: "handoff:bypass-attempt",
+      title: "Unsafe handoff",
+      body: "Unreviewed handoff body",
+      metadata: { handoff },
+    });
+    assert.throws(() => f.vault.commit(proposed.record.id), /must use saveHandoff or approve/);
+    assert.throws(() => f.vault.capture({
+      disposition: "active",
+      reason: "forged assessment",
+      record: {
+        ...proposed.record,
+        id: undefined,
+        idempotency_key: "forged-handoff-capture",
+      },
+    }), /must use saveHandoff/);
+    assert.equal(f.vault.get(proposed.record.id), null);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("concurrent review approvals allow exactly one handoff lineage successor", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-approval-race-"));
+  const vault = new ContextVault(root);
+  const activeAssessment = {
+    ...ACTIVE_HANDOFF,
+    activation_ttl_seconds: 3_600,
+    quota_limit: 10,
+  };
+  const heldAssessment = {
+    disposition: "quarantined",
+    reason: "review fixture",
+    expires_at: null,
+    activation_ttl_seconds: 3_600,
+    quota_limit: 10,
+  };
+  const common = {
+    tenant_id: "tenant-a",
+    owner_id: "owner-a",
+    agent_id: "agent-a",
+    project_id: "api",
+    task_id: "concurrent-approval",
+    goal: "Choose one reviewed successor",
+    branch: "main",
+  };
+  try {
+    vault.saveHandoff({
+      ...common,
+      checkpoint_id: "checkpoint-1",
+      current_state: "Initial state",
+    }, { assessment: activeAssessment });
+    const left = vault.saveHandoff({
+      ...common,
+      checkpoint_id: "checkpoint-2-left",
+      previous_checkpoint_id: "checkpoint-1",
+      current_state: "Left candidate",
+      sensitivity: "sensitive",
+    }, { assessment: heldAssessment });
+    const right = vault.saveHandoff({
+      ...common,
+      checkpoint_id: "checkpoint-2-right",
+      previous_checkpoint_id: "checkpoint-1",
+      current_state: "Right candidate",
+      sensitivity: "sensitive",
+    }, { assessment: heldAssessment });
+    vault.close();
+
+    const startAt = Date.now() + 250;
+    const outcomes = await Promise.all([
+      runConcurrentApproval(root, left.record.id, startAt),
+      runConcurrentApproval(root, right.record.id, startAt),
+    ]);
+    assert.equal(outcomes.filter((outcome) => outcome.ok).length, 1);
+    const loser = outcomes.find((outcome) => !outcome.ok);
+    assert.equal(loser.statusCode, 409);
+    assert.match(loser.message, /approval lineage conflict/);
+
+    const reopened = new ContextVault(root);
+    const latest = reopened.latestHandoff({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      project_id: "api",
+      task_id: "concurrent-approval",
+      branch: "main",
+      allowed_sensitivities: ["sensitive"],
+    });
+    assert.ok([left.record.id, right.record.id].includes(latest.record.id));
+    assert.equal(reopened.listMemories({
+      tenant_id: "tenant-a",
+      owner_id: "owner-a",
+      allowed_projects: ["api"],
+      allowed_sensitivities: ["sensitive"],
+      project_id: "api",
+      statuses: ["quarantined"],
+    }).filter((record) => record.type === "handoff").length, 1);
+    reopened.close();
+  } finally {
+    try { vault.close(); } catch {}
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

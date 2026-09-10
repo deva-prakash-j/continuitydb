@@ -182,6 +182,57 @@ test("review inbox exposes held memories and can explicitly approve quarantined 
   }
 });
 
+test("HTTP review approval rejects a stale handoff successor with conflict status", async () => {
+  const f = fixture();
+  try {
+    const address = await f.service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    const save = async (idempotencyKey, body) => {
+      const response = await fetch(`${base}/v1/handoffs`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "idempotency-key": idempotencyKey },
+        body: JSON.stringify(body),
+      });
+      assert.equal(response.status, 201);
+      return response.json();
+    };
+    const common = {
+      project_id: "api",
+      task_id: "review-race",
+      goal: "Preserve compare-and-set approval",
+      branch: "main",
+    };
+    const first = await save("review-race-1", {
+      ...common,
+      checkpoint_id: "checkpoint-1",
+      current_state: "Initial state",
+    });
+    const held = await save("review-race-2", {
+      ...common,
+      checkpoint_id: "checkpoint-2",
+      previous_checkpoint_id: first.handoff.checkpoint_id,
+      current_state: "Sensitive held state",
+      sensitivity: "sensitive",
+    });
+    await save("review-race-3", {
+      ...common,
+      checkpoint_id: "checkpoint-3",
+      previous_checkpoint_id: first.handoff.checkpoint_id,
+      current_state: "Winning state",
+    });
+
+    const approval = await fetch(`${base}/v1/memories/${held.record.id}/commit`, { method: "POST" });
+    assert.equal(approval.status, 409);
+    assert.match((await approval.json()).error, /approval lineage conflict/);
+    const latest = await fetch(`${base}/v1/handoffs/latest?project_id=api&task_id=review-race&branch=main`);
+    assert.equal(latest.status, 200);
+    assert.equal((await latest.json()).handoff.checkpoint_id, "checkpoint-3");
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("HTTP client uses the central service instead of constructing a local vault", async () => {
   const f = fixture();
   try {

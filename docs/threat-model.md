@@ -21,8 +21,8 @@ or become a tool instruction.
 |---|---|---|
 | Cross-tenant/owner retrieval | tenant and shared owner included in every local lookup; project/sensitivity ACLs centralized; adversarial tests | owner-aware DB row-level security, per-backend filter assertions, tenant-router tests |
 | Agent self-approval | capture/propose/approve/admin scopes are split; MCP has no approve/admin tools; server chooses status and TTL | OIDC workload claims and organization policy distribution |
-| Memory poisoning | project allowlists, bounded TTLs, confidence caps, atomic per-agent quota, compare-and-set handoff lineage, conflict quarantine and idempotency | semantic contradiction detection, anomaly detection, reputation and organization review queues |
-| Sensitive handoff bypass | every checkpoint passes capture policy and per-agent/project quota; private checkpoints expire and sensitive/restricted checkpoints remain held for review | organization-specific classification and DLP |
+| Memory poisoning | project allowlists, bounded TTLs, confidence caps, atomic per-agent quota, transactional compare-and-set handoff lineage at capture and review approval, conflict quarantine and idempotency | semantic contradiction detection, anomaly detection, reputation and organization review queues |
+| Sensitive handoff bypass | every checkpoint passes capture policy and per-agent/project quota; private checkpoints expire; sensitive/restricted checkpoints remain held until an approval transaction revalidates lineage and assigns a bounded activation TTL | organization-specific classification and DLP |
 | Prompt injection in memory | warning on every context pack; content never interpreted as policy | provenance UI, content-risk labels, tool planner separation |
 | Credential ingestion | recursive common-pattern rejection before persistence and secret-path denylist | DLP provider, organization policy and incident flow |
 | SSRF through embedding config | endpoints come from server config; remote endpoints opt-in and HTTPS-only | egress allowlist/proxy and DNS rebinding protection |
