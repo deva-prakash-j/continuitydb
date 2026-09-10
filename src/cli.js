@@ -6,6 +6,8 @@ import { createContinuityServer } from "./http-server.js";
 import { scanRepository } from "./repo-ingest.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
+import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { ensureLocalModel, localModelStatus } from "./local-embeddings.js";
 
 function parse(argv) {
   const positional = [];
@@ -62,6 +64,9 @@ Usage:
   continuitydb export [--output FILE]
   continuitydb audit-verify
   continuitydb repo-scan PATH [--project ID] [--since COMMIT] [--ingest] [--commit]
+  continuitydb embeddings-status [--cache PATH]
+  continuitydb embeddings-pull [--cache PATH]
+  continuitydb embeddings-index [--limit N] [--batch-size N]
 
 All finite commands emit JSON. Agent-facing capture is governed by server policy;
 commit, correct, delete and graph administration remain unavailable over MCP.
@@ -107,6 +112,10 @@ try {
       const audit = vault.verifyAuditLog();
       checks.push({ name: "sqlite", ok: true, value: "WAL + FTS5" });
       checks.push({ name: "audit_chain", ok: audit.valid, value: audit });
+      if (process.env.CONTINUITYDB_EMBEDDING_PROVIDER === "local") {
+        const model = localModelStatus({ home, cacheDir: process.env.CONTINUITYDB_MODEL_CACHE });
+        checks.push({ name: "local_embedding_model", ok: model.ready, value: model });
+      }
       vault.close();
     } catch (error) {
       checks.push({ name: "storage", ok: false, value: error.message });
@@ -132,6 +141,8 @@ try {
     await import("./mcp-server.js");
   } else {
     const vault = new ContextVault(home);
+    const embedder = createEmbedderFromEnv();
+    const engine = new HybridEngine(vault, embedder);
     try {
       if (command === "propose") {
         output(vault.propose({
@@ -185,9 +196,21 @@ try {
           tags: listFlag(flags.tags),
           idempotency_key: flags.idempotency_key,
         }, identity, vault);
-        output(vault.capture(assessment, { actor: `${identity.principal_id}/${identity.agent_id}` }));
+        const captured = vault.capture(assessment, { actor: `${identity.principal_id}/${identity.agent_id}` });
+        let semantic_index = { indexed: false, reason: "memory is not active or semantic retrieval is disabled" };
+        if (captured.record.status === "active" && embedder) {
+          try { semantic_index = await engine.indexMemory(captured.record.id); }
+          catch (error) { semantic_index = { indexed: false, reason: error.message }; }
+        }
+        output({ ...captured, semantic_index });
       } else if (command === "commit") {
-        output(vault.commit(positional[0]));
+        const committed = vault.commit(positional[0]);
+        let semantic_index = { indexed: false, reason: "semantic retrieval disabled" };
+        if (embedder) {
+          try { semantic_index = await engine.indexMemory(committed.id); }
+          catch (error) { semantic_index = { indexed: false, reason: error.message }; }
+        }
+        output({ ...committed, semantic_index });
       } else if (command === "correct") {
         const replacement = Object.fromEntries(Object.entries({
           body: flags.body,
@@ -198,7 +221,7 @@ try {
         }).filter(([, value]) => value !== undefined));
         output(vault.correct(positional[0], replacement, flags.reason || "cli-correction"));
       } else if (command === "search") {
-        output({ results: vault.search({
+        output({ results: await engine.search({
           query: positional.join(" "),
           project_id: flags.project || null,
           allowed_projects: listFlag(flags.allow_projects || flags.project),
@@ -213,7 +236,7 @@ try {
           owner_id: cliOwnerId,
         }) });
       } else if (command === "context") {
-        output(vault.contextPack({
+        output(await engine.contextPack({
           task: positional.join(" "),
           project_id: flags.project || null,
           allowed_projects: listFlag(flags.allow_projects || flags.project),
@@ -305,6 +328,18 @@ try {
           agent_id: cliAgentId,
         })), { commit: Boolean(flags.commit) });
         output({ ...result, records: flags.include_records ? result.records : undefined, ingested: ingested.length, committed: Boolean(flags.commit) });
+      } else if (command === "embeddings-status") {
+        output(localModelStatus({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE }));
+      } else if (command === "embeddings-pull") {
+        output(await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE }));
+      } else if (command === "embeddings-index") {
+        if (!embedder) throw new Error("configure CONTINUITYDB_EMBEDDING_PROVIDER=local or another supported provider");
+        output(await engine.indexPending({
+          tenant_id: cliTenantId,
+          owner_id: cliOwnerId,
+          limit: numberFlag(flags.limit, 10_000),
+          batch_size: numberFlag(flags.batch_size, 32),
+        }));
       } else {
         throw new Error(`unknown command: ${command}`);
       }

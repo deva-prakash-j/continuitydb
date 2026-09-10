@@ -1,5 +1,6 @@
 import { isLoopback } from "./security.js";
 import { fitContextPack } from "./store.js";
+import { LocalOnnxEmbedder } from "./local-embeddings.js";
 
 function validateVector(vector) {
   if (!Array.isArray(vector) || vector.length < 8 || vector.length > 8192) {
@@ -77,6 +78,15 @@ export function createEmbedderFromEnv(env = process.env) {
   const provider = env.CONTINUITYDB_EMBEDDING_PROVIDER;
   if (!provider || provider === "none") return null;
   const allowRemote = env.CONTINUITYDB_ALLOW_REMOTE_EMBEDDINGS === "true";
+  if (provider === "local") {
+    return new LocalOnnxEmbedder({
+      home: env.CONTINUITYDB_HOME || env.CONTEXT_VAULT_HOME,
+      cacheDir: env.CONTINUITYDB_MODEL_CACHE,
+      offline: env.CONTINUITYDB_LOCAL_MODEL_OFFLINE === "true",
+      threads: env.CONTINUITYDB_LOCAL_MODEL_THREADS,
+      batchSize: env.CONTINUITYDB_LOCAL_MODEL_BATCH_SIZE,
+    });
+  }
   if (provider === "ollama") {
     if (!env.CONTINUITYDB_EMBEDDING_MODEL) throw new Error("CONTINUITYDB_EMBEDDING_MODEL is required");
     return new OllamaEmbedder({
@@ -110,7 +120,9 @@ export class HybridEngine {
 
   async search(input) {
     if (!this.embedder) return this.vault.search(input);
-    const [queryVector] = await this.embedder.embed(input.query);
+    const queryVector = this.embedder.embedQuery
+      ? await this.embedder.embedQuery(input.query)
+      : (await this.embedder.embed(input.query))[0];
     const semanticCandidates = this.vault.semanticCandidates({
       ...input,
       query_embedding: queryVector,
@@ -136,8 +148,30 @@ export class HybridEngine {
     if (!this.embedder) return { indexed: false, reason: "semantic retrieval disabled" };
     const memory = this.vault.get(id);
     if (!memory) throw new Error(`active memory ${id} not found`);
-    const [vector] = await this.embedder.embed(`${memory.title}\n${memory.body}`);
+    const text = `${memory.title}\n${memory.body}`;
+    const [vector] = this.embedder.embedDocuments
+      ? await this.embedder.embedDocuments([text])
+      : await this.embedder.embed(text);
     this.vault.putEmbedding(id, vector, this.embedder.id);
     return { indexed: true, memory_id: id, model_id: this.embedder.id, dimensions: vector.length };
+  }
+
+  async indexPending({ tenant_id = "local", owner_id = "local-user", limit = 10_000, batch_size = 32 } = {}) {
+    if (!this.embedder) return { indexed: 0, reason: "semantic retrieval disabled" };
+    const ids = this.vault.pendingEmbeddingIds({ tenant_id, owner_id, model_id: this.embedder.id, limit });
+    let indexed = 0;
+    const size = Math.max(1, Math.min(64, Number(batch_size) || 32));
+    for (let offset = 0; offset < ids.length; offset += size) {
+      const batchIds = ids.slice(offset, offset + size);
+      const memories = batchIds.map((id) => this.vault.get(id));
+      const texts = memories.map((memory) => `${memory.title}\n${memory.body}`);
+      const vectors = this.embedder.embedDocuments
+        ? await this.embedder.embedDocuments(texts)
+        : await this.embedder.embed(texts);
+      if (vectors.length !== batchIds.length) throw new Error("embedding provider returned an incomplete indexing batch");
+      batchIds.forEach((id, index) => this.vault.putEmbedding(id, vectors[index], this.embedder.id));
+      indexed += batchIds.length;
+    }
+    return { indexed, pending_before: ids.length, model_id: this.embedder.id };
   }
 }

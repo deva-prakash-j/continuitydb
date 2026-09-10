@@ -58,3 +58,25 @@ test("hybrid engine returns ACL-filtered semantic candidates when lexical search
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("hybrid indexing batches active memories that do not have the current model projection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-embedding-batch-test-"));
+  const vault = new ContextVault(root);
+  const embedder = {
+    id: "fixture:batch-v1",
+    async embedDocuments(texts) { return texts.map(() => [1, 0, 0, 0, 0, 0, 0, 0]); },
+    async embedQuery() { return [1, 0, 0, 0, 0, 0, 0, 0]; },
+  };
+  try {
+    for (const body of ["First semantic fact", "Second semantic fact"]) {
+      const proposal = vault.propose({ tenant_id: "local", owner_id: "local-user", namespace_id: "project/api", project_id: "api", body });
+      vault.commit(proposal.record.id);
+    }
+    const engine = new HybridEngine(vault, embedder);
+    assert.equal((await engine.indexPending()).indexed, 2);
+    assert.equal((await engine.indexPending()).indexed, 0);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1134,6 +1134,32 @@ export class ContextVault {
     return { memory_id: memory.id, model_id: model, dimensions: vector.length };
   }
 
+  pendingEmbeddingIds({
+    tenant_id = LOCAL_TENANT,
+    owner_id = "local-user",
+    model_id,
+    limit = 10_000,
+  } = {}) {
+    const tenantId = requiredIdentifier(tenant_id, "tenant_id");
+    const ownerId = requiredString(owner_id, "owner_id");
+    const model = requiredIdentifier(model_id, "model_id");
+    return this.db.prepare(`
+      SELECT r.id
+      FROM memory_records r
+      LEFT JOIN memory_embeddings e
+        ON e.tenant_id = r.tenant_id
+       AND e.memory_id = r.id
+       AND e.model_id = ?
+       AND e.content_hash = r.content_hash
+      WHERE r.tenant_id = ?
+        AND r.owner_id = ?
+        AND r.status = 'active'
+        AND e.memory_id IS NULL
+      ORDER BY r.updated_at ASC, r.id ASC
+      LIMIT ?
+    `).all(model, tenantId, ownerId, clamp(Number(limit), 1, 250_000)).map((row) => row.id);
+  }
+
   semanticCandidates({
     query_embedding,
     model_id,

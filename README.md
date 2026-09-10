@@ -15,7 +15,7 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.4 alpha. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.5 alpha. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
 > production adapter and billion-record proof do not exist yet.
@@ -84,12 +84,12 @@ Tenant, project, sensitivity, lifecycle, temporal, and provenance controls keep
 retrieval bounded. Personal and employer data should still use separate stores
 and credentials when their trust domains differ.
 
-## Implemented in v0.4
+## Implemented in v0.5
 
 ### Retrieval
 
 - SQLite WAL and FTS5/BM25 lexical retrieval for identifiers, paths, errors, and keywords;
-- optional Ollama or OpenAI-compatible embeddings;
+- built-in local BGE-small quantized embeddings plus optional Ollama or OpenAI-compatible providers;
 - bounded exact vector scan for embedded mode;
 - project dependency closure and typed memory-graph expansion;
 - Reciprocal Rank Fusion across lexical, semantic, and graph candidates;
@@ -148,6 +148,19 @@ continuitydb doctor --home "$PWD/.continuitydb-demo"
 
 All finite CLI commands emit JSON. `serve` and `mcp` remain attached until the
 process receives `SIGINT` or `SIGTERM`.
+
+Enable the built-in semantic model without sending memory text to a provider:
+
+```bash
+continuitydb embeddings-pull --home "$PWD/.continuitydb-demo"
+
+CONTINUITYDB_EMBEDDING_PROVIDER=local \
+continuitydb embeddings-index --home "$PWD/.continuitydb-demo"
+```
+
+The first command downloads only the pinned 34.2 MB quantized model and
+vocabulary, verifies their SHA-256 digests, and caches them privately. Use
+`npm ci --omit=optional` for a smaller lexical/graph-only installation.
 
 ## Try automatic context transfer
 
@@ -328,6 +341,9 @@ Run `continuitydb help` for the concise built-in usage text.
 | `export` | Emit all canonical records as JSONL or create a new private output file |
 | `audit-verify` | Verify the local audit hash chain |
 | `repo-scan` | Safely inspect tracked repository files and optionally ingest records |
+| `embeddings-status` | Show the built-in model revision, checksums, cache path, and readiness |
+| `embeddings-pull` | Download and verify the pinned local model without embedding memory content |
+| `embeddings-index` | Batch-index active memories missing the configured model projection |
 
 Administrative CLI access is a trusted local boundary. Do not expose arbitrary
 CLI execution to an agent merely because the MCP tools are restricted.
@@ -357,7 +373,7 @@ for incremental scans. Limits can be set with `--max-files` and
 
 The scanner reads blobs from the resolved commit tree, not working-directory
 files, so an uncommitted edit cannot be cited as committed `HEAD` evidence. It
-does not execute repository code. v0.4 uses bounded pattern-based
+does not execute repository code. v0.5 uses bounded pattern-based
 symbol and manifest extraction; sandboxed Tree-sitter workers remain planned.
 
 ## HTTP API
@@ -441,18 +457,35 @@ Policy files must not be readable or writable by group or other users. See the
 [token-policy](examples/token-policy.example.json) shapes. Never commit usable
 credentials or raw tokens.
 
-### Optional semantic embeddings
+### Semantic embeddings
 
 Lexical plus graph retrieval works without an embedding model or network call.
+For zero-API-cost semantic retrieval, ContinuityDB includes a first-class local
+provider based on the MIT-licensed `bge-small-en-v1.5` model. Inference runs
+inside the process through WASM; memory and query text do not leave the host.
 
 | Variable | Values / purpose |
 |---|---|
-| `CONTINUITYDB_EMBEDDING_PROVIDER` | `none`, `ollama`, or `openai-compatible` |
-| `CONTINUITYDB_EMBEDDING_MODEL` | Provider model identifier; required when enabled |
+| `CONTINUITYDB_EMBEDDING_PROVIDER` | `none`, `local`, `ollama`, or `openai-compatible` |
+| `CONTINUITYDB_EMBEDDING_MODEL` | Provider model identifier; required for Ollama/OpenAI-compatible modes |
 | `CONTINUITYDB_EMBEDDING_ENDPOINT` | Ollama defaults to loopback `/api/embed`; required for OpenAI-compatible mode |
 | `CONTINUITYDB_EMBEDDING_DIMENSIONS` | Optional requested dimensions for OpenAI-compatible providers |
 | `CONTINUITYDB_EMBEDDING_API_KEY_ENV` | Name of a host-injected environment entry containing the provider credential |
 | `CONTINUITYDB_ALLOW_REMOTE_EMBEDDINGS` | Must be `true` for a non-loopback endpoint |
+| `CONTINUITYDB_MODEL_CACHE` | Override the built-in model cache root; defaults under `CONTINUITYDB_HOME/models` |
+| `CONTINUITYDB_LOCAL_MODEL_OFFLINE` | `true` refuses model downloads and requires a verified cache |
+| `CONTINUITYDB_LOCAL_MODEL_THREADS` | WASM threads, bounded from 1 to 8; default 1 |
+| `CONTINUITYDB_LOCAL_MODEL_BATCH_SIZE` | Local inference batch, bounded from 1 to 64; default 32 |
+
+The built-in model is pinned to repository revision
+`ea104dacec62c0de699686887e3f920caeb4f3e3`. Its 384-dimensional quantized ONNX
+artifact and vocabulary total 34,245,934 bytes. Every first-use artifact is
+downloaded over HTTPS from the fixed Hugging Face repository, size-bounded,
+SHA-256 verified, atomically installed, and cached with private permissions.
+After `embeddings-pull`, set `CONTINUITYDB_LOCAL_MODEL_OFFLINE=true` for a
+network-independent runtime. The optional WASM runtime is materially larger
+than the weights (about 137 MB unpacked in the tested npm release); this is why
+lexical-only installs can omit optional dependencies.
 
 Remote embedding endpoints must use HTTPS. Endpoint URLs cannot contain
 credentials, query strings, or fragments. ContinuityDB reads the configured
@@ -499,7 +532,7 @@ JSONL snapshot.
 
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
-encryption and remote signed audit checkpoints are not implemented in v0.4.
+encryption and remote signed audit checkpoints are not implemented in v0.5.
 
 ## Deployment and scale
 
@@ -524,8 +557,14 @@ npm test
 npm run benchmark:quality
 npm run benchmark:scale
 
-# Requires a configured real embedding provider
+# Uses any configured embedding provider
 npm run benchmark:hybrid
+
+# Downloads/uses the pinned built-in model and runs the hybrid fixture
+npm run benchmark:local
+
+# Measures local initialization, batch latency, throughput, and RSS
+npm run benchmark:local:performance
 
 # Tests, OpenAPI parse, quality baseline, dependency audit, and package check
 npm run release:check
@@ -558,9 +597,11 @@ distributed-scale result. A diagnostic 100k attempt reached 39,024 records in
 14 minutes 46 seconds at 99.2% of one CPU before it was deliberately stopped,
 showing nonlinear canonical-ingest degradation that must be profiled and fixed.
 
-Without an embedding provider, the current lexical fixture achieves 9/9 exact
-Recall@5 and 0/5 semantic Recall@5 with zero isolation leaks. Hybrid quality must
-be reported only with the model, dimensions, dataset, and raw results attached.
+Without an embedding provider, the fixture achieves 9/9 exact Recall@5 and 0/5
+semantic Recall@5. With the pinned local BGE-small q8 model, three consecutive
+runs each achieved 9/9 exact Recall@5, 5/5 semantic Recall@5, and zero isolation
+violations. This 14-query fixture is a regression gate, not broad retrieval
+evidence; larger held-out engineering datasets are still required.
 
 See the [methodology and verdict](docs/benchmark-report-2026-09-10.md),
 [raw 10k result](benchmarks/results/embedded-10k-2026-09-10.json), and
@@ -594,7 +635,7 @@ issue.
 
 - Alpha APIs and record formats may change before 1.0.
 - Embedded writes and queries share one synchronous process.
-- Semantic retrieval is opt-in and has no default model bundled.
+- Semantic retrieval is opt-in; the pinned local model is first-use downloaded rather than embedded in the npm tarball.
 - The local vector path is an exact bounded scan, not billion-scale ANN.
 - The centralized service still uses the embedded SQLite runtime; PostgreSQL
   migrations are a reference contract and no production adapter is wired yet.
@@ -617,7 +658,9 @@ that close a documented limitation with tests and evidence are especially welcom
 | [Scalability](docs/scalability.md) | Deployment envelopes, invariants, sharding plan, scale gates |
 | [Threat model](docs/threat-model.md) | Assets, boundaries, threats, shipped controls, production requirements |
 | [Benchmark report](docs/benchmark-report-2026-09-10.md) | Reproduction, hardware, raw metrics, saturation verdict |
+| [Local embeddings](docs/local-embeddings.md) | Pinned model, setup, quality, performance, security, and footprint |
 | [v0.4 verification](docs/build-verification-2026-09-10-v0.4.md) | Central MCP, handoff, UI, provenance, branch, budget and audit gates |
+| [v0.5 verification](docs/build-verification-2026-09-10-v0.5.md) | Pinned local model, integrity, quality, footprint, and CLI backfill gates |
 | [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
 | [Security policy](SECURITY.md) | Supported line and private reporting process |
 | [Contributing](CONTRIBUTING.md) | Development and pull-request expectations |

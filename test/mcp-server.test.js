@@ -107,7 +107,7 @@ test("stdio MCP can proxy two-agent continuity through one authoritative HTTP se
       args: [serverPath],
       env: { ...process.env, CONTINUITYDB_HTTP_URL: `http://127.0.0.1:${address.port}` },
     });
-    client = new Client({ name: "continuitydb-remote-test", version: "0.4.0" });
+    client = new Client({ name: "continuitydb-remote-test", version: "0.5.0" });
     await client.connect(transport);
     const saved = await client.callTool({
       name: "handoff_checkpoint",

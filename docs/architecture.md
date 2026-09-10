@@ -1,4 +1,4 @@
-# ContinuityDB architecture v0.4
+# ContinuityDB architecture v0.5
 
 ## Design principles
 
@@ -24,8 +24,9 @@ review inbox ------------------------------------------------+          +-> seri
 
 - SQLite WAL is the query/index engine for one host.
 - FTS5 handles exact identifiers, paths, errors and keywords.
-- Optional embeddings come from Ollama or an OpenAI-compatible endpoint and are
-  stored as versioned derived rows. Local vector retrieval is an exact bounded scan.
+- Optional embeddings come from the pinned built-in BGE-small q8 WASM provider,
+  Ollama, or an OpenAI-compatible endpoint and are stored as model/content-hash
+  versioned derived rows. Local vector retrieval is an exact bounded scan.
 - Project and memory edges provide bounded graph expansion.
 - RRF fuses lexical, semantic and graph ranks; MMR reduces repeated context.
 - Automatic capture has a separate write-rate limit, per-agent/project quota,
@@ -106,7 +107,7 @@ Typed project and memory edges carry weight, provenance and validity windows.
   no approval or administration tools. It can run against local storage or proxy
   to the authoritative HTTP service.
 
-## Explicit non-goals for v0.4
+## Explicit non-goals for v0.5
 
 - passive screen, clipboard or raw-chat surveillance;
 - treating retrieved text as policy or authorization;

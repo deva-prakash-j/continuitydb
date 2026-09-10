@@ -172,7 +172,7 @@ export function createContinuityServer({
     try {
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       if (request.method === "GET" && url.pathname === "/healthz") {
-        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.4.0" }, requestId);
+        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.5.0" }, requestId);
       }
 
       const identity = entries.length

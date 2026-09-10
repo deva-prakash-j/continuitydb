@@ -1,11 +1,19 @@
 {
   "name": "continuitydb",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": false,
   "description": "Portable, Git-grounded context graph for AI agents",
   "type": "module",
   "license": "Apache-2.0",
-  "keywords": ["ai", "agent", "memory", "mcp", "rag", "code-graph", "context-engine"],
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "mcp",
+    "rag",
+    "code-graph",
+    "context-engine"
+  ],
   "bin": {
     "continuitydb": "src/cli.js",
     "continuitydb-hook": "src/lifecycle-hook.js"
@@ -14,10 +22,27 @@
     ".": "./src/store.js",
     "./http-client": "./src/http-client.js",
     "./capture-policy": "./src/capture-policy.js",
+    "./embeddings": "./src/embeddings.js",
+    "./local-embeddings": "./src/local-embeddings.js",
     "./security": "./src/security.js",
     "./ranking": "./src/ranking.js"
   },
-  "files": ["src", "scripts", "benchmarks", "docs", "deploy", "examples", "LICENSE", "README.md", "SECURITY.md", "CHANGELOG.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "GOVERNANCE.md"],
+  "files": [
+    "src",
+    "scripts",
+    "benchmarks",
+    "docs",
+    "deploy",
+    "examples",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "GOVERNANCE.md",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "engines": {
     "node": ">=22.5"
   },
@@ -32,11 +57,16 @@
     "benchmark:scale": "node benchmarks/scale-benchmark.js",
     "benchmark:quality": "node benchmarks/quality-benchmark.js",
     "benchmark:hybrid": "node benchmarks/hybrid-quality-benchmark.js",
+    "benchmark:local": "node benchmarks/local-quality-benchmark.js",
+    "benchmark:local:performance": "node benchmarks/local-embedding-benchmark.js",
     "release:check": "npm test && npm run validate:openapi && npm run benchmark:quality && npm audit --omit=dev && npm pack --dry-run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "zod": "4.5.4"
+  },
+  "optionalDependencies": {
+    "onnxruntime-web": "1.29.0"
   },
   "devDependencies": {
     "yaml": "2.9.0"

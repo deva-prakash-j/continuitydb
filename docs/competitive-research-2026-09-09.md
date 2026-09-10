@@ -46,7 +46,7 @@ but its core memory service was not treated as an open-source building block.
 | Temporal truth and supersession | answer “what was true then?” without losing history | valid-time filtering, expiry, versions and supersession implemented |
 | Provenance and citations | verify rather than trust generated memory | source URI, repo path, symbol, branch and commit returned in every result |
 | Lexical retrieval | paths, symbols, hashes and errors | SQLite FTS5/BM25 implemented |
-| Semantic retrieval | paraphrases and intent | optional Ollama or OpenAI-compatible embedder plus hybrid fusion implemented; local vectors use bounded scan |
+| Semantic retrieval | paraphrases and intent | pinned local BGE-small q8, optional Ollama/OpenAI-compatible providers, and hybrid fusion implemented; local vectors use bounded scan |
 | Knowledge/dependency graph | impact and relationship traversal | project and memory edges, time bounds, graph expansion and graph-score fusion implemented |
 | Hybrid fusion and reranking | combine complementary retrieval signals | RRF, freshness/trust/scope boosts and MMR diversity implemented |
 | Token-bounded context | avoid filling the model window with duplicates | bounded cited context packs implemented; exact model tokenizer adapters remain open |

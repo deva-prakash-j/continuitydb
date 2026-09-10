@@ -9,6 +9,18 @@ after the first stable release.
 - Sandboxed Tree-sitter workers and Git staleness projector.
 - OIDC/mTLS identity adapter and compliance purge coordinator.
 
+## [0.5.0] - 2026-09-10
+
+- Added an opt-in built-in `bge-small-en-v1.5` q8 local embedding provider with
+  pinned model revision, byte sizes, SHA-256 verification, private cache,
+  offline mode, and WASM-only inference.
+- Added local model status/pull/backfill CLI commands and reproducible quality
+  and performance benchmarks.
+- Added query/document-specific BGE encoding, code-identifier normalization,
+  bounded WordPiece tokenization, and idempotent content-hash-aware backfill.
+- Kept the inference runtime optional so lexical/graph-only installations can
+  use `--omit=optional`.
+
 ## [0.4.0] - 2026-09-10
 
 - Added HTTP-backed stdio MCP mode for one authoritative store across clients and machines.

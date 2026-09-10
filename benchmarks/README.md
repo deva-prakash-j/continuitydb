@@ -42,5 +42,20 @@ For hybrid quality, configure a supported embedding provider and run:
 npm run benchmark:hybrid
 ```
 
+The built-in local model has dedicated quality and performance commands:
+
+```bash
+# First run downloads and verifies the pinned 34.2 MB artifacts.
+npm run benchmark:local
+
+# Cache first, then set CONTINUITYDB_LOCAL_MODEL_OFFLINE=true for closed-network runs.
+npm run benchmark:local:performance -- --repetitions=10
+```
+
+Publish model ID, revision, dimensions, query/document encoding behavior,
+quality metrics, latency, throughput, RSS, runtime version, and hardware. The
+repository's small 14-query fixture is a deterministic regression gate rather
+than a substitute for a held-out engineering retrieval dataset.
+
 Never publish a scale claim without the hardware details, raw per-run output,
 dataset generator, index configuration and error/isolation counts.

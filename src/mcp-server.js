@@ -10,7 +10,7 @@ import { createApiClientFromEnv } from "./http-client.js";
 const apiClient = createApiClientFromEnv();
 const vault = apiClient ? null : new ContextVault();
 const engine = apiClient ? null : new HybridEngine(vault, createEmbedderFromEnv());
-const server = new McpServer({ name: "continuitydb", version: "0.4.0" });
+const server = new McpServer({ name: "continuitydb", version: "0.5.0" });
 const tenantId = process.env.CONTINUITYDB_TENANT_ID || process.env.CONTEXT_VAULT_TENANT_ID || "local";
 const principalId = process.env.CONTINUITYDB_PRINCIPAL_ID || "local-agent";
 const ownerId = process.env.CONTINUITYDB_OWNER_ID || process.env.CONTEXT_VAULT_OWNER_ID || principalId;
