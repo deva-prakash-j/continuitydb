@@ -184,8 +184,10 @@ for design details and deliberate exclusions.
 ## Standalone binary quick start
 
 The standalone executable does not require system Node.js or npm. Release
-automation builds native artifacts for Linux x64, macOS x64/arm64, and Windows
-x64. Every artifact receives a SHA-256 sidecar; tagged releases also receive a
+automation builds native artifacts for Linux x64, macOS arm64, and Windows x64.
+Intel macOS is not published because upstream Node 25 SEA executables
+[segfault on x64 macOS](https://github.com/nodejs/node/issues/62893). Every
+supported artifact receives a SHA-256 sidecar; tagged releases also receive a
 GitHub build-provenance attestation. Until a tagged v0.7 release exists, build
 and test the binary from source using the next section.
 

@@ -124,12 +124,16 @@ cached developer-workspace `dist/` artifact.
 
 ## Evidence boundaries
 
-Only the Linux x64 executable was built and run on this host. macOS x64, macOS
-arm64, and Windows x64 jobs are configured but are **not verified** until their
+Only the Linux x64 executable was built and run on this host. macOS arm64 and
+Windows x64 jobs are configured but are **not verified** until their
 native GitHub runners complete terminal-green build, post-signing smoke,
 semantic inference, checksum, and artifact-upload gates for the exact release
 commit. Project-owned Developer ID and Authenticode signing identities are not
 configured.
+
+macOS x64 is intentionally unsupported for the v0.7 standalone binary because
+upstream Node 25 SEA executables [segfault on Intel macOS](https://github.com/nodejs/node/issues/62893).
+The npm distribution remains the supported Intel macOS installation path.
 
 The 34.2 MB local embedding model is an integrity-pinned first-use download;
 it is not bundled into the executable. The executable includes its Node runtime

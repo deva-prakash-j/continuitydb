@@ -33,12 +33,12 @@ export function validateReleaseWorkflow(document) {
   invariant(build.strategy?.["fail-fast"] === false, "all native targets must complete even if one fails");
   const targets = build.strategy?.matrix?.include || [];
   const names = new Set(targets.map((target) => target.name));
-  for (const required of ["linux-x64", "macos-x64", "macos-arm64", "windows-x64"]) {
+  for (const required of ["linux-x64", "macos-arm64", "windows-x64"]) {
     invariant(names.has(required), `native target ${required} is missing`);
   }
+  invariant(!names.has("macos-x64"),
+    "macos-x64 must not be published while upstream Node SEA crashes on Intel macOS");
   const targetByName = new Map(targets.map((target) => [target.name, target]));
-  invariant(targetByName.get("macos-x64")?.os === "macos-15-intel",
-    "macos-x64 must use the supported macos-15-intel runner");
   invariant(targetByName.get("macos-arm64")?.os === "macos-15",
     "macos-arm64 must use the supported macos-15 runner");
 

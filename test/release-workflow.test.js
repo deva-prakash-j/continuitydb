@@ -12,20 +12,24 @@ test("release workflow blocks publication on post-sign native semantic verificat
   assert.equal(validateReleaseWorkflow(workflow).valid, true);
 });
 
-test("release workflow runs native gates on pull requests using supported macOS runners", () => {
+test("release workflow runs native gates on pull requests using supported targets", () => {
   assert.notEqual(workflow.on.pull_request, undefined);
   const targets = new Map(workflow.jobs.build.strategy.matrix.include.map((target) => [target.name, target.os]));
-  assert.equal(targets.get("macos-x64"), "macos-15-intel");
+  assert.equal(targets.has("macos-x64"), false);
   assert.equal(targets.get("macos-arm64"), "macos-15");
 
   const noPullRequest = structuredClone(workflow);
   delete noPullRequest.on.pull_request;
   assert.throws(() => validateReleaseWorkflow(noPullRequest), /pull_request trigger is required/);
 
+  const unsupportedIntel = structuredClone(workflow);
+  unsupportedIntel.jobs.build.strategy.matrix.include.push({ name: "macos-x64", os: "macos-15-intel" });
+  assert.throws(() => validateReleaseWorkflow(unsupportedIntel), /must not be published/);
+
   const retiredRunner = structuredClone(workflow);
   retiredRunner.jobs.build.strategy.matrix.include
-    .find((target) => target.name === "macos-x64").os = "macos-13";
-  assert.throws(() => validateReleaseWorkflow(retiredRunner), /supported macos-15-intel runner/);
+    .find((target) => target.name === "macos-arm64").os = "macos-13";
+  assert.throws(() => validateReleaseWorkflow(retiredRunner), /supported macos-15 runner/);
 });
 
 test("release workflow validator rejects missing, skipped, or misordered semantic gates", () => {
