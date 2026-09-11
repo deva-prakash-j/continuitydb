@@ -21,7 +21,13 @@ mkdirSync(project);
 
 function run(args) {
   const result = spawnSync(binary, args, { encoding: "utf8", timeout: 30_000 });
-  assert.equal(result.status, 0, `${args.join(" ")} failed: ${result.stderr}`);
+  assert.equal(result.status, 0, `${args.join(" ")} failed: ${JSON.stringify({
+    status: result.status,
+    signal: result.signal,
+    error: result.error ? { code: result.error.code, message: result.error.message } : null,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  })}`);
   return result.stdout.trim() ? JSON.parse(result.stdout) : null;
 }
 
@@ -125,7 +131,13 @@ try {
   const installation = run(["install", "--prefix", prefix, "--apply"]);
   assert.equal(installation.installed, true);
   const installedResult = spawnSync(installation.launcher, ["version"], { encoding: "utf8", timeout: 30_000 });
-  assert.equal(installedResult.status, 0, installedResult.stderr);
+  assert.equal(installedResult.status, 0, JSON.stringify({
+    status: installedResult.status,
+    signal: installedResult.signal,
+    error: installedResult.error ? { code: installedResult.error.code, message: installedResult.error.message } : null,
+    stdout: installedResult.stdout,
+    stderr: installedResult.stderr,
+  }));
   assert.equal(JSON.parse(installedResult.stdout).version, version.version);
   await proveHttpService(version.version);
 

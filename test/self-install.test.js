@@ -3,7 +3,13 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { installStandaloneBinary } from "../src/self-install.js";
+import { canonicalInstallPrefix, installStandaloneBinary } from "../src/self-install.js";
+
+test("standalone installer canonicalizes only the trusted macOS /var alias", () => {
+  assert.equal(canonicalInstallPrefix("/var/folders/example/prefix", "darwin"), "/private/var/folders/example/prefix");
+  assert.equal(canonicalInstallPrefix("/var", "darwin"), "/private/var");
+  assert.equal(canonicalInstallPrefix("/var/folders/example/prefix", "linux"), "/var/folders/example/prefix");
+});
 
 test("standalone installer previews, installs versioned binary, and is idempotent", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-"));

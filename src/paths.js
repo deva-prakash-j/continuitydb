@@ -8,3 +8,9 @@ export function defaultDataHome(environment = process.env, platform = process.pl
   if (platform === "darwin") return resolve(homedir(), "Library", "Application Support", "ContinuityDB");
   return resolve(environment.XDG_DATA_HOME || join(homedir(), ".local", "share"), "continuitydb");
 }
+
+export function hasPrivateDirectoryPermissions(mode, platform = process.platform) {
+  // Windows ACLs are not represented by POSIX permission bits. Treat the mode
+  // check as not applicable there and rely on the platform ACL instead.
+  return platform === "win32" || (mode & 0o077) === 0;
+}

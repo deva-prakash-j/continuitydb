@@ -36,7 +36,7 @@ import {
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { installStandaloneBinary } from "./self-install.js";
 import { VERSION } from "./version.js";
-import { defaultDataHome } from "./paths.js";
+import { defaultDataHome, hasPrivateDirectoryPermissions } from "./paths.js";
 
 function parse(argv) {
   const positional = [];
@@ -424,7 +424,14 @@ try {
     const checks = [];
     checks.push({ name: "node", ok: Number(process.versions.node.split(".")[0]) >= 22, value: process.version });
     checks.push({ name: "home", ok: existsSync(home), value: home });
-    if (existsSync(home)) checks.push({ name: "home_permissions", ok: (statSync(home).mode & 0o077) === 0, value: (statSync(home).mode & 0o777).toString(8) });
+    if (existsSync(home)) {
+      const mode = statSync(home).mode;
+      checks.push({
+        name: "home_permissions",
+        ok: hasPrivateDirectoryPermissions(mode),
+        value: process.platform === "win32" ? "managed by Windows ACL" : (mode & 0o777).toString(8),
+      });
+    }
     try {
       const vault = new ContextVault(home);
       const audit = vault.verifyAuditLog();

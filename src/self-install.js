@@ -41,6 +41,18 @@ function assertNoSymlinkAncestors(path) {
   }
 }
 
+export function canonicalInstallPrefix(prefix, platform = process.platform) {
+  const absolute = resolve(prefix);
+  // macOS exposes /var as the OS-owned /private/var compatibility link. Temp
+  // directories live below it, so canonicalize that one trusted system alias
+  // before enforcing the no-symlink-ancestor rule. No user-controlled symlink
+  // is followed or allowlisted.
+  if (platform === "darwin" && (absolute === "/var" || absolute.startsWith(`/var${sep}`))) {
+    return join("/private/var", relative("/var", absolute));
+  }
+  return absolute;
+}
+
 function isManagedLauncher(path, managedRoot) {
   if (!lstatSync(path).isSymbolicLink()) return false;
   const target = resolve(dirname(path), readlinkSync(path));
@@ -91,13 +103,14 @@ export function installStandaloneBinary({
   const sourcePath = realpathSync(source);
   const metadata = lstatSync(sourcePath);
   if (!metadata.isFile() || metadata.isSymbolicLink()) throw new Error("installation source must be a regular file");
-  const installationPrefix = resolve(prefix);
+  const installationPrefix = canonicalInstallPrefix(prefix, platform);
   const executableName = platform === "win32" ? "continuitydb.exe" : "continuitydb";
   const versionDirectory = join(installationPrefix, "lib", "continuitydb", version);
   const versionedBinary = join(versionDirectory, executableName);
   const binDirectory = join(installationPrefix, "bin");
   const launcher = join(binDirectory, executableName);
-  const pathConfigured = pathValue.split(delimiter).some((item) => resolve(item || ".") === binDirectory);
+  const pathConfigured = pathValue.split(delimiter)
+    .some((item) => canonicalInstallPrefix(item || ".", platform) === binDirectory);
   const plan = { prefix: installationPrefix, source: sourcePath, versioned_binary: versionedBinary, launcher, path_configured: pathConfigured };
   if (!apply) return { installed: false, preview: true, ...plan };
 
