@@ -8,6 +8,17 @@ import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
 import { ensureLocalModel, localModelStatus } from "./local-embeddings.js";
+import {
+  connectAgent,
+  connectionStatus,
+  detectAgents,
+  disconnectAgent,
+  SUPPORTED_AGENTS,
+} from "./agent-connectors.js";
+import { isStandaloneBinary } from "./binary-runtime.js";
+import { installStandaloneBinary } from "./self-install.js";
+import { VERSION } from "./version.js";
+import { defaultDataHome } from "./paths.js";
 
 function parse(argv) {
   const positional = [];
@@ -44,10 +55,18 @@ function usage() {
   process.stdout.write(`ContinuityDB — portable context graph for AI agents
 
 Usage:
+  continuitydb version
+  continuitydb install [--prefix PATH] --apply
+  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--apply]
   continuitydb init [--home PATH]
   continuitydb doctor [--home PATH]
-  continuitydb serve [--home PATH] [--host HOST] [--port PORT] [--review-ui]
+  continuitydb run [--home PATH] [--host HOST] [--port PORT] [--review-ui]
+  continuitydb agents detect
+  continuitydb agents status [--project-dir PATH]
+  continuitydb agents connect AGENT|all [--project-dir PATH] [--transport stdio|http] [--url URL] --apply
+  continuitydb agents disconnect AGENT|all [--project-dir PATH] --apply
   continuitydb mcp [--home PATH]
+  continuitydb hook session-start|checkpoint [HOOK OPTIONS]
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
   continuitydb capture --body TEXT --project ID [--kind working|inference|git-fact|decision]
   continuitydb commit MEMORY_ID
@@ -73,9 +92,10 @@ commit, correct, delete and graph administration remain unavailable over MCP.
 `);
 }
 
-const { positional, flags } = parse(process.argv.slice(2));
+const rawArguments = process.argv.slice(2);
+const { positional, flags } = parse(rawArguments);
 const command = positional.shift();
-const home = resolve(flags.home || process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb"));
+const home = resolve(flags.home || defaultDataHome());
 const cliTenantId = process.env.CONTINUITYDB_TENANT_ID || "local";
 const cliPrincipalId = process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user";
 const cliOwnerId = process.env.CONTINUITYDB_OWNER_ID || cliPrincipalId;
@@ -86,8 +106,79 @@ if (!command || command === "help" || flags.help) {
   process.exit(0);
 }
 
+function agentSelection(value) {
+  const requested = listFlag(value || "detected");
+  if (requested.includes("all")) return [...SUPPORTED_AGENTS];
+  if (requested.includes("detected")) return detectAgents().filter((item) => item.installed).map((item) => item.client);
+  const unsupported = requested.filter((item) => !SUPPORTED_AGENTS.includes(item));
+  if (unsupported.length) throw new Error(`unsupported agents: ${unsupported.join(", ")}`);
+  return [...new Set(requested)];
+}
+
+function agentOptions() {
+  return {
+    home,
+    projectDir: resolve(flags.project_dir || process.cwd()),
+    binary: flags.binary || null,
+    ownerId: flags.owner || cliOwnerId,
+    tenantId: flags.tenant || cliTenantId,
+    projects: listFlag(flags.projects || flags.project),
+    sensitivities: listFlag(flags.sensitivities || "public,private"),
+    transport: flags.transport || "stdio",
+    url: flags.url,
+    tokenEnv: flags.token_env,
+    apply: Boolean(flags.apply),
+  };
+}
+
 try {
-  if (command === "init") {
+  if (command === "version") {
+    output({ version: VERSION, standalone: isStandaloneBinary(), node: process.version, platform: process.platform, arch: process.arch });
+  } else if (command === "install") {
+    output(installStandaloneBinary({ prefix: flags.prefix, apply: Boolean(flags.apply), force: Boolean(flags.force) }));
+  } else if (command === "setup") {
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const configPath = join(home, "config.json");
+    if (!existsSync(configPath)) {
+      writeFileSync(configPath, `${JSON.stringify({
+        schema_version: 2,
+        mode: "local",
+        tenant_id: flags.tenant || cliTenantId,
+        owner_id: flags.owner || cliOwnerId,
+        created_at: new Date().toISOString(),
+      }, null, 2)}\n`, { mode: 0o600 });
+    }
+    const vault = new ContextVault(home);
+    const stats = vault.stats();
+    vault.close();
+    const selected = agentSelection(flags.agents);
+    const connections = selected.map((client) => connectAgent(client, agentOptions()));
+    let embeddings = null;
+    if (flags.semantic) embeddings = await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE });
+    output({
+      setup: true,
+      home,
+      config: configPath,
+      stats,
+      detected_agents: detectAgents(),
+      connections,
+      embeddings,
+      applied: Boolean(flags.apply),
+      run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
+    });
+  } else if (command === "agents") {
+    const action = positional.shift() || "status";
+    if (action === "detect") output({ agents: detectAgents() });
+    else if (action === "status") output({ agents: connectionStatus(agentOptions()) });
+    else if (action === "connect" || action === "disconnect") {
+      const selected = agentSelection(positional.shift() || flags.agents || "detected");
+      const operation = action === "connect" ? connectAgent : disconnectAgent;
+      output({ action, applied: Boolean(flags.apply), results: selected.map((client) => operation(client, agentOptions())) });
+    } else throw new Error(`unknown agents action: ${action}`);
+  } else if (command === "hook") {
+    const { runLifecycleHook } = await import("./lifecycle-hook.js");
+    process.exitCode = await runLifecycleHook(rawArguments.slice(1));
+  } else if (command === "init") {
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const configPath = join(home, "config.json");
     if (!existsSync(configPath)) {
@@ -122,7 +213,7 @@ try {
     }
     output({ ok: checks.every((check) => check.ok), checks });
     if (!checks.every((check) => check.ok)) process.exitCode = 1;
-  } else if (command === "serve") {
+  } else if (command === "serve" || command === "run" || command === "start") {
     process.env.CONTINUITYDB_HOME = home;
     if (flags.review_ui) process.env.CONTINUITYDB_ENABLE_REVIEW_UI = "true";
     const service = createContinuityServer({

@@ -1,11 +1,56 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { BUILTIN_LOCAL_MODEL } from "../src/local-embeddings.js";
 import { ContextVault } from "../src/store.js";
+import { VERSION } from "../src/version.js";
+
+test("CLI version matches the package version", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
+  try {
+    const cli = new URL("../src/cli.js", import.meta.url).pathname;
+    const result = spawnSync(process.execPath, [cli, "version"], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    const value = JSON.parse(result.stdout);
+    assert.equal(value.version, VERSION);
+    const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+    assert.equal(packageJson.version, VERSION);
+    assert.equal(value.standalone, false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup previews and applies all project agent connections idempotently", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  mkdirSync(project);
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    const common = [cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--owner", "owner-a"];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    const previewValue = JSON.parse(preview.stdout);
+    assert.equal(previewValue.connections.length, 5);
+    assert.deepEqual(previewValue.run, { command: "continuitydb", args: ["run", "--home", home] });
+    assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).connections.every((item) => item.applied), true);
+    const status = spawnSync(process.execPath, [cli, "agents", "status", "--home", home, "--project-dir", project], { encoding: "utf8" });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(JSON.parse(status.stdout).agents.filter((item) => item.connected).length, 5);
+    const repeated = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(JSON.parse(repeated.stdout).connections.every((item) => !item.changed), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("CLI --home overrides environment home for local embedding cache resolution", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-home-test-"));

@@ -13,6 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
+import { ensureEmbeddedOnnxRuntime } from "./binary-runtime.js";
 
 const REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 const REPOSITORY = "Xenova/bge-small-en-v1.5";
@@ -241,22 +242,24 @@ export class WordPieceTokenizer {
   }
 }
 
-async function loadSession(status, threads) {
+async function loadSession(status, threads, options = {}) {
   const key = `${status.directory}:${threads}`;
   if (!sessions.has(key)) {
     sessions.set(key, (async () => {
       let ort;
-      try { ort = await import("onnxruntime-web"); }
+      try { ort = await import("onnxruntime-web/wasm"); }
       catch (error) {
         if (error.code === "ERR_MODULE_NOT_FOUND") {
           throw new Error("local embeddings require the optional onnxruntime-web dependency; reinstall without --omit=optional");
         }
         throw error;
       }
+      const embeddedRuntime = ensureEmbeddedOnnxRuntime(options);
+      if (embeddedRuntime) ort.env.wasm.wasmBinary = readFileSync(embeddedRuntime.wasm);
       ort.env.wasm.numThreads = threads;
       ort.env.wasm.proxy = false;
       const tokenizer = WordPieceTokenizer.fromFile(join(status.directory, "vocab.txt"));
-      const session = await ort.InferenceSession.create(join(status.directory, "model.onnx"), {
+      const session = await ort.InferenceSession.create(readFileSync(join(status.directory, "model.onnx")), {
         executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
       });
@@ -300,7 +303,7 @@ export class LocalOnnxEmbedder {
 
   async ready() {
     const status = await ensureLocalModel({ home: this.home, cacheDir: this.cacheDir, offline: this.offline });
-    await loadSession(status, this.threads);
+    await loadSession(status, this.threads, { home: this.home, cacheDir: this.cacheDir });
     return status;
   }
 
@@ -316,7 +319,7 @@ export class LocalOnnxEmbedder {
     const input = Array.isArray(texts) ? texts : [texts];
     if (!input.length || input.length > 256) throw new Error("embedding batch must contain 1 to 256 items");
     const status = await ensureLocalModel({ home: this.home, cacheDir: this.cacheDir, offline: this.offline });
-    const { ort, tokenizer, session } = await loadSession(status, this.threads);
+    const { ort, tokenizer, session } = await loadSession(status, this.threads, { home: this.home, cacheDir: this.cacheDir });
     const vectors = [];
     for (let offset = 0; offset < input.length; offset += this.batchSize) {
       const batch = input.slice(offset, offset + this.batchSize).map((value) => tokenizer.encode(value));

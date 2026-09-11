@@ -45,3 +45,26 @@ jobs:
           context: .
           push: false
           tags: continuitydb:test
+
+  binary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 25.9.0
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run test:binary
+      - run: npm run checksum:binaries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: continuitydb-linux-x64
+          path: |
+            dist/continuitydb-linux-x64
+            dist/continuitydb-linux-x64.sha256
+          if-no-files-found: error
+          retention-days: 14

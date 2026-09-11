@@ -1,6 +1,6 @@
 {
   "name": "continuitydb",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": false,
   "description": "Portable, Git-grounded context graph for AI agents",
   "type": "module",
@@ -47,6 +47,10 @@
     "node": ">=22.5"
   },
   "scripts": {
+    "build:binary": "node scripts/build-binary.js",
+    "checksum:binaries": "node scripts/checksum-binaries.js",
+    "test:binary": "npm run build:binary && node scripts/binary-smoke.js",
+    "test:binary:semantic": "npm run build:binary && node scripts/binary-semantic-smoke.js",
     "start:mcp": "node src/mcp-server.js",
     "start:http": "node src/http-server.js",
     "cli": "node src/cli.js",
@@ -54,6 +58,7 @@
     "test:security": "node --test test/security.test.js test/http-server.test.js",
     "test:clients": "node --test test/client-adapters.test.js test/lifecycle-hook.test.js test/mcp-server.test.js",
     "test:codex-client": "node scripts/codex-client-probe.js",
+    "test:codex-generated-config": "node scripts/codex-generated-config-probe.js",
     "validate:clients": "node scripts/validate-client-adapters.js",
     "validate:openapi": "node scripts/validate-openapi.js",
     "benchmark": "node benchmarks/lexical-benchmark.js",
@@ -73,6 +78,7 @@
     "onnxruntime-web": "1.29.0"
   },
   "devDependencies": {
+    "esbuild": "0.28.2",
     "yaml": "2.9.0"
   }
 }

@@ -15,7 +15,7 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.6 alpha. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.7 alpha candidate. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
 > production adapter and billion-record proof do not exist yet. Remote MCP and
@@ -141,6 +141,10 @@ and credentials when their trust domains differ.
 
 ### Interfaces and operations
 
+- standalone Linux, macOS, and Windows binary build pipeline with the Node
+  runtime and local ONNX/WASM inference runtime included;
+- idempotent user-scoped self-install plus CLI-managed project connections for
+  Codex, Claude Code, OpenCode, Cursor, and VS Code Copilot;
 - six scope-filtered agent-facing MCP tools, including structured handoff save/retrieval;
 - stateful Streamable HTTP MCP at `/mcp`, plus local stdio and HTTP-backed thin-stdio modes;
 - explicit MCP safety annotations, server instructions, bearer/OIDC identity binding,
@@ -176,6 +180,77 @@ and credentials when their trust domains differ.
 See the [architecture](docs/architecture.md) and
 [competitor-derived capability review](docs/competitive-research-2026-09-09.md)
 for design details and deliberate exclusions.
+
+## Standalone binary quick start
+
+The standalone executable does not require system Node.js or npm. Release
+automation builds native artifacts for Linux x64, macOS x64/arm64, and Windows
+x64. Every artifact receives a SHA-256 sidecar; tagged releases also receive a
+GitHub build-provenance attestation. Until a tagged v0.7 release exists, build
+and test the binary from source using the next section.
+
+After downloading the artifact for your platform, verify its `.sha256` sidecar,
+then preview and apply a user-scoped installation:
+
+```bash
+chmod +x ./continuitydb-linux-x64
+./continuitydb-linux-x64 install
+./continuitydb-linux-x64 install --apply
+
+export PATH="$HOME/.local/bin:$PATH"
+continuitydb version
+```
+
+`install` writes a versioned executable below `~/.local/lib/continuitydb` and
+atomically updates `~/.local/bin/continuitydb`. It does not edit shell profiles
+or replace an unmanaged launcher unless `--force` is explicit. Windows defaults
+to `%LOCALAPPDATA%\\ContinuityDB`.
+
+From a repository, initialize a private vault and connect every installed
+supported client. Both commands initialize the private vault; the first only
+previews client-config changes, while the second creates backups and applies
+them:
+
+```bash
+continuitydb setup --agents detected --project-dir "$PWD"
+continuitydb setup --agents detected --project-dir "$PWD" --apply
+
+# Or generate all five supported project configurations:
+continuitydb setup --agents all --project-dir "$PWD" --apply
+
+continuitydb agents status --project-dir "$PWD"
+continuitydb run
+```
+
+By default every project points at the same platform user-data vault:
+`~/.local/share/continuitydb` on Linux, `~/Library/Application Support/ContinuityDB`
+on macOS, and `%LOCALAPPDATA%\\ContinuityDB\\data` on Windows. `--home` remains
+an explicit override. Add `--semantic` to `setup` to download and verify the pinned 34.2 MB local
+embedding model. The binary already contains the integrity-pinned ONNX/WASM
+runtime, so no separate inference package is installed.
+
+The generated project files are:
+
+| Client | Managed project file |
+|---|---|
+| Codex | `.codex/config.toml` managed block |
+| Claude Code | `.mcp.json` → `mcpServers.continuitydb` |
+| OpenCode | `opencode.json` → `mcp.continuitydb` |
+| Cursor | `.cursor/mcp.json` → `mcpServers.continuitydb` |
+| VS Code Copilot | `.vscode/mcp.json` → `servers.continuitydb` |
+
+Writes are atomic, symlinked config paths are rejected, existing files are
+backed up privately below the vault, and rerunning setup is idempotent. Static
+secrets are never written: remote configs store only a token environment
+variable reference. Disconnect removes only the ContinuityDB-owned entry:
+
+```bash
+continuitydb agents disconnect codex --project-dir "$PWD"
+continuitydb agents disconnect codex --project-dir "$PWD" --apply
+```
+
+See [binary distribution and setup](docs/binary-distribution.md) for build,
+checksum, remote transport, recovery, and platform details.
 
 ## Quick start from source
 
@@ -437,10 +512,18 @@ Run `continuitydb help` for the concise built-in usage text.
 
 | Command | Purpose |
 |---|---|
+| `version` | Show CLI version, embedded runtime mode, platform, and architecture |
+| `install` | Preview or apply a versioned user-scoped standalone-binary installation |
+| `setup` | Initialize a vault and preview/apply detected or selected agent connections |
 | `init` | Create a private local data directory and embedded database |
 | `doctor` | Check Node version, directory permissions, SQLite/FTS5, and audit-chain health |
-| `serve` | Start the HTTP service |
+| `run` / `serve` | Start the foreground HTTP and Streamable MCP service |
+| `agents detect` | Find supported client executables without running them |
+| `agents status` | Report project connection state for all supported clients |
+| `agents connect` | Preview/apply one or all project-scoped MCP configurations |
+| `agents disconnect` | Preview/remove only the ContinuityDB-managed configuration |
 | `mcp` | Start the stdio MCP server |
+| `hook` | Run bundled Claude/Cursor lifecycle hook operations from the same binary |
 | `propose` | Create a memory that remains invisible to recall |
 | `capture` | Apply automatic capture policy as an agent identity |
 | `commit` | Activate a proposed memory through the trusted CLI/admin path |

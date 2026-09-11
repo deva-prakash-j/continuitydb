@@ -1,0 +1,138 @@
+# Standalone binary distribution and agent setup
+
+ContinuityDB 0.7 can be bundled as a native single executable. End users do
+not need Node.js, npm, a global package installation, or a separate SQLite
+library.
+
+## Artifact contents
+
+The executable contains:
+
+- a Node.js runtime with built-in SQLite/FTS5;
+- the ContinuityDB CLI, HTTP service, MCP servers, policy engine, and adapters;
+- the MCP SDK and JWT verification dependencies;
+- the ONNX Runtime WebAssembly glue and integrity-pinned WASM binary.
+
+The 34.2 MB BGE-small model and vocabulary remain an integrity-pinned first-use
+download. This keeps the executable smaller and lets lexical/graph-only users
+avoid model storage. `setup --semantic` downloads the model, validates exact
+byte sizes and SHA-256 digests, and stores it in a private cache.
+
+## Supported build targets
+
+| Target | Release workflow | Evidence before first v0.7 release |
+|---|---:|---|
+| Linux x64 | Yes | Locally built and end-to-end tested |
+| macOS x64 | Yes | Build matrix configured; native CI result required |
+| macOS arm64 | Yes | Build matrix configured; native CI result required |
+| Windows x64 | Yes | Build matrix configured; native CI result required |
+
+Do not describe an artifact as verified until its native build and binary smoke
+job is terminal green. macOS outputs receive ad-hoc signing in CI; official
+Developer ID and Windows Authenticode signing require project-owned signing
+identities and are not currently configured.
+
+## Build and smoke test
+
+Binary construction uses Node's official Single Executable Application
+facility. Build hosts require Node 25.5 or newer, but produced binaries include
+their runtime and have no Node requirement on the destination host.
+
+```bash
+npm ci --ignore-scripts
+npm run test:binary
+npm run checksum:binaries
+```
+
+The smoke test proves:
+
+1. the executable identifies itself as standalone;
+2. versioned self-install and launcher execution;
+3. setup preview and idempotent apply;
+4. all five agent configuration writers;
+5. vault initialization and doctor checks;
+6. foreground HTTP service readiness and clean shutdown;
+7. MCP initialization and six-tool discovery;
+8. agent capture followed by retrieval.
+
+Use `npm run test:binary:semantic` for the networked model pull plus real local
+WASM inference gate.
+
+## Install
+
+Preview first:
+
+```bash
+./continuitydb-linux-x64 install
+```
+
+Apply:
+
+```bash
+./continuitydb-linux-x64 install --apply
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+The installer:
+
+- installs to a versioned directory;
+- atomically switches a managed launcher;
+- refuses symlink traversal in the installation prefix;
+- refuses an unmanaged existing launcher unless `--force` is explicit;
+- does not edit shell profiles, request administrator access, or send data.
+
+## Set up a project and connect clients
+
+```bash
+continuitydb setup \
+  --project-dir "$PWD" \
+  --owner developer-1 \
+  --projects api,schema \
+  --agents detected
+
+# Review the JSON plan, then apply the same command with:
+continuitydb setup --project-dir "$PWD" --owner developer-1 \
+  --projects api,schema --agents detected --apply
+```
+
+Use `--agents all` to generate every supported project file even when the
+client executable is not installed yet. Use `agents connect` and
+`agents disconnect` for one client at a time. Both preview by default and need
+`--apply` to mutate project files.
+
+Local stdio is the default and starts the binary on demand. For one central
+service, pass `--transport http --url https://memory.example/mcp`; generated
+configs refer to `CONTINUITYDB_MCP_TOKEN` (or `--token-env NAME`) without
+copying its value.
+
+## Run
+
+```bash
+continuitydb run
+```
+
+The default data home is global to the OS user, so every connected repository
+uses one vault. Override it with `--home` only when intentionally separating
+trust domains. `run` is intentionally foreground-first. Process supervision belongs to the
+operator's user service manager, container platform, or orchestrator, which
+can provide restart policy, logs, and resource limits without ContinuityDB
+inventing an unsafe cross-platform PID daemon.
+
+## Recovery
+
+Changed client files are backed up by content hash below:
+
+```text
+<continuitydb-home>/backups/agent-config/<client>/
+```
+
+Disconnect removes only the managed ContinuityDB entry or Codex managed block;
+unrelated client configuration remains intact. If validation fails before an
+atomic rename, the original file remains authoritative.
+
+## Release integrity
+
+Each workflow artifact includes a `.sha256` file. Tagged GitHub releases also
+use GitHub artifact attestations. Verify both the checksum and release origin
+before executing a downloaded binary. Never accept a checksum copied from an
+unrelated mirror or chat message.
