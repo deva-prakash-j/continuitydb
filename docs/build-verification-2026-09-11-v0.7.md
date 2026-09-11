@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `402de9d37189b50c043483344ffe3994548c6806`
+- **Runtime candidate tested:** `58e271b16f46c8e1d43ca14f64bac2f7e1225da4`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143997992` bytes
 - **Linux binary SHA-256:**
-  `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d`
+  `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -58,7 +58,7 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **117/117** primary Node tests passed with **0 failed** and **0 skipped**;
+- **121/121** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
@@ -74,26 +74,26 @@ Observed results on the build host:
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
 - the Linux executable is **143,997,992 bytes**, SHA-256
-  `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d`.
+  `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`402de9d37189b50c043483344ffe3994548c6806`:
+`58e271b16f46c8e1d43ca14f64bac2f7e1225da4`:
 
-- [release-binaries run 34619047984](https://github.com/deva-prakash-j/continuitydb/actions/runs/34619047984):
+- [release-binaries run 34622120306](https://github.com/deva-prakash-j/continuitydb/actions/runs/34622120306):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34619047931](https://github.com/deva-prakash-j/continuitydb/actions/runs/34619047931):
+- [CI run 34622120156](https://github.com/deva-prakash-j/continuitydb/actions/runs/34622120156):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 143,997,992 | `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d` |
-| macOS arm64 | 147,759,328 | `ebe258ac61acd13281b95775febcdcf71eaf9b3f73420030117ec03cd4f236d8` |
-| Windows x64 | 110,742,528 | `9e2d2445857314f5ae77fc1576a5c8b5c4e3dc785b28a61971d2b44f82144390` |
+| Linux x64 | 143,997,992 | `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06` |
+| macOS arm64 | 147,759,328 | `083d663eb58135635837d3f2849fcaf0f75c7e0053118fd21e844eb69c7ac25c` |
+| Windows x64 | 110,745,088 | `c42374a62837fb4f99751d09b27673ad337ef9667c882e86347062b028da5d50` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -129,10 +129,16 @@ cached developer-workspace `dist/` artifact.
 - connector preflight and rollback use compare-and-swap snapshots; rollback
   restores only bytes written by the failed transaction and preserves a file
   changed by a concurrent writer while reporting the conflict;
-- connector commits also acquire a per-configuration cross-process lock and
-  compare the preflight snapshot immediately before atomic replacement,
-  closing the preflight-to-rename race while preserving non-cooperating direct
-  writers;
+- connector commits use crash-released SQLite transaction locks shared by all
+  ContinuityDB processes and compare the preflight snapshot immediately before
+  atomic replacement; arbitrary editors that do not participate in this lock
+  protocol are detected on that final comparison when their write lands first,
+  but cannot be given transactional guarantees across a later direct-write
+  race by a portable filesystem API;
+- the same SQLite-backed resource locks serialize model-cache and standalone
+  installer critical sections, are re-entrant within one process, release
+  automatically after process death, and have no stale lockfile unlink or PID
+  reuse path;
 - external model-cache rollback applies the same compare-and-swap rule and
   never overwrites a newer concurrent cache artifact;
 - a later commit failure restores changed files and removes backup artifacts

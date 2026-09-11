@@ -24,10 +24,10 @@ returned.
 
 ### Verification status
 
-The v0.7 runtime candidate at `402de9d37189b50c043483344ffe3994548c6806`
+The v0.7 runtime candidate at `58e271b16f46c8e1d43ca14f64bac2f7e1225da4`
 has passed its builder and supported-native CI gates:
 
-- full automated suite: **117/117 passing**, with 0 failed and 0 skipped;
+- full automated suite: **121/121 passing**, with 0 failed and 0 skipped;
 - OpenAPI validation: **20 paths**;
 - exact lexical Recall@5: **9/9**, with **0 isolation violations**;
 - dependency audit: **0 known production vulnerabilities**;
@@ -37,10 +37,11 @@ has passed its builder and supported-native CI gates:
   **terminal green**;
 - Node 22/24, container, and Linux binary CI: **terminal green**.
 
-The candidate also serializes setup with concurrent first-open vault writers
-and uses per-configuration commit locks plus compare-and-swap rollback, so a
-failed setup cannot rewind a concurrent memory, client configuration, model
-cache update, or installer change.
+The candidate serializes ContinuityDB-controlled setup, first-open, connector,
+model-cache, and installer operations with crash-released SQLite transaction
+locks plus compare-and-swap rollback. Direct edits made by programs that do not
+participate in the lock protocol are rechecked immediately before replacement,
+but do not receive a portable cross-process transaction guarantee.
 
 See the exact commands, GitHub run URLs, artifact digests, environment, and
 evidence boundaries in the
