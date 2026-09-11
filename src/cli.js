@@ -21,6 +21,7 @@ import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
 import {
+  acquireLocalModelCacheLock,
   ensureLocalModel,
   localModelStatus,
   restoreLocalModelCache,
@@ -369,7 +370,12 @@ try {
     }
 
     const releaseInitializationLock = acquireVaultInitializationLock(home);
+    const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
+    let releaseExternalCacheLock = null;
     try {
+      releaseExternalCacheLock = flags.semantic && configuredCache
+        ? acquireLocalModelCacheLock({ home, cacheDir: configuredCache })
+        : null;
       const initialized = await initializeSetupHome(home, flags);
       let connections;
       try {
@@ -401,7 +407,8 @@ try {
         run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
       });
     } finally {
-      releaseInitializationLock();
+      try { if (releaseExternalCacheLock) releaseExternalCacheLock(); }
+      finally { releaseInitializationLock(); }
     }
   } else if (command === "agents") {
     const action = positional.shift() || "status";

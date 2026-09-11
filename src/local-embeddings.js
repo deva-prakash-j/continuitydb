@@ -76,6 +76,15 @@ function modelRoot(home, configuredCache, spec = BUILTIN_LOCAL_MODEL) {
   return join(base, spec.cache_directory);
 }
 
+export function acquireLocalModelCacheLock({
+  home,
+  cacheDir,
+  spec = BUILTIN_LOCAL_MODEL,
+  timeoutMs = 120_000,
+} = {}) {
+  return acquireFileLock(join(modelRoot(home, cacheDir, spec), ".download.lock"), { timeoutMs });
+}
+
 export function snapshotLocalModelCache({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } = {}) {
   const directory = modelRoot(home, cacheDir, spec);
   const base = dirname(directory);
@@ -205,38 +214,37 @@ export function localModelStatus({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } 
 
 export async function ensureLocalModel({ home, cacheDir, offline = false, fetchImpl = fetch, spec = BUILTIN_LOCAL_MODEL } = {}) {
   const cacheKey = modelRoot(home, cacheDir, spec);
-  if (verifiedModels.has(cacheKey)) {
-    const cached = localModelStatus({ home, cacheDir, spec });
-    if (cached.ready) return cached;
-    verifiedModels.delete(cacheKey);
-  }
-  const status = localModelStatus({ home, cacheDir, spec });
-  if (!status.cache_directory_safe) throw new Error("local embedding model cache must be a real directory, not a symlink");
-  if (status.ready) {
-    verifiedModels.set(cacheKey, status);
-    return status;
-  }
-  if (offline) throw new Error("local embedding model is not cached and offline mode is enabled");
-  mkdirSync(status.directory, { recursive: true, mode: 0o700 });
-  const directoryMetadata = lstatSync(status.directory);
-  if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
-    throw new Error("local embedding model cache must be a real directory, not a symlink");
-  }
-  chmodSync(status.directory, 0o700);
-  const lock = join(status.directory, ".download.lock");
-  const releaseLock = acquireFileLock(lock, { timeoutMs: 120_000 });
+  const releaseLock = acquireLocalModelCacheLock({ home, cacheDir, spec });
   try {
+    if (verifiedModels.has(cacheKey)) {
+      const cached = localModelStatus({ home, cacheDir, spec });
+      if (cached.ready) return cached;
+      verifiedModels.delete(cacheKey);
+    }
+    const status = localModelStatus({ home, cacheDir, spec });
+    if (!status.cache_directory_safe) throw new Error("local embedding model cache must be a real directory, not a symlink");
+    if (status.ready) {
+      verifiedModels.set(cacheKey, status);
+      return status;
+    }
+    if (offline) throw new Error("local embedding model is not cached and offline mode is enabled");
+    mkdirSync(status.directory, { recursive: true, mode: 0o700 });
+    const directoryMetadata = lstatSync(status.directory);
+    if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+      throw new Error("local embedding model cache must be a real directory, not a symlink");
+    }
+    chmodSync(status.directory, 0o700);
     for (const artifact of spec.artifacts) {
       const destination = join(status.directory, artifact.name);
       if (!validArtifact(destination, artifact)) await downloadArtifact(status.directory, artifact, fetchImpl, spec);
     }
+    const completed = localModelStatus({ home, cacheDir, spec });
+    if (!completed.ready) throw new Error("local embedding model installation did not complete");
+    verifiedModels.set(cacheKey, completed);
+    return completed;
   } finally {
     releaseLock();
   }
-  const completed = localModelStatus({ home, cacheDir, spec });
-  if (!completed.ready) throw new Error("local embedding model installation did not complete");
-  verifiedModels.set(cacheKey, completed);
-  return completed;
 }
 
 export function normalizeEmbeddingText(value) {
