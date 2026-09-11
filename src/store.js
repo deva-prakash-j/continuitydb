@@ -10,6 +10,7 @@ import {
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
+import { acquireVaultInitializationLock } from "./file-lock.js";
 import {
   freshnessScore,
   maxMarginalRelevance,
@@ -444,8 +445,10 @@ export class ContextVault {
       return;
     }
 
-    mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
+    const releaseInitializationLock = acquireVaultInitializationLock(rootDir);
+    try {
+      mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
+      mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
 
     this.db = new DatabaseSync(join(this.indexDir, "context-vault.db"));
     // Configure the busy handler before WAL or schema initialization. WAL mode
@@ -657,7 +660,10 @@ export class ContextVault {
     const indexed = this.db.prepare("SELECT count(*) AS count FROM memory_records").get().count;
     const canonicalCount = readdirSync(this.recordsDir).filter((name) => name.endsWith(".md")).length;
     if (Number(indexed) === 0 && canonicalCount > 0) this.rebuildIndex();
-    this.loadProjectLinks();
+      this.loadProjectLinks();
+    } finally {
+      releaseInitializationLock();
+    }
   }
 
   migrateLegacySchema() {

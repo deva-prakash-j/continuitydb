@@ -19,6 +19,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
+import { acquireFileLock } from "./file-lock.js";
 
 export const SUPPORTED_AGENTS = Object.freeze(["codex", "claude", "opencode", "cursor", "copilot"]);
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -165,35 +166,57 @@ function cleanupCreatedDirectories(plan, result) {
   }
 }
 
-function atomicWrite(path, content, { root, home, client, apply, expected }) {
+function atomicWrite(path, content, { root, home, client, apply, expected, beforeReplace }) {
   const createdDirectories = ensureSafeParents(root, path, apply);
-  const beforeState = currentSnapshot(path);
-  if (expected && !sameSnapshot(beforeState, expected)) {
-    throw new Error(`configuration changed after preflight: ${path}`);
+  if (!apply) {
+    const beforeState = currentSnapshot(path);
+    if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
+    return beforeState.content === content
+      ? { path, changed: false, applied: false, backup: null, createdDirectories }
+      : { path, changed: true, applied: false, backup: null, createdDirectories };
   }
-  const before = beforeState.content || "";
-  if (before === content) return { path, changed: false, applied: apply, backup: null, createdDirectories };
-  if (!apply) return { path, changed: true, applied: false, backup: null, createdDirectories };
-  const backupArtifacts = backupExisting(path, join(home, "backups"), client);
-  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+
+  const lockPath = join(dirname(path), `.${basename(path)}.continuitydb.lock`);
+  const releaseLock = acquireFileLock(lockPath);
   try {
-    writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
-    renameSync(temporary, path);
-    chmodSync(path, 0o600);
-  } catch (error) {
-    if (existsSync(temporary)) rmSync(temporary);
-    cleanupBackupArtifacts(backupArtifacts);
-    throw error;
+    const beforeState = currentSnapshot(path);
+    if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
+    const before = beforeState.content || "";
+    if (before === content) return { path, changed: false, applied: true, backup: null, createdDirectories };
+    const backupArtifacts = backupExisting(path, join(home, "backups"), client);
+    const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+      if (beforeReplace) {
+        if (process.env.NODE_ENV !== "test") throw new Error("connector replace test hook is available only in tests");
+        beforeReplace({ path, lockPath });
+      }
+      // Detect direct writers that do not participate in ContinuityDB's lock
+      // protocol. Participating connector processes serialize on lockPath.
+      if (!sameSnapshot(currentSnapshot(path), beforeState)) {
+        const error = new Error(`configuration changed before atomic replacement: ${path}`);
+        error.continuitydbNoWrite = true;
+        throw error;
+      }
+      renameSync(temporary, path);
+      chmodSync(path, 0o600);
+    } catch (error) {
+      if (existsSync(temporary)) rmSync(temporary);
+      cleanupBackupArtifacts(backupArtifacts);
+      throw error;
+    }
+    return {
+      path,
+      changed: true,
+      applied: true,
+      backup: backupArtifacts?.path || null,
+      backupArtifacts,
+      createdDirectories,
+      written: currentSnapshot(path),
+    };
+  } finally {
+    releaseLock();
   }
-  return {
-    path,
-    changed: true,
-    applied: true,
-    backup: backupArtifacts?.path || null,
-    backupArtifacts,
-    createdDirectories,
-    written: currentSnapshot(path),
-  };
 }
 
 function snapshot(path) {
@@ -422,12 +445,13 @@ function applyAgentPlans(plans) {
       try {
         result = atomicWrite(plan.path, plan.content, {
           root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: true, expected: plan.original,
+          beforeReplace: plan.options._testBeforeReplace,
         });
         result.createdDirectories = createdDirectories;
       } catch (error) {
         try {
           const current = currentSnapshot(plan.path);
-          if (sameSnapshot(current, plan.original)) {
+          if (error.continuitydbNoWrite || sameSnapshot(current, plan.original)) {
             cleanupCreatedDirectories(plan, { createdDirectories });
           } else {
             restoreSnapshot(plan, {

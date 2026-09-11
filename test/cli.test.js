@@ -71,6 +71,24 @@ function waitForSetupSnapshot(child) {
   });
 }
 
+function waitForChildMessage(child, type) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error(`timed out waiting for child message ${type}`)), 30_000);
+    const listener = (message) => {
+      if (message?.type !== type) return;
+      clearTimeout(timeout);
+      child.off("message", listener);
+      resolve(message);
+    };
+    child.on("message", listener);
+    child.once("error", (error) => {
+      clearTimeout(timeout);
+      child.off("message", listener);
+      reject(error);
+    });
+  });
+}
+
 test("CLI version matches the package version", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
   try {
@@ -252,18 +270,16 @@ test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { sk
   }
 });
 
-test("CLI failed setup preserves a commit made after its rollback snapshot", async () => {
+test("CLI failed setup serializes a concurrent first-open commit and preserves it", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-concurrent-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
-  let original;
   let reopened;
+  let writer;
   try {
+    mkdirSync(join(home, "index"), { recursive: true });
     mkdirSync(project);
-    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
-    assert.equal(init.status, 0, init.stderr);
-    original = new ContextVault(home);
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
@@ -278,25 +294,26 @@ test("CLI failed setup preserves a commit made after its rollback snapshot", asy
     const snapshot = await waitForSetupSnapshot(child);
     assert.equal(existsSync(snapshot.directory), true);
 
-    const proposed = original.propose({
-      body: "Committed after setup created its rollback snapshot.",
-      project_id: "concurrent-project",
-      owner_id: "local-user",
-    });
-    const committed = original.commit(proposed.record.id);
+    const worker = new URL("../test-support/concurrent-first-commit.mjs", import.meta.url).pathname;
+    writer = fork(worker, [], { silent: true });
+    await waitForChildMessage(writer, "ready");
+    const starting = waitForChildMessage(writer, "starting");
+    const committed = waitForChildMessage(writer, "committed");
+    writer.send({ type: "commit", home, cli });
+    await starting;
+    // The writer is now waiting on the setup initialization lock. Resume the
+    // failed setup; rollback completes before the first-open writer proceeds.
     child.send("continuitydb:resume-setup");
 
     const result = await exit;
     assert.notEqual(result.code, 0, result.stderr);
     assert.match(result.stderr, /backup parent must be a real directory/);
-    assert.equal(original.get(committed.id)?.body, committed.body, "commit must survive failed setup on original handle");
-    original.close();
-    original = null;
+    const committedMessage = await committed;
 
     reopened = new ContextVault(home);
-    assert.equal(reopened.get(committed.id)?.body, committed.body, "commit must survive original close and reopen");
+    assert.equal(reopened.get(committedMessage.id)?.body, committedMessage.body, "first-open commit must survive failed setup");
   } finally {
-    original?.close();
+    if (writer?.connected) writer.disconnect();
     reopened?.close();
     rmSync(root, { recursive: true, force: true });
   }

@@ -308,3 +308,23 @@ test("rollback preserves a connector file changed by a concurrent writer", () =>
     rmSync(value.root, { recursive: true, force: true });
   }
 });
+
+test("connector fails closed when a direct writer changes config before atomic replacement", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "test";
+    const paths = seedClientFiles(value.project);
+    const concurrent = 'model = "direct-concurrent-writer"\n';
+    assert.throws(() => connectAgent("codex", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => writeFileSync(path, concurrent, { mode: 0o600 }),
+    }), /configuration changed before atomic replacement/);
+    assert.equal(readFileSync(paths.codex, "utf8"), concurrent);
+    assert.equal(existsSync(join(value.home, "backups", "agent-config", "codex")), false);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});

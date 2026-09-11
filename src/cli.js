@@ -37,6 +37,7 @@ import { isStandaloneBinary } from "./binary-runtime.js";
 import { installStandaloneBinary } from "./self-install.js";
 import { VERSION } from "./version.js";
 import { defaultDataHome, hasPrivateDirectoryPermissions } from "./paths.js";
+import { acquireVaultInitializationLock } from "./file-lock.js";
 
 function parse(argv) {
   const positional = [];
@@ -367,36 +368,41 @@ try {
       process.exit(0);
     }
 
-    const initialized = await initializeSetupHome(home, flags);
-    let connections;
+    const releaseInitializationLock = acquireVaultInitializationLock(home);
     try {
-      // This is intentionally the final fallible setup mutation. The connector
-      // layer rolls its whole batch back. If this invocation created the vault,
-      // remove it as well so setup remains end-to-end atomic.
-      connections = connectAgents(selected, connectionOptions);
-    } catch (error) {
-      const rollbackErrors = [];
-      try { rollbackInitializedSetup(initialized); }
-      catch (rollbackError) { rollbackErrors.push(rollbackError); }
-      if (initialized.externalCacheSnapshot && initialized.externalCacheWritten) {
-        try { restoreLocalModelCache(initialized.externalCacheSnapshot, initialized.externalCacheWritten); }
+      const initialized = await initializeSetupHome(home, flags);
+      let connections;
+      try {
+        // Hold the vault initialization lock until connector commit succeeds or
+        // setup-owned state is restored. A concurrent first-open waits here,
+        // then initializes against the final state instead of being rewound.
+        connections = connectAgents(selected, connectionOptions);
+      } catch (error) {
+        const rollbackErrors = [];
+        try { rollbackInitializedSetup(initialized); }
         catch (rollbackError) { rollbackErrors.push(rollbackError); }
+        if (initialized.externalCacheSnapshot && initialized.externalCacheWritten) {
+          try { restoreLocalModelCache(initialized.externalCacheSnapshot, initialized.externalCacheWritten); }
+          catch (rollbackError) { rollbackErrors.push(rollbackError); }
+        }
+        if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");
+        throw error;
       }
-      if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");
-      throw error;
+      discardSetupSnapshot(initialized.vaultSnapshot);
+      output({
+        setup: true,
+        home,
+        config: configPath,
+        stats: initialized.stats,
+        detected_agents: detectAgents(),
+        connections,
+        embeddings: initialized.embeddings,
+        applied: Boolean(flags.apply),
+        run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
+      });
+    } finally {
+      releaseInitializationLock();
     }
-    discardSetupSnapshot(initialized.vaultSnapshot);
-    output({
-      setup: true,
-      home,
-      config: configPath,
-      stats: initialized.stats,
-      detected_agents: detectAgents(),
-      connections,
-      embeddings: initialized.embeddings,
-      applied: Boolean(flags.apply),
-      run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
-    });
   } else if (command === "agents") {
     const action = positional.shift() || "status";
     if (action === "detect") output({ agents: detectAgents() });
@@ -410,20 +416,25 @@ try {
     const { runLifecycleHook } = await import("./lifecycle-hook.js");
     process.exitCode = await runLifecycleHook(rawArguments.slice(1));
   } else if (command === "init") {
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    const configPath = join(home, "config.json");
-    if (!existsSync(configPath)) {
-      writeFileSync(configPath, `${JSON.stringify({
-        schema_version: 1,
-        mode: "local",
-        tenant_id: "local",
-        created_at: new Date().toISOString(),
-      }, null, 2)}\n`, { mode: 0o600 });
+    const releaseInitializationLock = acquireVaultInitializationLock(home);
+    try {
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const configPath = join(home, "config.json");
+      if (!existsSync(configPath)) {
+        writeFileSync(configPath, `${JSON.stringify({
+          schema_version: 1,
+          mode: "local",
+          tenant_id: "local",
+          created_at: new Date().toISOString(),
+        }, null, 2)}\n`, { mode: 0o600 });
+      }
+      const vault = new ContextVault(home);
+      const stats = vault.stats();
+      vault.close();
+      output({ initialized: true, home, config: configPath, stats });
+    } finally {
+      releaseInitializationLock();
     }
-    const vault = new ContextVault(home);
-    const stats = vault.stats();
-    vault.close();
-    output({ initialized: true, home, config: configPath, stats });
   } else if (command === "doctor") {
     const checks = [];
     checks.push({ name: "node", ok: Number(process.versions.node.split(".")[0]) >= 22, value: process.version });
