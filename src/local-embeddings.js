@@ -8,11 +8,13 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { ensureEmbeddedOnnxRuntime } from "./binary-runtime.js";
 
 const REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
@@ -75,6 +77,70 @@ function modelRoot(home, configuredCache, spec = BUILTIN_LOCAL_MODEL) {
     ? resolve(configuredCache)
     : join(resolve(home || process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || ".continuitydb"), "models");
   return join(base, spec.cache_directory);
+}
+
+export function snapshotLocalModelCache({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } = {}) {
+  const directory = modelRoot(home, cacheDir, spec);
+  const base = dirname(directory);
+  const directoryExisted = existsSync(directory);
+  if (directoryExisted) {
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("local embedding model cache must be a real directory, not a symlink");
+    }
+  }
+  const artifacts = spec.artifacts.map((artifact) => {
+    const path = join(directory, artifact.name);
+    if (!existsSync(path)) return { path, existed: false, bytes: null, mode: null };
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`local embedding cache artifact must be a regular file: ${path}`);
+    }
+    return { path, existed: true, bytes: readFileSync(path), mode: metadata.mode & 0o777 };
+  });
+  return {
+    cacheKey: directory,
+    base,
+    baseExisted: existsSync(base),
+    directory,
+    directoryExisted,
+    artifacts,
+  };
+}
+
+export function restoreLocalModelCache(snapshot) {
+  verifiedModels.delete(snapshot.cacheKey);
+  for (const artifact of snapshot.artifacts) {
+    if (artifact.existed) {
+      mkdirSync(snapshot.directory, { recursive: true, mode: 0o700 });
+      const temporary = `${artifact.path}.${process.pid}.${randomUUID()}.rollback`;
+      writeFileSync(temporary, artifact.bytes, { flag: "wx", mode: artifact.mode || 0o600 });
+      if (existsSync(artifact.path)) {
+        const current = lstatSync(artifact.path);
+        if (!current.isFile() || current.isSymbolicLink()) {
+          rmSync(temporary);
+          throw new Error(`refusing to replace unexpected local embedding cache artifact: ${artifact.path}`);
+        }
+        rmSync(artifact.path);
+      }
+      renameSync(temporary, artifact.path);
+      chmodSync(artifact.path, artifact.mode || 0o600);
+    } else if (existsSync(artifact.path)) {
+      const metadata = lstatSync(artifact.path);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        throw new Error(`refusing to remove unexpected local embedding cache artifact: ${artifact.path}`);
+      }
+      rmSync(artifact.path);
+    }
+  }
+  if (!snapshot.directoryExisted && existsSync(snapshot.directory)) {
+    try { rmdirSync(snapshot.directory); }
+    catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+  }
+  if (!snapshot.baseExisted && existsSync(snapshot.base)) {
+    try { rmdirSync(snapshot.base); }
+    catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+  }
 }
 
 function sleep(milliseconds) {
@@ -150,7 +216,11 @@ export function localModelStatus({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } 
 
 export async function ensureLocalModel({ home, cacheDir, offline = false, fetchImpl = fetch, spec = BUILTIN_LOCAL_MODEL } = {}) {
   const cacheKey = modelRoot(home, cacheDir, spec);
-  if (verifiedModels.has(cacheKey)) return verifiedModels.get(cacheKey);
+  if (verifiedModels.has(cacheKey)) {
+    const cached = localModelStatus({ home, cacheDir, spec });
+    if (cached.ready) return cached;
+    verifiedModels.delete(cacheKey);
+  }
   const status = localModelStatus({ home, cacheDir, spec });
   if (!status.cache_directory_safe) throw new Error("local embedding model cache must be a real directory, not a symlink");
   if (status.ready) {

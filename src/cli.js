@@ -18,7 +18,12 @@ import { scanRepository } from "./repo-ingest.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
-import { ensureLocalModel, localModelStatus } from "./local-embeddings.js";
+import {
+  ensureLocalModel,
+  localModelStatus,
+  restoreLocalModelCache,
+  snapshotLocalModelCache,
+} from "./local-embeddings.js";
 import {
   connectAgents,
   connectionStatus,
@@ -165,6 +170,9 @@ async function initializeSetupHome(home, flags) {
   let target = home;
   let staging = null;
   let before = new Set();
+  const externalCacheSnapshot = flags.semantic && configuredCache
+    ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
+    : null;
 
   if (existed) {
     before = new Set(["config.json", "records", "index", "models"].filter((name) => existsSync(join(home, name))));
@@ -199,10 +207,16 @@ async function initializeSetupHome(home, flags) {
       staging = null;
       if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
     }
-    return { stats, embeddings, created: !existed, before };
+    return { stats, embeddings, created: !existed, before, externalCacheSnapshot };
   } catch (error) {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     if (existed) removeCreatedSetupArtifacts(home, before);
+    if (externalCacheSnapshot) {
+      try { restoreLocalModelCache(externalCacheSnapshot); }
+      catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], "setup initialization failed and external model-cache rollback was incomplete");
+      }
+    }
     throw error;
   }
 }
@@ -245,6 +259,12 @@ try {
     } catch (error) {
       if (initialized.created && existsSync(home)) rmSync(home, { recursive: true, force: true });
       else removeCreatedSetupArtifacts(home, initialized.before);
+      if (initialized.externalCacheSnapshot) {
+        try { restoreLocalModelCache(initialized.externalCacheSnapshot); }
+        catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], "setup failed and external model-cache rollback was incomplete");
+        }
+      }
       throw error;
     }
     output({

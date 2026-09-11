@@ -66,8 +66,30 @@ export function validateReleaseWorkflow(document) {
   return { valid: true, native_targets: [...names].sort() };
 }
 
+export function validateCiWorkflow(document) {
+  const jobs = document?.jobs || {};
+  invariant(jobs.binary, "CI binary job is required");
+  for (const job of Object.values(jobs)) validatePinnedActions(job.steps || []);
+  const steps = jobs.binary.steps || [];
+  const functionalIndex = runIndex(steps, "npm run test:binary");
+  const semanticIndex = runIndex(steps, "npm run smoke:binary:semantic");
+  const checksumIndex = runIndex(steps, "npm run checksum:binaries");
+  const uploadIndex = actionIndex(steps, "actions/upload-artifact@");
+  invariant(functionalIndex >= 0, "CI standalone binary test is missing");
+  invariant(semanticIndex > functionalIndex, "CI native semantic inference is missing or misordered");
+  invariant(checksumIndex > semanticIndex, "CI checksums must follow semantic verification");
+  invariant(uploadIndex > checksumIndex, "CI may upload only post-verification bytes");
+  for (const index of [functionalIndex, semanticIndex, checksumIndex, uploadIndex]) {
+    invariant(!steps[index].if, "CI binary verification/checksum/upload gates must be unconditional");
+    invariant(steps[index]["continue-on-error"] !== true, "CI binary release gates must be blocking");
+  }
+  return { valid: true, binary_artifact_verified: true };
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const path = resolve(process.argv[2] || ".github/workflows/release-binaries.yml");
-  const result = validateReleaseWorkflow(parse(readFileSync(path, "utf8")));
-  process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+  const releasePath = resolve(process.argv[2] || ".github/workflows/release-binaries.yml");
+  const ciPath = resolve(process.argv[3] || ".github/workflows/ci.yml");
+  const release = validateReleaseWorkflow(parse(readFileSync(releasePath, "utf8")));
+  const ci = validateCiWorkflow(parse(readFileSync(ciPath, "utf8")));
+  process.stdout.write(`${JSON.stringify({ release, ci }, null, 2)}\n`);
 }

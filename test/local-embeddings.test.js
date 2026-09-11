@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,6 +10,8 @@ import {
   localModelStatus,
   LocalOnnxEmbedder,
   normalizeEmbeddingText,
+  restoreLocalModelCache,
+  snapshotLocalModelCache,
   WordPieceTokenizer,
 } from "../src/local-embeddings.js";
 
@@ -86,5 +88,37 @@ test("local model installer refuses a symlinked model cache directory", async ()
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(target, { recursive: true, force: true });
+  }
+});
+
+test("local model cache transaction removes new artifacts and restores overwritten files", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-local-model-transaction-"));
+  const bytes = Buffer.from("fixture-model");
+  const spec = fixtureSpec("transactional", bytes);
+  const modelDirectory = join(root, spec.cache_directory);
+  try {
+    const empty = snapshotLocalModelCache({ cacheDir: root, spec });
+    await ensureLocalModel({
+      cacheDir: root,
+      spec,
+      fetchImpl: async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
+    });
+    restoreLocalModelCache(empty);
+    assert.equal(existsSync(modelDirectory), false, "new external model directory must be removed on rollback");
+
+    mkdirSync(modelDirectory, { recursive: true });
+    const artifact = join(modelDirectory, "model.onnx");
+    writeFileSync(artifact, "pre-existing-invalid-model");
+    const existing = snapshotLocalModelCache({ cacheDir: root, spec });
+    await ensureLocalModel({
+      cacheDir: root,
+      spec,
+      fetchImpl: async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
+    });
+    restoreLocalModelCache(existing);
+    assert.equal(readFileSync(artifact, "utf8"), "pre-existing-invalid-model");
+    assert.equal(localModelStatus({ cacheDir: root, spec }).ready, false, "rollback must invalidate the verified cache entry");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

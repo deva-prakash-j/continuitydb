@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { parse } from "yaml";
-import { validateReleaseWorkflow } from "../scripts/validate-release-workflow.js";
+import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate-release-workflow.js";
 
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
+const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
 
 test("release workflow blocks publication on post-sign native semantic verification", () => {
   assert.equal(validateReleaseWorkflow(workflow).valid, true);
@@ -36,4 +37,23 @@ test("release workflow rejects mutable action tags in privileged and build jobs"
     mutable.jobs[job].steps.find((step) => step.uses).uses = action;
     assert.throws(() => validateReleaseWorkflow(mutable), /full immutable commit SHA/);
   }
+});
+
+test("CI uploads only an immutable, semantically verified native binary", () => {
+  assert.equal(validateCiWorkflow(ciWorkflow).valid, true);
+
+  const missingSemantic = structuredClone(ciWorkflow);
+  missingSemantic.jobs.binary.steps = missingSemantic.jobs.binary.steps
+    .filter((step) => step.run !== "npm run smoke:binary:semantic");
+  assert.throws(() => validateCiWorkflow(missingSemantic), /semantic inference is missing/);
+
+  const earlyUpload = structuredClone(ciWorkflow);
+  const steps = earlyUpload.jobs.binary.steps;
+  const upload = steps.splice(steps.findIndex((step) => String(step.uses || "").startsWith("actions/upload-artifact@")), 1)[0];
+  steps.splice(steps.findIndex((step) => step.run === "npm run smoke:binary:semantic"), 0, upload);
+  assert.throws(() => validateCiWorkflow(earlyUpload), /post-verification bytes/);
+
+  const mutableUpload = structuredClone(ciWorkflow);
+  mutableUpload.jobs.binary.steps.find((step) => String(step.uses || "").startsWith("actions/upload-artifact@")).uses = "actions/upload-artifact@v4";
+  assert.throws(() => validateCiWorkflow(mutableUpload), /full immutable commit SHA/);
 });
