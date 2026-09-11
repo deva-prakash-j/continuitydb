@@ -35,7 +35,9 @@ identities and are not currently configured.
 ## Build and smoke test
 
 Binary construction uses Node's official Single Executable Application
-facility. Build hosts require Node 25.5 or newer, but produced binaries include
+facility. Build hosts and the complete `npm run release:check` gate require
+Node 25.5 or newer because the gate builds and exercises the standalone
+binary from a clean tree. Produced binaries include
 their runtime and have no Node requirement on the destination host.
 
 ```bash

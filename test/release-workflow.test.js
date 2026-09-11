@@ -6,6 +6,7 @@ import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate
 
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
 const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
+const packageDocument = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 
 test("release workflow blocks publication on post-sign native semantic verification", () => {
   assert.equal(validateReleaseWorkflow(workflow).valid, true);
@@ -56,4 +57,13 @@ test("CI uploads only an immutable, semantically verified native binary", () => 
   const mutableUpload = structuredClone(ciWorkflow);
   mutableUpload.jobs.binary.steps.find((step) => String(step.uses || "").startsWith("actions/upload-artifact@")).uses = "actions/upload-artifact@v4";
   assert.throws(() => validateCiWorkflow(mutableUpload), /full immutable commit SHA/);
+});
+
+test("release check builds the standalone binary before the generated Codex config probe", () => {
+  assert.equal(packageDocument.scripts["test:codex-config"], "npm run test:codex-generated-config");
+  assert.equal(
+    packageDocument.scripts["test:codex-generated-config"],
+    "npm run build:binary && node scripts/codex-generated-config-probe.js",
+  );
+  assert.match(packageDocument.scripts["release:check"], /npm run test:codex-config$/);
 });

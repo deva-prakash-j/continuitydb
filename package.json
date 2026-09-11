@@ -60,7 +60,7 @@
     "test:security": "node --test test/security.test.js test/http-server.test.js",
     "test:clients": "node --test test/client-adapters.test.js test/lifecycle-hook.test.js test/mcp-server.test.js",
     "test:codex-client": "node scripts/codex-client-probe.js",
-    "test:codex-generated-config": "node scripts/codex-generated-config-probe.js",
+    "test:codex-generated-config": "npm run build:binary && node scripts/codex-generated-config-probe.js",
     "test:codex-config": "npm run test:codex-generated-config",
     "package:check": "npm pack --dry-run",
     "validate:clients": "node scripts/validate-client-adapters.js",
