@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `daa43b201c5242abb8ff2fadaafee92860f921df`
+- **Runtime candidate tested:** `402de9d37189b50c043483344ffe3994548c6806`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143997992` bytes
 - **Linux binary SHA-256:**
-  `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49`
+  `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -58,15 +58,15 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **116/116** primary Node tests passed with **0 failed** and **0 skipped**;
+- **117/117** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run on the runtime candidate completed with **85 files**,
-  approximately **148.3 kB** packed and **539.5 kB** unpacked;
+- package dry-run on the runtime candidate completed with **86 files**,
+  approximately **151.6 kB** packed and **552.5 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -74,26 +74,26 @@ Observed results on the build host:
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
 - the Linux executable is **143,997,992 bytes**, SHA-256
-  `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49`.
+  `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`daa43b201c5242abb8ff2fadaafee92860f921df`:
+`402de9d37189b50c043483344ffe3994548c6806`:
 
-- [release-binaries run 34615456695](https://github.com/deva-prakash-j/continuitydb/actions/runs/34615456695):
+- [release-binaries run 34619047984](https://github.com/deva-prakash-j/continuitydb/actions/runs/34619047984):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34615456681](https://github.com/deva-prakash-j/continuitydb/actions/runs/34615456681):
+- [CI run 34619047931](https://github.com/deva-prakash-j/continuitydb/actions/runs/34619047931):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 143,997,992 | `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49` |
-| macOS arm64 | 147,759,328 | `6cecf376306cdc3ee821adf4e670a39048999041a5c856d4bf62e89d2ecd6f13` |
-| Windows x64 | 110,742,528 | `4c1a94fd919e1df4088cc8ad5c454837e8cdba68744120691740dfd907785ffa` |
+| Linux x64 | 143,997,992 | `c795c8989e55ac85495c545078766a63bfd1ce3822fdbc273bc91c4c475b6d9d` |
+| macOS arm64 | 147,759,328 | `ebe258ac61acd13281b95775febcdcf71eaf9b3f73420030117ec03cd4f236d8` |
+| Windows x64 | 110,742,528 | `9e2d2445857314f5ae77fc1576a5c8b5c4e3dc785b28a61971d2b44f82144390` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -112,6 +112,9 @@ cached developer-workspace `dist/` artifact.
   immutable read-only mode and never snapshots, restores, or rewinds live
   SQLite files; a concurrent capture committed while setup is paused remains
   present after a later connector failure;
+- setup and every local vault first-open share a re-entrant per-vault
+  initialization lock, so rollback finishes before a concurrent first commit
+  proceeds and can never delete that commit or its generated configuration;
 - only setup-owned configuration or internal model-cache paths are eligible for
   rollback, while connector configuration changes use their own reversible
   transaction;
@@ -126,6 +129,10 @@ cached developer-workspace `dist/` artifact.
 - connector preflight and rollback use compare-and-swap snapshots; rollback
   restores only bytes written by the failed transaction and preserves a file
   changed by a concurrent writer while reporting the conflict;
+- connector commits also acquire a per-configuration cross-process lock and
+  compare the preflight snapshot immediately before atomic replacement,
+  closing the preflight-to-rename race while preserving non-cooperating direct
+  writers;
 - external model-cache rollback applies the same compare-and-swap rule and
   never overwrites a newer concurrent cache artifact;
 - a later commit failure restores changed files and removes backup artifacts
