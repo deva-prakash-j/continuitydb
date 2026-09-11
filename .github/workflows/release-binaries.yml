@@ -167,10 +167,8 @@ jobs:
           mapfile -t actual < <(find "$verify_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
           [[ "${actual[*]}" == "${expected[*]}" ]]
 
-          for binary in continuitydb-linux-x64 continuitydb-darwin-arm64 continuitydb-win32-x64.exe; do
-            expected_digest="$(sha256sum "release/$binary" | cut -d ' ' -f 1)"
-            actual_digest="$(sha256sum "$verify_dir/$binary" | cut -d ' ' -f 1)"
-            [[ "$actual_digest" == "$expected_digest" ]]
+          for asset in "${expected[@]}"; do
+            cmp -- "release/$asset" "$verify_dir/$asset"
           done
           (
             cd "$verify_dir"
@@ -178,6 +176,6 @@ jobs:
             sha256sum -c continuitydb-darwin-arm64.sha256
             sha256sum -c continuitydb-win32-x64.exe.sha256
           )
-          for binary in continuitydb-linux-x64 continuitydb-darwin-arm64 continuitydb-win32-x64.exe; do
-            gh attestation verify "$verify_dir/$binary" --repo "$GH_REPO"
+          for asset in "${expected[@]}"; do
+            gh attestation verify "$verify_dir/$asset" --repo "$GH_REPO"
           done

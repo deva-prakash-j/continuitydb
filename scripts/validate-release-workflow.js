@@ -114,14 +114,15 @@ export function validateReleaseWorkflow(document) {
     "post-publication verification must download from the explicit repository");
   invariant(publishedVerifyCommand.includes('[[ "${actual[*]}" == "${expected[*]}" ]]'),
     "post-publication verification must enforce the exact six-asset set");
-  invariant(publishedVerifyCommand.includes('sha256sum "$verify_dir/$binary"') &&
-    publishedVerifyCommand.includes('sha256sum "release/$binary"'),
-    "published binary digests must match the verified build inputs");
+  invariant(publishedVerifyCommand.includes('for asset in "${expected[@]}"') &&
+    publishedVerifyCommand.includes('cmp -- "release/$asset" "$verify_dir/$asset"'),
+    "all six published assets must match the verified build inputs byte-for-byte");
   invariant(publishedVerifyCommand.includes("sha256sum -c"),
     "downloaded checksum sidecars must be verified");
   invariant(publishedVerifyCommand.includes("gh attestation verify") &&
-    publishedVerifyCommand.includes('--repo "$GH_REPO"'),
-    "published binaries must pass provenance verification");
+    publishedVerifyCommand.includes('--repo "$GH_REPO"') &&
+    publishedVerifyCommand.includes('gh attestation verify "$verify_dir/$asset"'),
+    "all six published assets must pass provenance verification");
   invariant(publishedVerifyCommand.includes("targetCommitish") && publishedVerifyCommand.includes("isPrerelease"),
     "published release identity must be verified after publication");
   return { valid: true, native_targets: [...names].sort() };

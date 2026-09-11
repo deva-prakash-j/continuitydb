@@ -132,6 +132,15 @@ test("published release verification validates bytes, exact assets, identity, an
     .find((step) => String(step.name || "").includes("Verify published release assets"));
   noProvenanceStep.run = noProvenanceStep.run.replace("gh attestation verify", "gh attestation inspect");
   assert.throws(() => validateReleaseWorkflow(noProvenance), /provenance verification/);
+
+  const binariesOnly = structuredClone(workflow);
+  const binariesOnlyStep = binariesOnly.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+  binariesOnlyStep.run = binariesOnlyStep.run.replace(
+    'cmp -- "release/$asset" "$verify_dir/$asset"',
+    'true # binary-only verifier omitted checksum-sidecar byte comparison',
+  );
+  assert.throws(() => validateReleaseWorkflow(binariesOnly), /all six published assets/);
 });
 
 test("release workflow validator rejects missing, skipped, or misordered semantic gates", () => {
