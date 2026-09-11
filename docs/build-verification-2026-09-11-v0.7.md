@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `ef8b6dad85d5662df0030b7098290fb769ea78e7`
+- **Runtime candidate tested:** `b418e501316b87ae4629a05b7cd004db89b5ae13`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143989800` bytes
 - **Linux binary SHA-256:**
-  `2940c1c92ce85f3232370b2ccd6d86444ce2e5d546b5b553308573f09ef45806`
+  `5238e8938f0c560307ae3c01e7f844680357a691a49c07f400e869e3d31b54ea`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -57,15 +57,15 @@ npm run test:binary:semantic
 
 Observed results on the build host:
 
-- **99/99** primary Node tests passed with **0 failed** and **0 skipped**;
+- **100/100** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run completed with **83 files**, **140.5 kB** packed and
-  **510.3 kB** unpacked;
+- package dry-run completed with **84 files**, **141.9 kB** packed and
+  **515.4 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -75,7 +75,9 @@ Observed results on the build host:
 
 ## Remediations covered by this candidate
 
-- `setup --apply` validates every selected connector before creating a vault;
+- `setup --apply` validates and commits every selected connector before
+  creating a new vault, so a later connector failure cannot leave vault
+  artifacts behind;
 - multi-client operations preflight every target before any mutation;
 - a later commit failure restores changed files and removes backup artifacts
   and empty directories created by the failed batch;
