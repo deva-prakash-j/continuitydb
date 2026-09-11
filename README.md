@@ -24,7 +24,7 @@ returned.
 
 ### Verification status
 
-The v0.7 release candidate at `d714e11d7158178298a15648de4169a4a6232d75`
+The v0.7 release candidate at `8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`
 has passed its builder and supported-native CI gates:
 
 - full automated suite: **125/125 passing**, with 0 failed and 0 skipped;

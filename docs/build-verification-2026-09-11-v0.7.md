@@ -6,15 +6,15 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `d714e11d7158178298a15648de4169a4a6232d75`
-- **Release-workflow candidate tested:** `d714e11d7158178298a15648de4169a4a6232d75`
+- **Runtime candidate tested:** `8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`
+- **Release-workflow candidate tested:** `8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `144002088` bytes
 - **Linux binary SHA-256:**
-  `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89`
+  `6d9bbf08cf199db98d5a0b4b9c263a70c9342ea05b3a1101c42df038b50c28ac`
 - **Repository state:** `HEAD` exactly matched the release-workflow candidate,
   whose runtime tree descends from the runtime candidate above, and the tracked
   worktree was clean after verification.
@@ -68,7 +68,7 @@ Observed results on the build host:
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
 - package dry-run on the candidate completed with **86 files**,
-  approximately **154.3 kB** packed and **563.2 kB** unpacked;
+  approximately **154.4 kB** packed and **563.7 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -76,34 +76,35 @@ Observed results on the build host:
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
 - the Linux executable is **144,002,088 bytes**, SHA-256
-  `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89`.
+  `6d9bbf08cf199db98d5a0b4b9c263a70c9342ea05b3a1101c42df038b50c28ac`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`d714e11d7158178298a15648de4169a4a6232d75`:
+`8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`:
 
-- [release-binaries run 34626768941](https://github.com/deva-prakash-j/continuitydb/actions/runs/34626768941):
+- [release-binaries run 34628699730](https://github.com/deva-prakash-j/continuitydb/actions/runs/34628699730):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34626768881](https://github.com/deva-prakash-j/continuitydb/actions/runs/34626768881):
+- [CI run 34628699912](https://github.com/deva-prakash-j/continuitydb/actions/runs/34628699912):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 144,002,088 | `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89` |
-| macOS arm64 | 147,759,328 | `b648b5af12feb121ccc1b1f937ea90b4bc39c6ed81e6849094cc76c039f06608` |
-| Windows x64 | 110,746,112 | `9185d51b353261ac6a0f69a255fcdc38be74b40ae02e01ecd1ac887a95ad1413` |
+| Linux x64 | 144,002,088 | `6d9bbf08cf199db98d5a0b4b9c263a70c9342ea05b3a1101c42df038b50c28ac` |
+| macOS arm64 | 147,759,328 | `70fc2578ca2068d707abfe2aaa0e29b4db3c104031f412b9942461e2a7a11b9c` |
+| Windows x64 | 110,746,112 | `5dabcee4853ecc3d64ac4ea78a370f2d72ff0b68d8efb3164c3b913f241aa92c` |
 
-Clean-checkout reproducibility was verified in a new detached Git worktree at
-the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
-exist. A fresh `npm ci --ignore-scripts && npm run release:check` completed
-successfully, built the executable required by the generated Codex
-configuration probe, and was followed by functional and semantic smoke tests
-against that same binary. The release gate therefore does not depend on a
-cached developer-workspace `dist/` artifact.
+Clean-checkout reproducibility was verified in two independently extracted Git
+trees at the exact runtime SHA, with distinct output directories and distinct
+`TMPDIR`/`TMP`/`TEMP` roots. Both builds produced the same 144,002,088-byte
+Linux executable and SHA-256 above. The SEA configuration uses stable relative
+input, asset, and output paths inside a private per-build directory, so neither
+checkout paths nor temporary-directory paths enter the executable bytes. A
+fresh `npm ci --ignore-scripts && npm run release:check` also completed without
+a cached developer-workspace `dist/` artifact.
 
 ## Remediations covered by this candidate
 
