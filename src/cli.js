@@ -270,6 +270,7 @@ async function initializeSetupHome(home, flags) {
   let staging = null;
   let vaultSnapshot = null;
   let existingStats = null;
+  let externalCacheWritten = null;
   const externalCacheSnapshot = flags.semantic && configuredCache
     ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
     : null;
@@ -311,6 +312,9 @@ async function initializeSetupHome(home, flags) {
     let embeddings = null;
     if (flags.semantic) {
       embeddings = await ensureLocalModel({ home: target, cacheDir: configuredCache });
+      if (externalCacheSnapshot) {
+        externalCacheWritten = snapshotLocalModelCache({ home: target, cacheDir: configuredCache });
+      }
     }
     if (staging) {
       if (existsSync(home)) throw new Error(`setup home appeared while initialization was in progress: ${home}`);
@@ -318,7 +322,7 @@ async function initializeSetupHome(home, flags) {
       staging = null;
       if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
     }
-    return { stats, embeddings, created: !existed, home, vaultSnapshot, externalCacheSnapshot };
+    return { stats, embeddings, created: !existed, home, vaultSnapshot, externalCacheSnapshot, externalCacheWritten };
   } catch (error) {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     const rollbackErrors = [];
@@ -326,8 +330,8 @@ async function initializeSetupHome(home, flags) {
       try { restoreSetupSnapshot(vaultSnapshot); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    if (externalCacheSnapshot) {
-      try { restoreLocalModelCache(externalCacheSnapshot); }
+    if (externalCacheSnapshot && externalCacheWritten) {
+      try { restoreLocalModelCache(externalCacheSnapshot, externalCacheWritten); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
     if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup initialization failed and rollback was incomplete");
@@ -374,8 +378,8 @@ try {
       const rollbackErrors = [];
       try { rollbackInitializedSetup(initialized); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
-      if (initialized.externalCacheSnapshot) {
-        try { restoreLocalModelCache(initialized.externalCacheSnapshot); }
+      if (initialized.externalCacheSnapshot && initialized.externalCacheWritten) {
+        try { restoreLocalModelCache(initialized.externalCacheSnapshot, initialized.externalCacheWritten); }
         catch (rollbackError) { rollbackErrors.push(rollbackError); }
       }
       if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");

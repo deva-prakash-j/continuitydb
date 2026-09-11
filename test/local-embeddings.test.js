@@ -103,7 +103,8 @@ test("local model cache transaction removes new artifacts and restores overwritt
       spec,
       fetchImpl: async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
     });
-    restoreLocalModelCache(empty);
+    const installedEmpty = snapshotLocalModelCache({ cacheDir: root, spec });
+    restoreLocalModelCache(empty, installedEmpty);
     assert.equal(existsSync(modelDirectory), false, "new external model directory must be removed on rollback");
 
     mkdirSync(modelDirectory, { recursive: true });
@@ -115,9 +116,34 @@ test("local model cache transaction removes new artifacts and restores overwritt
       spec,
       fetchImpl: async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
     });
-    restoreLocalModelCache(existing);
+    const installedExisting = snapshotLocalModelCache({ cacheDir: root, spec });
+    restoreLocalModelCache(existing, installedExisting);
     assert.equal(readFileSync(artifact, "utf8"), "pre-existing-invalid-model");
     assert.equal(localModelStatus({ cacheDir: root, spec }).ready, false, "rollback must invalidate the verified cache entry");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local model rollback preserves a concurrent cache writer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-local-model-concurrent-"));
+  const bytes = Buffer.from("fixture-model");
+  const spec = fixtureSpec("concurrent", bytes);
+  try {
+    const before = snapshotLocalModelCache({ cacheDir: root, spec });
+    await ensureLocalModel({
+      cacheDir: root,
+      spec,
+      fetchImpl: async () => new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
+    });
+    const written = snapshotLocalModelCache({ cacheDir: root, spec });
+    const artifact = join(root, spec.cache_directory, "model.onnx");
+    writeFileSync(artifact, "concurrent-writer");
+    assert.throws(
+      () => restoreLocalModelCache(before, written),
+      /rollback conflict: local embedding cache changed concurrently/,
+    );
+    assert.equal(readFileSync(artifact, "utf8"), "concurrent-writer");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

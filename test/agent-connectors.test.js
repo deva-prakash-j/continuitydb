@@ -281,3 +281,30 @@ test("all-client rollback removes backup artifacts created before a later backup
     rmSync(value.root, { recursive: true, force: true });
   }
 });
+
+test("rollback preserves a connector file changed by a concurrent writer", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "test";
+    const paths = seedClientFiles(value.project);
+    const concurrent = 'model = "concurrent-writer"\n';
+    const backupRoot = join(value.home, "backups", "agent-config");
+    mkdirSync(backupRoot, { recursive: true });
+    writeFileSync(join(backupRoot, "opencode"), "force a later commit failure\n");
+
+    assert.throws(() => connectAgents(SUPPORTED_AGENTS, {
+      ...options(value),
+      _testAfterCommit: ({ committed }) => {
+        if (committed === 1) writeFileSync(paths.codex, concurrent, { mode: 0o600 });
+      },
+    }), /rollback conflict: configuration changed concurrently/);
+
+    assert.equal(readFileSync(paths.codex, "utf8"), concurrent);
+    assert.equal(readFileSync(paths.claude, "utf8"), '{"keep":"claude"}\n');
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});

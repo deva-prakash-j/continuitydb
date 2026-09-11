@@ -108,8 +108,23 @@ export function snapshotLocalModelCache({ home, cacheDir, spec = BUILTIN_LOCAL_M
   };
 }
 
-export function restoreLocalModelCache(snapshot) {
+function cacheArtifactMatches(artifact) {
+  if (!artifact.existed) return !existsSync(artifact.path);
+  if (!existsSync(artifact.path)) return false;
+  const metadata = lstatSync(artifact.path);
+  return metadata.isFile() && !metadata.isSymbolicLink()
+    && (metadata.mode & 0o777) === artifact.mode
+    && readFileSync(artifact.path).equals(artifact.bytes);
+}
+
+export function restoreLocalModelCache(snapshot, expectedCurrent = null) {
   verifiedModels.delete(snapshot.cacheKey);
+  if (expectedCurrent) {
+    const conflicts = expectedCurrent.artifacts.filter((artifact) => !cacheArtifactMatches(artifact));
+    if (conflicts.length) {
+      throw new Error(`rollback conflict: local embedding cache changed concurrently: ${conflicts.map((item) => item.path).join(", ")}`);
+    }
+  }
   for (const artifact of snapshot.artifacts) {
     if (artifact.existed) {
       mkdirSync(snapshot.directory, { recursive: true, mode: 0o700 });

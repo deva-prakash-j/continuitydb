@@ -146,9 +146,32 @@ function cleanupBackupArtifacts(artifacts) {
   }
 }
 
-function atomicWrite(path, content, { root, home, client, apply }) {
+function sameSnapshot(left, right) {
+  return left.existed === right.existed
+    && left.content === right.content
+    && left.mode === right.mode;
+}
+
+function currentSnapshot(path) {
+  return snapshot(path);
+}
+
+function cleanupCreatedDirectories(plan, result) {
+  for (const directory of [...(result.createdDirectories || [])].reverse()) {
+    if (contains(plan.options.projectDir, directory) && existsSync(directory)) {
+      try { rmdirSync(directory); }
+      catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+    }
+  }
+}
+
+function atomicWrite(path, content, { root, home, client, apply, expected }) {
   const createdDirectories = ensureSafeParents(root, path, apply);
-  const before = readText(path);
+  const beforeState = currentSnapshot(path);
+  if (expected && !sameSnapshot(beforeState, expected)) {
+    throw new Error(`configuration changed after preflight: ${path}`);
+  }
+  const before = beforeState.content || "";
   if (before === content) return { path, changed: false, applied: apply, backup: null, createdDirectories };
   if (!apply) return { path, changed: true, applied: false, backup: null, createdDirectories };
   const backupArtifacts = backupExisting(path, join(home, "backups"), client);
@@ -169,6 +192,7 @@ function atomicWrite(path, content, { root, home, client, apply }) {
     backup: backupArtifacts?.path || null,
     backupArtifacts,
     createdDirectories,
+    written: currentSnapshot(path),
   };
 }
 
@@ -182,7 +206,15 @@ function snapshot(path) {
 }
 
 function restoreSnapshot(plan, result) {
-  const { path, original, options } = plan;
+  const { path, original } = plan;
+  if (result.changed === false) return;
+  const current = currentSnapshot(path);
+  const expected = result.written || { existed: true, content: plan.content, mode: 0o600 };
+  if (!sameSnapshot(current, expected)) {
+    cleanupCreatedDirectories(plan, result);
+    cleanupBackupArtifacts(result.backupArtifacts);
+    throw new Error(`rollback conflict: configuration changed concurrently: ${path}`);
+  }
   if (original.existed) {
     const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
     writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
@@ -195,9 +227,7 @@ function restoreSnapshot(plan, result) {
     }
     rmSync(path);
   }
-  for (const directory of [...(result.createdDirectories || [])].reverse()) {
-    if (contains(options.projectDir, directory) && existsSync(directory)) rmdirSync(directory);
-  }
+  cleanupCreatedDirectories(plan, result);
   cleanupBackupArtifacts(result.backupArtifacts);
 }
 
@@ -376,7 +406,7 @@ function applyAgentPlans(plans) {
     return plans.map((plan) => plan.noOp
       ? publicResult(plan, { path: plan.path, changed: false, applied: false, backup: null, createdDirectories: [] })
       : publicResult(plan, atomicWrite(plan.path, plan.content, {
-        root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: false,
+        root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: false, expected: plan.original,
       })));
   }
 
@@ -391,17 +421,32 @@ function applyAgentPlans(plans) {
       let result;
       try {
         result = atomicWrite(plan.path, plan.content, {
-          root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: true,
+          root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: true, expected: plan.original,
         });
         result.createdDirectories = createdDirectories;
       } catch (error) {
-        try { restoreSnapshot(plan, { createdDirectories }); }
+        try {
+          const current = currentSnapshot(plan.path);
+          if (sameSnapshot(current, plan.original)) {
+            cleanupCreatedDirectories(plan, { createdDirectories });
+          } else {
+            restoreSnapshot(plan, {
+              changed: true,
+              createdDirectories,
+              written: { existed: true, content: plan.content, mode: 0o600 },
+            });
+          }
+        }
         catch (rollbackError) {
           throw new AggregateError([error, rollbackError], `agent configuration write failed and rollback was incomplete for ${plan.client}`);
         }
         throw error;
       }
       committed.push({ plan, result });
+      if (plan.options._testAfterCommit) {
+        if (process.env.NODE_ENV !== "test") throw new Error("agent commit test hook is available only in tests");
+        plan.options._testAfterCommit({ plan, result, committed: committed.length });
+      }
     }
     return committed.map(({ plan, result }) => publicResult(plan, result));
   } catch (error) {

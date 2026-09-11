@@ -7,13 +7,14 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  rmdirSync,
   realpathSync,
   renameSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { delimiter, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { defaultInstallPrefix } from "./agent-connectors.js";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { VERSION } from "./version.js";
@@ -22,11 +23,14 @@ function sha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function ensureDirectory(path) {
+function ensureDirectory(path, createdDirectories = null) {
   if (existsSync(path)) {
     const metadata = lstatSync(path);
     if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`installation path must be a real directory: ${path}`);
-  } else mkdirSync(path, { recursive: true, mode: 0o700 });
+  } else {
+    mkdirSync(path, { mode: 0o700 });
+    createdDirectories?.push(path);
+  }
 }
 
 function assertNoSymlinkAncestors(path) {
@@ -60,23 +64,25 @@ function isManagedLauncher(path, managedRoot) {
   return value === "" || (value !== ".." && !value.startsWith(`..${sep}`));
 }
 
-function backupLauncher(path, installationPrefix) {
+function backupLauncher(path, installationPrefix, createdDirectories) {
   const directory = join(installationPrefix, "lib", "continuitydb", "backups");
-  ensureDirectory(directory);
+  ensureDirectory(directory, createdDirectories);
   const metadata = lstatSync(path);
   if (metadata.isSymbolicLink()) {
     const target = readlinkSync(path);
     const destination = join(directory, `launcher-${sha256Text(target).slice(0, 16)}.link.txt`);
-    if (!existsSync(destination)) writeFilePrivate(destination, `${target}\n`);
-    return destination;
+    const created = !existsSync(destination);
+    if (created) writeFilePrivate(destination, `${target}\n`);
+    return { path: destination, created };
   }
   if (!metadata.isFile()) throw new Error(`existing launcher is not a regular file or symlink: ${path}`);
   const destination = join(directory, `launcher-${sha256(path).slice(0, 16)}.bak`);
-  if (!existsSync(destination)) {
+  const created = !existsSync(destination);
+  if (created) {
     copyFileSync(path, destination);
     chmodSync(destination, 0o600);
   }
-  return destination;
+  return { path: destination, created };
 }
 
 function sha256Text(value) {
@@ -89,6 +95,49 @@ function writeFilePrivate(path, value) {
   renameSync(temporary, path);
 }
 
+function entrySnapshot(path) {
+  if (!existsSync(path) && !lstatSafe(path)) return { existed: false, type: null, bytes: null, target: null, mode: null };
+  const metadata = lstatSync(path);
+  if (metadata.isSymbolicLink()) {
+    return { existed: true, type: "link", bytes: null, target: readlinkSync(path), mode: null };
+  }
+  if (!metadata.isFile()) throw new Error(`installation target must be a regular file or symlink: ${path}`);
+  return { existed: true, type: "file", bytes: readFileSync(path), target: null, mode: metadata.mode & 0o777 };
+}
+
+function sameEntry(left, right) {
+  if (left.existed !== right.existed || left.type !== right.type || left.target !== right.target || left.mode !== right.mode) return false;
+  if (!left.bytes && !right.bytes) return true;
+  return Boolean(left.bytes && right.bytes && left.bytes.equals(right.bytes));
+}
+
+function restoreEntry(path, original, expectedCurrent) {
+  const current = entrySnapshot(path);
+  if (!sameEntry(current, expectedCurrent)) {
+    throw new Error(`rollback conflict: installation target changed concurrently: ${path}`);
+  }
+  if (current.existed) unlinkSync(path);
+  if (!original.existed) return;
+  if (original.type === "link") {
+    const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback-link`);
+    symlinkSync(original.target, temporary);
+    renameSync(temporary, path);
+    return;
+  }
+  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
+  writeFileSync(temporary, original.bytes, { flag: "wx", mode: original.mode || 0o600 });
+  renameSync(temporary, path);
+  chmodSync(path, original.mode || 0o600);
+}
+
+function removeCreatedDirectories(directories) {
+  for (const directory of [...directories].reverse()) {
+    if (!existsSync(directory)) continue;
+    try { rmdirSync(directory); }
+    catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+  }
+}
+
 export function installStandaloneBinary({
   source = process.execPath,
   prefix = defaultInstallPrefix(),
@@ -98,6 +147,7 @@ export function installStandaloneBinary({
   platform = process.platform,
   version = VERSION,
   pathValue = process.env.PATH || "",
+  _testBeforeLauncherCommit = null,
 } = {}) {
   if (!standalone) throw new Error("self-install is available only from a standalone ContinuityDB binary");
   const sourcePath = realpathSync(source);
@@ -115,46 +165,90 @@ export function installStandaloneBinary({
   if (!apply) return { installed: false, preview: true, ...plan };
 
   assertNoSymlinkAncestors(installationPrefix);
-  ensureDirectory(installationPrefix);
-  ensureDirectory(join(installationPrefix, "lib"));
-  ensureDirectory(join(installationPrefix, "lib", "continuitydb"));
-  ensureDirectory(versionDirectory);
-  ensureDirectory(binDirectory);
+  const originalVersioned = entrySnapshot(versionedBinary);
+  const originalLauncher = entrySnapshot(launcher);
   if (existsSync(versionedBinary) && sha256(versionedBinary) !== sha256(sourcePath)) {
     throw new Error(`versioned installation already exists with different content: ${versionedBinary}`);
   }
-  if (!existsSync(versionedBinary)) {
-    const temporary = join(versionDirectory, `.${executableName}.${process.pid}.${randomUUID()}.tmp`);
-    copyFileSync(sourcePath, temporary);
-    chmodSync(temporary, 0o755);
-    renameSync(temporary, versionedBinary);
+  if (originalLauncher.existed && platform !== "win32") {
+    const managed = originalLauncher.type === "link"
+      && isManagedLauncher(launcher, join(installationPrefix, "lib", "continuitydb"));
+    if (!managed && !force) throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
+  } else if (originalLauncher.existed && platform === "win32"
+    && !(originalLauncher.type === "file" && originalVersioned.existed && sha256(launcher) === sha256(versionedBinary)) && !force) {
+    throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
   }
 
+  const createdDirectories = [];
+  let versionedExpected = originalVersioned;
+  let launcherExpected = originalLauncher;
   let launcherBackup = null;
-  if (platform === "win32") {
-    if (existsSync(launcher) && sha256(launcher) === sha256(versionedBinary)) {
+  try {
+    for (const directory of [
+      installationPrefix,
+      join(installationPrefix, "lib"),
+      join(installationPrefix, "lib", "continuitydb"),
+      versionDirectory,
+      binDirectory,
+    ]) ensureDirectory(directory, createdDirectories);
+
+    if (!originalVersioned.existed) {
+      const temporary = join(versionDirectory, `.${executableName}.${process.pid}.${randomUUID()}.tmp`);
+      copyFileSync(sourcePath, temporary);
+      chmodSync(temporary, 0o755);
+      renameSync(temporary, versionedBinary);
+      versionedExpected = entrySnapshot(versionedBinary);
+    }
+
+    const launcherAlreadyCurrent = platform === "win32"
+      ? originalLauncher.existed && originalLauncher.type === "file" && sha256(launcher) === sha256(versionedBinary)
+      : originalLauncher.existed && originalLauncher.type === "link"
+        && resolve(dirname(launcher), originalLauncher.target) === versionedBinary;
+    if (launcherAlreadyCurrent) {
       return { installed: true, preview: false, ...plan, sha256: sha256(versionedBinary), launcher_backup: null };
     }
-    if (existsSync(launcher)) {
-      if (!force) throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
-      launcherBackup = backupLauncher(launcher, installationPrefix);
+
+    if (originalLauncher.existed) {
+      const managed = platform !== "win32" && originalLauncher.type === "link"
+        && isManagedLauncher(launcher, join(installationPrefix, "lib", "continuitydb"));
+      if (!managed) launcherBackup = backupLauncher(launcher, installationPrefix, createdDirectories);
       unlinkSync(launcher);
+      launcherExpected = entrySnapshot(launcher);
     }
-    const temporary = join(binDirectory, `.${executableName}.${process.pid}.${randomUUID()}.tmp`);
-    copyFileSync(versionedBinary, temporary);
-    renameSync(temporary, launcher);
-  } else {
-    if (existsSync(launcher) || lstatSafe(launcher)) {
-      const managed = isManagedLauncher(launcher, join(installationPrefix, "lib", "continuitydb"));
-      if (!managed && !force) throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
-      if (!managed) launcherBackup = backupLauncher(launcher, installationPrefix);
-      unlinkSync(launcher);
+
+    if (_testBeforeLauncherCommit) {
+      if (process.env.NODE_ENV !== "test") throw new Error("installer test hook is available only in tests");
+      _testBeforeLauncherCommit({ launcher, versionedBinary });
     }
-    const temporary = join(binDirectory, `.continuitydb.${process.pid}.${randomUUID()}.link`);
-    symlinkSync(relative(binDirectory, versionedBinary), temporary);
-    renameSync(temporary, launcher);
+
+    if (platform === "win32") {
+      const temporary = join(binDirectory, `.${executableName}.${process.pid}.${randomUUID()}.tmp`);
+      copyFileSync(versionedBinary, temporary);
+      renameSync(temporary, launcher);
+    } else {
+      const temporary = join(binDirectory, `.continuitydb.${process.pid}.${randomUUID()}.link`);
+      symlinkSync(relative(binDirectory, versionedBinary), temporary);
+      renameSync(temporary, launcher);
+    }
+    launcherExpected = entrySnapshot(launcher);
+  } catch (error) {
+    const rollbackErrors = [];
+    try { restoreEntry(launcher, originalLauncher, launcherExpected); }
+    catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    try { restoreEntry(versionedBinary, originalVersioned, versionedExpected); }
+    catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    if (launcherBackup?.created && existsSync(launcherBackup.path)) {
+      try { unlinkSync(launcherBackup.path); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    try { removeCreatedDirectories(createdDirectories); }
+    catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    if (rollbackErrors.length) {
+      throw new AggregateError([error, ...rollbackErrors], "standalone installation failed and rollback was incomplete");
+    }
+    throw error;
   }
-  return { installed: true, preview: false, ...plan, sha256: sha256(versionedBinary), launcher_backup: launcherBackup };
+  return { installed: true, preview: false, ...plan, sha256: sha256(versionedBinary), launcher_backup: launcherBackup?.path || null };
 }
 
 function lstatSafe(path) {
