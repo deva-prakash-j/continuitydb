@@ -142,6 +142,12 @@ try {
     // Setup must fail without touching the global vault when any client
     // configuration cannot be parsed or safely rendered.
     connectAgents(selected, { ...connectionOptions, apply: false });
+    // Commit the already-preflighted connector batch before initializing the
+    // vault. connectAgents is transactional and restores client files,
+    // backups, and directories on failure. Keeping vault creation after that
+    // boundary prevents a failed connector commit from leaving a partially
+    // initialized global vault behind.
+    const connections = connectAgents(selected, connectionOptions);
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const configPath = join(home, "config.json");
     if (!existsSync(configPath)) {
@@ -156,7 +162,6 @@ try {
     const vault = new ContextVault(home);
     const stats = vault.stats();
     vault.close();
-    const connections = connectAgents(selected, connectionOptions);
     let embeddings = null;
     if (flags.semantic) embeddings = await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE });
     output({

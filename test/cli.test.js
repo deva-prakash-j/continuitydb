@@ -80,6 +80,39 @@ test("CLI setup --agents all fails before mutating any client when a later confi
   }
 });
 
+test("CLI setup commit failure leaves no newly initialized vault artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-commit-failure-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const codex = join(project, ".codex", "config.toml");
+  const blockingBackupParent = join(home, "backups");
+  mkdirSync(join(project, ".codex"), { recursive: true });
+  mkdirSync(home, { recursive: true });
+  writeFileSync(codex, 'model = "gpt-5"\n');
+  writeFileSync(blockingBackupParent, "pre-existing backup blocker\n");
+  const beforeCodex = readFileSync(codex, "utf8");
+  const beforeBlocker = readFileSync(blockingBackupParent, "utf8");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.equal(readFileSync(codex, "utf8"), beforeCodex);
+    assert.equal(readFileSync(blockingBackupParent, "utf8"), beforeBlocker);
+    assert.equal(existsSync(join(home, "config.json")), false);
+    assert.equal(existsSync(join(home, "records")), false);
+    assert.equal(existsSync(join(home, "index")), false);
+    assert.equal(existsSync(join(project, ".mcp.json")), false);
+    assert.equal(existsSync(join(project, "opencode.json")), false);
+    assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+    assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI agents connect all fails before mutating any client when a later namespace is invalid", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-connect-atomic-"));
   const project = join(root, "project");
