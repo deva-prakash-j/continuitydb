@@ -18,7 +18,27 @@ returned.
 > **Project status:** v0.5 alpha. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
-> production adapter and billion-record proof do not exist yet.
+> production adapter and billion-record proof do not exist yet. Current `main`
+> also contains unreleased handoff, quota, concurrent-bootstrap, and audit
+> hardening documented in the [changelog](CHANGELOG.md).
+
+### Verification status
+
+The runtime at commit
+[`76e413f`](https://github.com/deva-prakash-j/continuitydb/commit/76e413fb210d0f09a507809129c168eaa31391da)
+passed the independent Astraea strict QA gate after five review/fix rounds:
+
+- final verdict: **PASS**, with no P0/P1 findings;
+- full automated suite: **64/64 passing**;
+- focused security suite: **11/11 passing**;
+- OpenAPI validation: **18 paths**;
+- dependency audit: **0 known production vulnerabilities**;
+- mixed-workload smoke: **0 retrieval misses, isolation violations, or HTTP failures**;
+- concurrent first-open stress: **240/240 successful process opens** across ten
+  fresh-vault repetitions.
+
+This README update is documentation-only and does not change runtime behaviour.
+CI remains the authoritative check for the exact published head.
 
 ## The problem
 
@@ -84,7 +104,7 @@ Tenant, project, sensitivity, lifecycle, temporal, and provenance controls keep
 retrieval bounded. Personal and employer data should still use separate stores
 and credentials when their trust domains differ.
 
-## Implemented in v0.5
+## Current main capabilities
 
 ### Retrieval
 
@@ -125,6 +145,22 @@ and credentials when their trust domains differ.
 - OpenAPI contract, tests, benchmarks, CI, non-root container, threat model,
   security policy, contribution guide, and governance document;
 - 64-partition PostgreSQL/pgvector reference migrations with owner-aware row-level security.
+
+### Reliability and concurrency
+
+- fresh-vault WAL transition, schema creation, and additive migrations are
+  serialized so concurrent first-open processes wait instead of racing bootstrap;
+- handoff idempotency is scoped by tenant, owner, agent, project, task, and branch;
+- handoff lineage, quota evaluation, sequence allocation, persistence, and
+  supersession execute in one `BEGIN IMMEDIATE` transaction;
+- stale or concurrent successors are quarantined instead of replacing the
+  current startup checkpoint;
+- a quota slot is reused only when an agent supersedes its own checkpoint;
+  cross-agent succession consumes the receiving agent's quota;
+- review approval revalidates lineage and quota in the write transaction, so
+  only one concurrent reviewer can activate a successor;
+- legacy audit events retain their original hashes; corrupted or divergent
+  history is reported invalid rather than rewritten into a valid-looking chain.
 
 See the [architecture](docs/architecture.md) and
 [competitor-derived capability review](docs/competitive-research-2026-09-09.md)
@@ -292,15 +328,17 @@ injects exactly one separately addressed checkpoint selected by shared owner,
 project, task and applicable branch. Private checkpoints receive the configured
 working-memory TTL; sensitive and restricted checkpoints are quarantined until a
 reviewer explicitly approves them. Per-agent/project capture quotas apply to
-checkpoints as well, while exact idempotent retries remain allowed. After the
-first checkpoint for a task and branch, every successor must name the current
-latest checkpoint in `previous_checkpoint_id`. This compare-and-set lineage
+checkpoints as well, while exact idempotent retries remain allowed. The first
+checkpoint for a task and branch uses `previous_checkpoint_id: null`; every
+successor must name the current latest checkpoint. This compare-and-set lineage
 quarantines stale or concurrent writers instead of replacing startup context.
 Review approval repeats that comparison inside the same write transaction: a
 held successor whose predecessor is no longer latest receives HTTP `409` and
 remains held. A valid approval supersedes its predecessor, receives a fresh
-monotonic sequence and activates with the configured bounded TTL. Direct store
-commit/capture calls cannot activate a handoff without these governance checks.
+monotonic sequence and activates with the configured bounded TTL. Quota slot
+reuse is limited to same-agent replacement; a different agent continuing the
+lineage consumes that agent's own project quota. Direct store commit/capture
+calls cannot activate a handoff without these governance checks.
 
 ```bash
 export CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331
@@ -711,10 +749,11 @@ Important shipped controls include:
 - committed-blob repository ingestion and branch-scoped working knowledge;
 - task/branch-scoped handoff idempotency, persisted retry responses, bounded
   checkpoint TTLs, deterministic checkpoint sequencing, compare-and-set lineage,
-  atomic quota enforcement, and structured correction;
+  same-agent-only quota slot reuse, transactional review approval, atomic quota
+  enforcement, and structured correction;
 - idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
-- transactionally serialized hash-chained audit log, legacy-chain preservation,
-  and verifier;
+- serialized concurrent first-open bootstrap, transactionally serialized
+  hash-chained audit log, legacy-chain preservation, and verifier;
 - pinned lockfile, minimal dependencies, CI audit, and non-root container.
 
 Known gaps include static-token lifecycle, application-level encryption,
