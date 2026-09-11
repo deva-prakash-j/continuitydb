@@ -1,6 +1,17 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { ContextVault } from "./store.js";
 import { createContinuityServer } from "./http-server.js";
 import { scanRepository } from "./repo-ingest.js";
@@ -131,6 +142,71 @@ function agentOptions() {
   };
 }
 
+function assertSetupHome(path) {
+  if (!existsSync(path)) return;
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`setup home must be a real directory, not a symlink: ${path}`);
+  }
+}
+
+function removeCreatedSetupArtifacts(home, before) {
+  const paths = ["config.json", "records", "index", "models"];
+  for (const name of paths.reverse()) {
+    const path = join(home, name);
+    if (!before.has(name) && existsSync(path)) rmSync(path, { recursive: true, force: true });
+  }
+}
+
+async function initializeSetupHome(home, flags) {
+  assertSetupHome(home);
+  const existed = existsSync(home);
+  const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
+  let target = home;
+  let staging = null;
+  let before = new Set();
+
+  if (existed) {
+    before = new Set(["config.json", "records", "index", "models"].filter((name) => existsSync(join(home, name))));
+  } else {
+    mkdirSync(dirname(home), { recursive: true, mode: 0o700 });
+    staging = mkdtempSync(join(dirname(home), `.${basename(home)}.setup-`));
+    chmodSync(staging, 0o700);
+    target = staging;
+  }
+
+  try {
+    const configPath = join(target, "config.json");
+    if (!existsSync(configPath)) {
+      writeFileSync(configPath, `${JSON.stringify({
+        schema_version: 2,
+        mode: "local",
+        tenant_id: flags.tenant || cliTenantId,
+        owner_id: flags.owner || cliOwnerId,
+        created_at: new Date().toISOString(),
+      }, null, 2)}\n`, { mode: 0o600 });
+    }
+    const vault = new ContextVault(target);
+    const stats = vault.stats();
+    vault.close();
+    let embeddings = null;
+    if (flags.semantic) {
+      embeddings = await ensureLocalModel({ home: target, cacheDir: configuredCache });
+    }
+    if (staging) {
+      if (existsSync(home)) throw new Error(`setup home appeared while initialization was in progress: ${home}`);
+      renameSync(staging, home);
+      staging = null;
+      if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
+    }
+    return { stats, embeddings, created: !existed, before };
+  } catch (error) {
+    if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+    if (existed) removeCreatedSetupArtifacts(home, before);
+    throw error;
+  }
+}
+
 try {
   if (command === "version") {
     output({ version: VERSION, standalone: isStandaloneBinary(), node: process.version, platform: process.platform, arch: process.arch });
@@ -141,37 +217,44 @@ try {
     const connectionOptions = agentOptions();
     // Setup must fail without touching the global vault when any client
     // configuration cannot be parsed or safely rendered.
-    connectAgents(selected, { ...connectionOptions, apply: false });
-    // Commit the already-preflighted connector batch before initializing the
-    // vault. connectAgents is transactional and restores client files,
-    // backups, and directories on failure. Keeping vault creation after that
-    // boundary prevents a failed connector commit from leaving a partially
-    // initialized global vault behind.
-    const connections = connectAgents(selected, connectionOptions);
-    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const previewConnections = connectAgents(selected, { ...connectionOptions, apply: false });
     const configPath = join(home, "config.json");
-    if (!existsSync(configPath)) {
-      writeFileSync(configPath, `${JSON.stringify({
-        schema_version: 2,
-        mode: "local",
-        tenant_id: flags.tenant || cliTenantId,
-        owner_id: flags.owner || cliOwnerId,
-        created_at: new Date().toISOString(),
-      }, null, 2)}\n`, { mode: 0o600 });
+    if (!connectionOptions.apply) {
+      output({
+        setup: true,
+        preview: true,
+        home,
+        config: configPath,
+        stats: null,
+        detected_agents: detectAgents(),
+        connections: previewConnections,
+        embeddings: flags.semantic ? { planned: true, provider: "local" } : null,
+        applied: false,
+        run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
+      });
+      process.exit(0);
     }
-    const vault = new ContextVault(home);
-    const stats = vault.stats();
-    vault.close();
-    let embeddings = null;
-    if (flags.semantic) embeddings = await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE });
+
+    const initialized = await initializeSetupHome(home, flags);
+    let connections;
+    try {
+      // This is intentionally the final fallible setup mutation. The connector
+      // layer rolls its whole batch back. If this invocation created the vault,
+      // remove it as well so setup remains end-to-end atomic.
+      connections = connectAgents(selected, connectionOptions);
+    } catch (error) {
+      if (initialized.created && existsSync(home)) rmSync(home, { recursive: true, force: true });
+      else removeCreatedSetupArtifacts(home, initialized.before);
+      throw error;
+    }
     output({
       setup: true,
       home,
       config: configPath,
-      stats,
+      stats: initialized.stats,
       detected_agents: detectAgents(),
       connections,
-      embeddings,
+      embeddings: initialized.embeddings,
       applied: Boolean(flags.apply),
       run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
     });

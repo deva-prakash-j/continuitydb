@@ -38,6 +38,7 @@ test("CLI setup previews and applies all project agent connections idempotently"
     assert.equal(previewValue.connections.length, 5);
     assert.deepEqual(previewValue.run, { command: "continuitydb", args: ["run", "--home", home] });
     assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+    assert.equal(existsSync(home), false, "setup preview must not initialize the vault");
     const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
     assert.equal(applied.status, 0, applied.stderr);
     assert.equal(JSON.parse(applied.stdout).connections.every((item) => item.applied), true);
@@ -104,6 +105,36 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
     assert.equal(existsSync(join(home, "config.json")), false);
     assert.equal(existsSync(join(home, "records")), false);
     assert.equal(existsSync(join(home, "index")), false);
+    assert.equal(existsSync(join(project, ".mcp.json")), false);
+    assert.equal(existsSync(join(project, "opencode.json")), false);
+    assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+    assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup vault failure occurs before agent commit and removes new setup artifacts", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-vault-failure-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const codex = join(project, ".codex", "config.toml");
+  const blocker = join(home, "index");
+  mkdirSync(join(project, ".codex"), { recursive: true });
+  mkdirSync(home, { recursive: true });
+  writeFileSync(codex, 'model = "gpt-5"\n');
+  writeFileSync(blocker, "pre-existing index blocker\n");
+  const beforeCodex = readFileSync(codex, "utf8");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(codex, "utf8"), beforeCodex);
+    assert.equal(readFileSync(blocker, "utf8"), "pre-existing index blocker\n");
+    assert.equal(existsSync(join(home, "config.json")), false);
+    assert.equal(existsSync(join(home, "records")), false);
     assert.equal(existsSync(join(project, ".mcp.json")), false);
     assert.equal(existsSync(join(project, "opencode.json")), false);
     assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
