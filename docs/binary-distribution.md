@@ -72,10 +72,18 @@ The smoke test proves:
 Use `npm run test:binary:semantic` for the networked model pull plus real local
 WASM inference gate.
 
-Pull requests and tagged-release automation apply the same gates on every supported native matrix target.
+Pull requests, pushes to `main`, and tagged-release automation apply the same
+gates on every supported native matrix target. Every successful `main` push
+creates or refreshes one commit-bound GitHub prerelease named
+`main-<12-character-commit>`. A workflow rerun updates that same prerelease
+instead of creating a duplicate. A pushed `v*` tag creates the stable release
+for that tag.
 For macOS, signing happens before both the ordinary binary smoke and semantic
 inference smoke. Checksums and artifact upload happen only after those blocking
-tests pass; publication depends on the complete native matrix.
+tests pass; publication depends on the complete native matrix. Before
+publication, the workflow requires all three supported binaries and their
+SHA-256 sidecars, verifies each checksum, creates build-provenance attestations,
+and then verifies that every expected asset exists on the GitHub Release.
 
 ## Install
 

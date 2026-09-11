@@ -189,9 +189,11 @@ The standalone executable does not require system Node.js or npm. Release
 automation builds native artifacts for Linux x64, macOS arm64, and Windows x64.
 Intel macOS is not published because upstream Node 25 SEA executables
 [segfault on x64 macOS](https://github.com/nodejs/node/issues/62893). Every
-supported artifact receives a SHA-256 sidecar; tagged releases also receive a
-GitHub build-provenance attestation. Until a tagged v0.7 release exists, build
-and test the binary from source using the next section.
+supported artifact receives a SHA-256 sidecar and GitHub build-provenance
+attestation. Every successful push to `main` creates a commit-bound prerelease
+with all supported native binaries; workflow reruns update the same release
+idempotently. Pushed `v*` tags create stable releases. Intel macOS remains
+npm-only until upstream Node SEA support is available.
 
 After downloading the artifact for your platform, verify its `.sha256` sidecar,
 then preview and apply a user-scoped installation:

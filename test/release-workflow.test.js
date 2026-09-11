@@ -32,6 +32,25 @@ test("release workflow runs native gates on pull requests using supported target
   assert.throws(() => validateReleaseWorkflow(retiredRunner), /supported macos-15 runner/);
 });
 
+test("every main push publishes one idempotent commit-bound prerelease", () => {
+  assert.deepEqual(workflow.on.push.branches, ["main"]);
+  assert.deepEqual(workflow.on.push.tags, ["v*"]);
+  assert.match(workflow.jobs.publish.if, /refs\/heads\/main/);
+
+  const missingMain = structuredClone(workflow);
+  missingMain.on.push.branches = [];
+  assert.throws(() => validateReleaseWorkflow(missingMain), /every push to main/);
+
+  const tagsOnly = structuredClone(workflow);
+  tagsOnly.jobs.publish.if = "startsWith(github.ref, 'refs/tags/v')";
+  assert.throws(() => validateReleaseWorkflow(tagsOnly), /main pushes and version-tag pushes/);
+
+  const nonIdempotent = structuredClone(workflow);
+  const publishStep = nonIdempotent.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  publishStep.run = publishStep.run.replace("gh release upload", "gh release replace");
+  assert.throws(() => validateReleaseWorkflow(nonIdempotent), /idempotent/);
+});
+
 test("release workflow validator rejects missing, skipped, or misordered semantic gates", () => {
   const missing = structuredClone(workflow);
   missing.jobs.build.steps = missing.jobs.build.steps.filter((step) => step.run !== "npm run smoke:binary:semantic");

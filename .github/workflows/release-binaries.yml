@@ -2,6 +2,7 @@ name: release-binaries
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -50,7 +51,7 @@ jobs:
           retention-days: 14
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -63,9 +64,81 @@ jobs:
           pattern: continuitydb-*
           path: release
           merge-multiple: true
+      - name: Verify complete native release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            continuitydb-linux-x64
+            continuitydb-linux-x64.sha256
+            continuitydb-darwin-arm64
+            continuitydb-darwin-arm64.sha256
+            continuitydb-win32-x64.exe
+            continuitydb-win32-x64.exe.sha256
+          )
+          for asset in "${expected[@]}"; do
+            test -f "release/$asset"
+          done
+          test "$(find release -maxdepth 1 -type f -name 'continuitydb-*' | wc -l | tr -d ' ')" = "${#expected[@]}"
+          (
+            cd release
+            sha256sum -c continuitydb-linux-x64.sha256
+            sha256sum -c continuitydb-darwin-arm64.sha256
+            sha256sum -c continuitydb-win32-x64.exe.sha256
+          )
       - uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: "release/continuitydb-*"
+      - name: Resolve idempotent release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            echo "tag=main-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+            echo "title=ContinuityDB main build ${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "title=ContinuityDB $GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release/* --verify-tag --generate-notes
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.release.outputs.title }}
+          RELEASE_PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          elif [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            gh release create "$RELEASE_TAG" release/* \
+              --target "$GITHUB_SHA" \
+              --title "$RELEASE_TITLE" \
+              --generate-notes \
+              --prerelease
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag \
+              --title "$RELEASE_TITLE" \
+              --generate-notes
+          fi
+      - name: Verify published release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
+          for expected in \
+            continuitydb-linux-x64 \
+            continuitydb-linux-x64.sha256 \
+            continuitydb-darwin-arm64 \
+            continuitydb-darwin-arm64.sha256 \
+            continuitydb-win32-x64.exe \
+            continuitydb-win32-x64.exe.sha256; do
+            grep -Fx "$expected" <<<"$assets" >/dev/null
+          done

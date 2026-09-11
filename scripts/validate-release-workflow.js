@@ -27,6 +27,11 @@ function validatePinnedActions(steps) {
 export function validateReleaseWorkflow(document) {
   invariant(document?.on?.pull_request !== undefined,
     "pull_request trigger is required so native release gates run before merge");
+  const push = document?.on?.push;
+  invariant(Array.isArray(push?.branches) && push.branches.includes("main"),
+    "every push to main must trigger the native release workflow");
+  invariant(Array.isArray(push?.tags) && push.tags.includes("v*"),
+    "version-tag release trigger is required");
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
   invariant(build && publish, "build and publish jobs are required");
@@ -63,13 +68,30 @@ export function validateReleaseWorkflow(document) {
 
   const needs = Array.isArray(publish.needs) ? publish.needs : [publish.needs];
   invariant(needs.includes("build"), "publish must depend on every native build matrix result");
+  const publishCondition = String(publish.if || "");
+  invariant(publishCondition.includes("refs/heads/main") && publishCondition.includes("refs/tags/v"),
+    "publish must run for main pushes and version-tag pushes only");
   const publishSteps = publish.steps || [];
   validatePinnedActions(publishSteps);
   const downloadIndex = actionIndex(publishSteps, "actions/download-artifact@");
+  const verifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify complete native release set"));
   const attestIndex = actionIndex(publishSteps, "actions/attest-build-provenance@");
   const releaseIndex = publishSteps.findIndex((step) => String(step.run || "").includes("gh release create"));
-  invariant(downloadIndex >= 0 && attestIndex > downloadIndex && releaseIndex > attestIndex,
-    "downloaded native artifacts must be attested before release publication");
+  const publishedVerifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify published release assets"));
+  invariant(downloadIndex >= 0 && verifyIndex > downloadIndex && attestIndex > verifyIndex && releaseIndex > attestIndex,
+    "downloaded native artifacts must be checksum-verified and attested before release publication");
+  invariant(publishedVerifyIndex > releaseIndex,
+    "published release assets must be independently verified after publication");
+  const verifyCommand = String(publishSteps[verifyIndex]?.run || "");
+  for (const asset of ["continuitydb-linux-x64", "continuitydb-darwin-arm64", "continuitydb-win32-x64.exe"]) {
+    invariant(verifyCommand.includes(asset), `release verification must require ${asset}`);
+  }
+  invariant(verifyCommand.includes("sha256sum -c"), "release artifact checksums must be verified before publication");
+  const releaseCommand = String(publishSteps[releaseIndex]?.run || "");
+  invariant(releaseCommand.includes("gh release upload") && releaseCommand.includes("--clobber"),
+    "release publication must be idempotent on workflow reruns");
+  invariant(releaseCommand.includes("--target \"$GITHUB_SHA\"") && releaseCommand.includes("--prerelease"),
+    "main pushes must create commit-bound prereleases");
   return { valid: true, native_targets: [...names].sort() };
 }
 
