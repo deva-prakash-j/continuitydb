@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `20ef15ce1d6abbd8abc49306e5ea567e01766aed`
+- **Runtime candidate tested:** `b48184b90de5f036d917d821e278fba0ba17e66e`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143989800` bytes
 - **Linux binary SHA-256:**
-  `406453c6666606cc9c5d9975e247d26bcfd4c8eaf947dba71b1b2c23a30af048`
+  `cef46ce211365004d3e31c321b8dd4ddc3bc78f6b57dd1072a94450fdcc49438`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -57,15 +57,15 @@ npm run test:binary:semantic
 
 Observed results on the build host:
 
-- **101/101** primary Node tests passed with **0 failed** and **0 skipped**;
+- **103/103** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run completed with **84 files**, **142.5 kB** packed and
-  **518.0 kB** unpacked;
+- package dry-run completed with **84 files**, **143.6 kB** packed and
+  **523.3 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -81,14 +81,19 @@ Observed results on the build host:
 - initialization failure occurs before connector mutation and removes only the
   setup artifacts created by the failed invocation, preserving pre-existing
   vault data and client configuration byte-for-byte;
+- setup treats an external local-model cache as transactional state: a failed
+  invocation removes newly downloaded model artifacts, restores overwritten
+  pre-existing files byte-for-byte, and invalidates stale in-process cache
+  verification state;
 - multi-client operations preflight every target before any mutation;
 - a later commit failure restores changed files and removes backup artifacts
   and empty directories created by the failed batch;
 - malformed JSON/TOML or malformed managed namespaces fail closed;
 - embedded WASM bytes are integrity checked and supplied in memory rather than
   extracted through a writable cache path;
-- the release workflow blocks publication until native functional and semantic
-  binary smoke tests pass; macOS smoke tests run after signing;
+- every CI or release workflow that uploads a native binary blocks publication
+  until native functional and semantic binary smoke tests pass; macOS smoke
+  tests run after signing;
 - privileged release actions are pinned to immutable commit SHAs;
 - the required `package:check` and `test:codex-config` release aliases are
   present and exercised.
