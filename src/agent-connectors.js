@@ -9,6 +9,8 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
+  rmdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -37,13 +39,18 @@ function ensureSafeParents(root, target, apply) {
   const relativeParent = relative(root, dirname(target));
   let current = root;
   if (existsSync(current) && lstatSync(current).isSymbolicLink()) throw new Error("project directory must not be a symlink");
+  const created = [];
   for (const part of relativeParent.split(sep).filter(Boolean)) {
     current = join(current, part);
     if (existsSync(current)) {
       const metadata = lstatSync(current);
       if (!metadata.isDirectory() || metadata.isSymbolicLink()) throw new Error(`configuration parent must be a real directory: ${current}`);
-    } else if (apply) mkdirSync(current, { mode: 0o700 });
+    } else if (apply) {
+      mkdirSync(current, { mode: 0o700 });
+      created.push(current);
+    }
   }
+  return created;
 }
 
 function readText(path) {
@@ -108,16 +115,49 @@ function backupExisting(path, backupRoot, client) {
 }
 
 function atomicWrite(path, content, { root, home, client, apply }) {
-  ensureSafeParents(root, path, apply);
+  const createdDirectories = ensureSafeParents(root, path, apply);
   const before = readText(path);
-  if (before === content) return { path, changed: false, applied: apply, backup: null };
-  if (!apply) return { path, changed: true, applied: false, backup: null };
+  if (before === content) return { path, changed: false, applied: apply, backup: null, createdDirectories };
+  if (!apply) return { path, changed: true, applied: false, backup: null, createdDirectories };
   const backup = backupExisting(path, join(home, "backups"), client);
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
   renameSync(temporary, path);
   chmodSync(path, 0o600);
-  return { path, changed: true, applied: true, backup };
+  return { path, changed: true, applied: true, backup, createdDirectories };
+}
+
+function snapshot(path) {
+  if (!existsSync(path)) return { existed: false, content: null, mode: null };
+  const metadata = lstatSync(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`configuration must be a regular file, not a symlink: ${path}`);
+  }
+  return { existed: true, content: readText(path), mode: metadata.mode & 0o777 };
+}
+
+function restoreSnapshot(plan, result) {
+  const { path, original, options } = plan;
+  if (original.existed) {
+    const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
+    writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
+    renameSync(temporary, path);
+    chmodSync(path, original.mode || 0o600);
+  } else if (existsSync(path)) {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`refusing to roll back non-file configuration target: ${path}`);
+    }
+    rmSync(path);
+  }
+  for (const directory of [...(result.createdDirectories || [])].reverse()) {
+    if (contains(options.projectDir, directory) && existsSync(directory)) rmdirSync(directory);
+  }
+}
+
+function publicResult(plan, result) {
+  const { createdDirectories: _createdDirectories, ...value } = result;
+  return { client: plan.client, project_dir: plan.options.projectDir, ...value };
 }
 
 function envFor(client, options) {
@@ -252,45 +292,108 @@ function normalizeOptions(options = {}) {
   };
 }
 
-export function connectAgent(client, rawOptions = {}) {
+function prepareAgentChange(client, rawOptions, action) {
   if (!SUPPORTED_AGENTS.includes(client)) throw new Error(`unsupported agent: ${client}`);
   const options = normalizeOptions(rawOptions);
-  let result;
+  let path;
+  let content;
   if (client === "codex") {
-    const path = join(options.projectDir, ".codex", "config.toml");
-    const text = replaceManagedToml(readText(path), codexBlock(options), path);
-    result = atomicWrite(path, text, { root: options.projectDir, home: options.home, client, apply: options.apply });
+    path = join(options.projectDir, ".codex", "config.toml");
+    const current = readText(path);
+    validateToml(current, path);
+    if (action === "connect") content = replaceManagedToml(current, codexBlock(options), path);
+    else {
+      const managed = managedCodexBlock(current);
+      content = managed === null ? current
+        : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length)}`.trimStart();
+      validateToml(content, path);
+    }
   } else {
-    const path = jsonTarget(client, options.projectDir);
+    path = jsonTarget(client, options.projectDir);
+    if (action === "disconnect" && !existsSync(path)) {
+      ensureSafeParents(options.projectDir, path, false);
+      return { client, action, options, path, content: "", original: snapshot(path), noOp: true };
+    }
     const current = parseJson(path);
-    const value = connectedJson(client, current, options);
-    result = atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`, { root: options.projectDir, home: options.home, client, apply: options.apply });
+    const value = action === "connect" ? connectedJson(client, current, options) : disconnectedJson(client, current, path);
+    content = `${JSON.stringify(value, null, 2)}\n`;
   }
-  return { client, transport: options.transport, project_dir: options.projectDir, ...result };
+  ensureSafeParents(options.projectDir, path, false);
+  return { client, action, options, path, content, original: snapshot(path) };
+}
+
+function applyAgentPlans(plans) {
+  if (!plans.length) return [];
+  const apply = plans[0].options.apply;
+  if (!plans.every((plan) => plan.options.apply === apply)) throw new Error("agent batch must use one apply mode");
+  if (!apply) {
+    return plans.map((plan) => plan.noOp
+      ? publicResult(plan, { path: plan.path, changed: false, applied: false, backup: null, createdDirectories: [] })
+      : publicResult(plan, atomicWrite(plan.path, plan.content, {
+        root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: false,
+      })));
+  }
+
+  const committed = [];
+  try {
+    for (const plan of plans) {
+      if (plan.noOp) {
+        committed.push({ plan, result: { path: plan.path, changed: false, applied: true, backup: null, createdDirectories: [] } });
+        continue;
+      }
+      const createdDirectories = ensureSafeParents(plan.options.projectDir, plan.path, true);
+      let result;
+      try {
+        result = atomicWrite(plan.path, plan.content, {
+          root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: true,
+        });
+        result.createdDirectories = createdDirectories;
+      } catch (error) {
+        try { restoreSnapshot(plan, { createdDirectories }); }
+        catch (rollbackError) {
+          throw new AggregateError([error, rollbackError], `agent configuration write failed and rollback was incomplete for ${plan.client}`);
+        }
+        throw error;
+      }
+      committed.push({ plan, result });
+    }
+    return committed.map(({ plan, result }) => publicResult(plan, result));
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const item of committed.reverse()) {
+      try { restoreSnapshot(item.plan, item.result); }
+      catch (rollbackError) { rollbackErrors.push(`${item.plan.client}: ${rollbackError.message}`); }
+    }
+    if (rollbackErrors.length) {
+      throw new AggregateError([error], `agent configuration batch failed and rollback was incomplete: ${rollbackErrors.join("; ")}`);
+    }
+    throw error;
+  }
+}
+
+function batch(clients, rawOptions, action) {
+  const unique = [...new Set(clients)];
+  if (!unique.length) return [];
+  // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
+  // path and rendered output must validate before the first client file changes.
+  const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action));
+  return applyAgentPlans(plans);
+}
+
+export function connectAgents(clients, rawOptions = {}) {
+  return batch(clients, rawOptions, "connect").map((result) => ({ transport: normalizeOptions(rawOptions).transport, ...result }));
+}
+
+export function disconnectAgents(clients, rawOptions = {}) {
+  return batch(clients, rawOptions, "disconnect");
+}
+
+export function connectAgent(client, rawOptions = {}) {
+  return connectAgents([client], rawOptions)[0];
 }
 
 export function disconnectAgent(client, rawOptions = {}) {
-  if (!SUPPORTED_AGENTS.includes(client)) throw new Error(`unsupported agent: ${client}`);
-  const options = normalizeOptions(rawOptions);
-  let result;
-  if (client === "codex") {
-    const path = join(options.projectDir, ".codex", "config.toml");
-    const current = readText(path);
-    validateToml(current, path);
-    const managed = managedCodexBlock(current);
-    const text = managed === null ? current
-      : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length)}`.trimStart();
-    validateToml(text, path);
-    result = atomicWrite(path, text, { root: options.projectDir, home: options.home, client, apply: options.apply });
-  } else {
-    const path = jsonTarget(client, options.projectDir);
-    if (!existsSync(path)) return { client, project_dir: options.projectDir, path, changed: false, applied: options.apply, backup: null };
-    const current = parseJson(path);
-    result = atomicWrite(path, `${JSON.stringify(disconnectedJson(client, current, path), null, 2)}\n`, {
-      root: options.projectDir, home: options.home, client, apply: options.apply,
-    });
-  }
-  return { client, project_dir: options.projectDir, ...result };
+  return disconnectAgents([client], rawOptions)[0];
 }
 
 export function connectionStatus(rawOptions = {}) {

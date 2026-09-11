@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   connectAgent,
+  connectAgents,
   connectionStatus,
   detectAgents,
   disconnectAgent,
@@ -13,6 +14,31 @@ import {
 
 const CODEX_START_FOR_TEST = "# >>> continuitydb managed configuration >>>";
 const CODEX_END_FOR_TEST = "# <<< continuitydb managed configuration <<<";
+
+function clientPaths(project) {
+  return {
+    codex: join(project, ".codex", "config.toml"),
+    claude: join(project, ".mcp.json"),
+    opencode: join(project, "opencode.json"),
+    cursor: join(project, ".cursor", "mcp.json"),
+    copilot: join(project, ".vscode", "mcp.json"),
+  };
+}
+
+function seedClientFiles(project) {
+  const paths = clientPaths(project);
+  for (const path of Object.values(paths)) mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(paths.codex, 'model = "gpt-5"\n');
+  writeFileSync(paths.claude, '{"keep":"claude"}\n');
+  writeFileSync(paths.opencode, '{"keep":"opencode"}\n');
+  writeFileSync(paths.cursor, '{"keep":"cursor"}\n');
+  writeFileSync(paths.copilot, '{"keep":"copilot"}\n');
+  return paths;
+}
+
+function contents(paths) {
+  return Object.fromEntries(Object.entries(paths).map(([client, path]) => [client, readFileSync(path, "utf8")]));
+}
 
 function fixture() {
   const root = join(tmpdir(), `continuitydb-connectors-${process.pid}-${crypto.randomUUID()}`);
@@ -187,5 +213,47 @@ test("Codex connector rejects malformed TOML and invalid managed markers without
     } finally {
       rmSync(value.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("all-client connect preflights every configuration before changing any client file", () => {
+  const hostileByClient = {
+    codex: "[broken\nvalue = true\n",
+    claude: "{ broken json\n",
+    opencode: '{"mcp":"invalid"}\n',
+    cursor: '{"mcpServers":[]}\n',
+    copilot: '{"servers":7}\n',
+  };
+  for (const failedClient of SUPPORTED_AGENTS) {
+    const value = fixture();
+    try {
+      const paths = seedClientFiles(value.project);
+      writeFileSync(paths[failedClient], hostileByClient[failedClient]);
+      const before = contents(paths);
+      assert.throws(() => connectAgents(SUPPORTED_AGENTS, options(value)), /(invalid TOML|Unexpected token|Expected property|namespace .* must be a JSON object)/);
+      assert.deepEqual(contents(paths), before, `batch mutated files before ${failedClient} validation failed`);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("all-client connect rolls back earlier client files when a later write fails", () => {
+  const value = fixture();
+  try {
+    const claude = join(value.project, ".mcp.json");
+    const original = '{"keep":"claude"}\n';
+    writeFileSync(claude, original);
+    mkdirSync(value.home, { recursive: true });
+    // All client configs are valid during phase 1. The second commit fails only
+    // when it tries to create its immutable backup beneath this non-directory.
+    writeFileSync(join(value.home, "backups"), "blocks backup directory creation\n");
+    assert.throws(() => connectAgents(SUPPORTED_AGENTS, options(value)), /(ENOTDIR|not a directory)/i);
+    assert.equal(readFileSync(claude, "utf8"), original);
+    assert.equal(existsSync(join(value.project, ".codex", "config.toml")), false);
+    assert.equal(existsSync(join(value.project, ".codex")), false);
+    assert.equal(existsSync(join(value.project, "opencode.json")), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
   }
 });

@@ -52,6 +52,59 @@ test("CLI setup previews and applies all project agent connections idempotently"
   }
 });
 
+test("CLI setup --agents all fails before mutating any client when a later config is malformed", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-atomic-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const codex = join(project, ".codex", "config.toml");
+  const claude = join(project, ".mcp.json");
+  mkdirSync(join(project, ".codex"), { recursive: true });
+  writeFileSync(codex, 'model = "gpt-5"\n');
+  writeFileSync(claude, "{ malformed\n");
+  const beforeCodex = readFileSync(codex, "utf8");
+  const beforeClaude = readFileSync(claude, "utf8");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.equal(readFileSync(codex, "utf8"), beforeCodex);
+    assert.equal(readFileSync(claude, "utf8"), beforeClaude);
+    assert.equal(existsSync(join(project, "opencode.json")), false);
+    assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+    assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI agents connect all fails before mutating any client when a later namespace is invalid", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-connect-atomic-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const codex = join(project, ".codex", "config.toml");
+  const claude = join(project, ".mcp.json");
+  const opencode = join(project, "opencode.json");
+  mkdirSync(join(project, ".codex"), { recursive: true });
+  writeFileSync(codex, 'model = "gpt-5"\n');
+  writeFileSync(claude, '{"keep":true}\n');
+  writeFileSync(opencode, '{"mcp":"invalid"}\n');
+  const before = new Map([codex, claude, opencode].map((path) => [path, readFileSync(path, "utf8")]));
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    const result = spawnSync(process.execPath, [
+      cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    for (const [path, content] of before) assert.equal(readFileSync(path, "utf8"), content);
+    assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+    assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI --home overrides environment home for local embedding cache resolution", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-home-test-"));
   const envHome = join(root, "environment-home");

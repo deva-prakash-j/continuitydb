@@ -239,11 +239,15 @@ The generated project files are:
 | Cursor | `.cursor/mcp.json` → `mcpServers.continuitydb` |
 | VS Code Copilot | `.vscode/mcp.json` → `servers.continuitydb` |
 
-Writes are atomic, symlinked config paths are rejected, existing files are
-backed up privately below the vault, and rerunning setup is idempotent. Static
-secrets are never written: remote configs store only a token environment
-variable reference. Malformed JSON/TOML and non-object managed namespaces are
-rejected before mutation. Disconnect removes only the ContinuityDB-owned entry:
+Single-client writes are atomic. Multi-client `setup` and `agents connect`
+operations use a two-phase batch: every selected JSON/TOML file, managed
+namespace, marker, path, and rendered output is validated before the first
+client file changes. If a later filesystem write still fails, earlier client
+changes and newly created config directories are rolled back. Symlinked config
+paths are rejected, existing files are backed up privately below the vault, and
+rerunning setup is idempotent. Static secrets are never written: remote configs
+store only a token environment variable reference. Disconnect removes only the
+ContinuityDB-owned entry:
 
 ```bash
 continuitydb agents disconnect codex --project-dir "$PWD"

@@ -105,9 +105,16 @@ continuitydb setup --project-dir "$PWD" --owner developer-1 \
 ```
 
 Use `--agents all` to generate every supported project file even when the
-client executable is not installed yet. Use `agents connect` and
-`agents disconnect` for one client at a time. Both preview by default and need
-`--apply` to mutate project files.
+client executable is not installed yet. `agents connect` and `agents
+disconnect` accept one client or `all`. All commands preview by default and
+need `--apply` to mutate project files.
+
+Multi-client apply is fail-closed. ContinuityDB first parses and validates all
+selected files, namespaces, managed markers, paths, and generated output
+without writing. It begins the commit phase only after every client passes
+preflight. If a later write fails despite preflight, earlier client files and
+newly created configuration directories are restored before the command
+returns failure.
 
 Local stdio is the default and starts the binary on demand. For one central
 service, pass `--transport http --url https://memory.example/mcp`; generated
@@ -136,8 +143,9 @@ Changed client files are backed up by content hash below:
 ```
 
 Disconnect removes only the managed ContinuityDB entry or Codex managed block;
-unrelated client configuration remains intact. If validation fails before an
-atomic rename, the original file remains authoritative.
+unrelated client configuration remains intact. Individual files use atomic
+rename. Multi-client operations additionally restore already-written files if
+a later commit fails.
 
 Existing JSON client files must contain object-shaped managed namespaces.
 Existing Codex TOML must parse cleanly and contain at most one well-formed

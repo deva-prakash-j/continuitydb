@@ -9,10 +9,10 @@ import { normalizeIdentity } from "./security.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
 import { ensureLocalModel, localModelStatus } from "./local-embeddings.js";
 import {
-  connectAgent,
+  connectAgents,
   connectionStatus,
   detectAgents,
-  disconnectAgent,
+  disconnectAgents,
   SUPPORTED_AGENTS,
 } from "./agent-connectors.js";
 import { isStandaloneBinary } from "./binary-runtime.js";
@@ -152,7 +152,7 @@ try {
     const stats = vault.stats();
     vault.close();
     const selected = agentSelection(flags.agents);
-    const connections = selected.map((client) => connectAgent(client, agentOptions()));
+    const connections = connectAgents(selected, agentOptions());
     let embeddings = null;
     if (flags.semantic) embeddings = await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE });
     output({
@@ -172,8 +172,8 @@ try {
     else if (action === "status") output({ agents: connectionStatus(agentOptions()) });
     else if (action === "connect" || action === "disconnect") {
       const selected = agentSelection(positional.shift() || flags.agents || "detected");
-      const operation = action === "connect" ? connectAgent : disconnectAgent;
-      output({ action, applied: Boolean(flags.apply), results: selected.map((client) => operation(client, agentOptions())) });
+      const operation = action === "connect" ? connectAgents : disconnectAgents;
+      output({ action, applied: Boolean(flags.apply), results: operation(selected, agentOptions()) });
     } else throw new Error(`unknown agents action: ${action}`);
   } else if (command === "hook") {
     const { runLifecycleHook } = await import("./lifecycle-hook.js");
