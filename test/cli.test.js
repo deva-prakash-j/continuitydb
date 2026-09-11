@@ -74,6 +74,7 @@ test("CLI setup --agents all fails before mutating any client when a later confi
     assert.equal(existsSync(join(project, "opencode.json")), false);
     assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
     assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+    assert.equal(existsSync(home), false, "failed connector preflight must not initialize the global vault");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

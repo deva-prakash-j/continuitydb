@@ -137,6 +137,11 @@ try {
   } else if (command === "install") {
     output(installStandaloneBinary({ prefix: flags.prefix, apply: Boolean(flags.apply), force: Boolean(flags.force) }));
   } else if (command === "setup") {
+    const selected = agentSelection(flags.agents);
+    const connectionOptions = agentOptions();
+    // Setup must fail without touching the global vault when any client
+    // configuration cannot be parsed or safely rendered.
+    connectAgents(selected, { ...connectionOptions, apply: false });
     mkdirSync(home, { recursive: true, mode: 0o700 });
     const configPath = join(home, "config.json");
     if (!existsSync(configPath)) {
@@ -151,8 +156,7 @@ try {
     const vault = new ContextVault(home);
     const stats = vault.stats();
     vault.close();
-    const selected = agentSelection(flags.agents);
-    const connections = connectAgents(selected, agentOptions());
+    const connections = connectAgents(selected, connectionOptions);
     let embeddings = null;
     if (flags.semantic) embeddings = await ensureLocalModel({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE });
     output({

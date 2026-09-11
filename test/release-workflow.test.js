@@ -29,3 +29,11 @@ test("release workflow validator rejects missing, skipped, or misordered semanti
   independentPublish.jobs.publish.needs = [];
   assert.throws(() => validateReleaseWorkflow(independentPublish), /publish must depend/);
 });
+
+test("release workflow rejects mutable action tags in privileged and build jobs", () => {
+  for (const [job, action] of [["build", "actions/checkout@v5"], ["publish", "actions/download-artifact@v5"]]) {
+    const mutable = structuredClone(workflow);
+    mutable.jobs[job].steps.find((step) => step.uses).uses = action;
+    assert.throws(() => validateReleaseWorkflow(mutable), /full immutable commit SHA/);
+  }
+});

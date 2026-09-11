@@ -16,6 +16,14 @@ function actionIndex(steps, prefix) {
   return steps.findIndex((step) => String(step.uses || "").startsWith(prefix));
 }
 
+function validatePinnedActions(steps) {
+  for (const step of steps) {
+    if (!step.uses) continue;
+    invariant(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}$/.test(String(step.uses)),
+      `third-party action must use a full immutable commit SHA: ${step.uses}`);
+  }
+}
+
 export function validateReleaseWorkflow(document) {
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
@@ -28,6 +36,7 @@ export function validateReleaseWorkflow(document) {
   }
 
   const steps = build.steps || [];
+  validatePinnedActions(steps);
   const buildIndex = runIndex(steps, "npm run build:binary");
   const signIndex = steps.findIndex((step) => String(step.run || "").includes("codesign --force --sign"));
   const smokeIndex = runIndex(steps, "npm run smoke:binary");
@@ -48,6 +57,7 @@ export function validateReleaseWorkflow(document) {
   const needs = Array.isArray(publish.needs) ? publish.needs : [publish.needs];
   invariant(needs.includes("build"), "publish must depend on every native build matrix result");
   const publishSteps = publish.steps || [];
+  validatePinnedActions(publishSteps);
   const downloadIndex = actionIndex(publishSteps, "actions/download-artifact@");
   const attestIndex = actionIndex(publishSteps, "actions/attest-build-provenance@");
   const releaseIndex = publishSteps.findIndex((step) => String(step.run || "").includes("gh release create"));

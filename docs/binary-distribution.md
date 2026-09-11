@@ -153,6 +153,12 @@ ContinuityDB managed block. Connect, disconnect, and status operations fail
 closed on malformed structures instead of replacing or reporting success for
 an invalid user configuration.
 
+`setup` validates every selected client configuration before initializing a
+new vault. Multi-client apply tracks both configuration writes and newly
+created immutable backup artifacts; a later failure restores the original
+client files and removes backup files/directories created by that failed
+batch.
+
 ## Release integrity
 
 Each workflow artifact includes a `.sha256` file. Tagged GitHub releases also

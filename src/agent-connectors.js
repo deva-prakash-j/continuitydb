@@ -105,13 +105,45 @@ function backupExisting(path, backupRoot, client) {
   const value = readText(path);
   const digest = sha256(value);
   const directory = join(backupRoot, "agent-config", client);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const destination = join(directory, `${basename(path)}.${digest.slice(0, 16)}.bak`);
-  if (!existsSync(destination)) {
-    copyFileSync(path, destination);
-    chmodSync(destination, 0o600);
+  const createdDirectories = [];
+  for (const candidate of [dirname(backupRoot), backupRoot, join(backupRoot, "agent-config"), directory]) {
+    if (existsSync(candidate)) {
+      const metadata = lstatSync(candidate);
+      if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+        throw new Error(`backup parent must be a real directory: ${candidate}`);
+      }
+    } else {
+      mkdirSync(candidate, { recursive: true, mode: 0o700 });
+      createdDirectories.push(candidate);
+    }
   }
-  return destination;
+  const destination = join(directory, `${basename(path)}.${digest.slice(0, 16)}.bak`);
+  let createdFile = false;
+  try {
+    copyFileSync(path, destination, constants.COPYFILE_EXCL);
+    createdFile = true;
+    chmodSync(destination, 0o600);
+  } catch (error) {
+    if (error?.code !== "EEXIST") {
+      cleanupBackupArtifacts({ path: destination, createdFile, createdDirectories });
+      throw error;
+    }
+  }
+  return { path: destination, createdFile, createdDirectories };
+}
+
+function cleanupBackupArtifacts(artifacts) {
+  if (!artifacts) return;
+  if (artifacts.createdFile && existsSync(artifacts.path)) {
+    const metadata = lstatSync(artifacts.path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`refusing to remove unexpected backup artifact: ${artifacts.path}`);
+    }
+    rmSync(artifacts.path);
+  }
+  for (const directory of [...artifacts.createdDirectories].reverse()) {
+    if (existsSync(directory)) rmdirSync(directory);
+  }
 }
 
 function atomicWrite(path, content, { root, home, client, apply }) {
@@ -119,12 +151,25 @@ function atomicWrite(path, content, { root, home, client, apply }) {
   const before = readText(path);
   if (before === content) return { path, changed: false, applied: apply, backup: null, createdDirectories };
   if (!apply) return { path, changed: true, applied: false, backup: null, createdDirectories };
-  const backup = backupExisting(path, join(home, "backups"), client);
+  const backupArtifacts = backupExisting(path, join(home, "backups"), client);
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
-  writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
-  renameSync(temporary, path);
-  chmodSync(path, 0o600);
-  return { path, changed: true, applied: true, backup, createdDirectories };
+  try {
+    writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
+    if (existsSync(temporary)) rmSync(temporary);
+    cleanupBackupArtifacts(backupArtifacts);
+    throw error;
+  }
+  return {
+    path,
+    changed: true,
+    applied: true,
+    backup: backupArtifacts?.path || null,
+    backupArtifacts,
+    createdDirectories,
+  };
 }
 
 function snapshot(path) {
@@ -153,10 +198,11 @@ function restoreSnapshot(plan, result) {
   for (const directory of [...(result.createdDirectories || [])].reverse()) {
     if (contains(options.projectDir, directory) && existsSync(directory)) rmdirSync(directory);
   }
+  cleanupBackupArtifacts(result.backupArtifacts);
 }
 
 function publicResult(plan, result) {
-  const { createdDirectories: _createdDirectories, ...value } = result;
+  const { createdDirectories: _createdDirectories, backupArtifacts: _backupArtifacts, ...value } = result;
   return { client: plan.client, project_dir: plan.options.projectDir, ...value };
 }
 

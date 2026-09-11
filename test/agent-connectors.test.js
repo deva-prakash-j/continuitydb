@@ -248,11 +248,35 @@ test("all-client connect rolls back earlier client files when a later write fail
     // All client configs are valid during phase 1. The second commit fails only
     // when it tries to create its immutable backup beneath this non-directory.
     writeFileSync(join(value.home, "backups"), "blocks backup directory creation\n");
-    assert.throws(() => connectAgents(SUPPORTED_AGENTS, options(value)), /(ENOTDIR|not a directory)/i);
+    assert.throws(() => connectAgents(SUPPORTED_AGENTS, options(value)), /(ENOTDIR|not a directory|backup parent must be a real directory)/i);
     assert.equal(readFileSync(claude, "utf8"), original);
     assert.equal(existsSync(join(value.project, ".codex", "config.toml")), false);
     assert.equal(existsSync(join(value.project, ".codex")), false);
     assert.equal(existsSync(join(value.project, "opencode.json")), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("all-client rollback removes backup artifacts created before a later backup failure", () => {
+  const value = fixture();
+  try {
+    const paths = seedClientFiles(value.project);
+    const before = contents(paths);
+    const backupRoot = join(value.home, "backups", "agent-config");
+    mkdirSync(backupRoot, { recursive: true });
+    const blocker = join(backupRoot, "opencode");
+    writeFileSync(blocker, "pre-existing blocker\n");
+
+    assert.throws(
+      () => connectAgents(SUPPORTED_AGENTS, options(value)),
+      /backup parent must be a real directory/,
+    );
+
+    assert.deepEqual(contents(paths), before);
+    assert.equal(existsSync(join(backupRoot, "codex")), false);
+    assert.equal(existsSync(join(backupRoot, "claude")), false);
+    assert.equal(readFileSync(blocker, "utf8"), "pre-existing blocker\n");
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
