@@ -15,33 +15,38 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.6 alpha candidate. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.6 alpha. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
-> production adapter and billion-record proof do not exist yet. Current `main`
-> also contains unreleased handoff, quota, concurrent-bootstrap, and audit
-> hardening documented in the [changelog](CHANGELOG.md).
+> production adapter and billion-record proof do not exist yet. Remote MCP and
+> client adapters are evidence-graded: a tested configuration is not described
+> as a real-client tool-call proof unless that exact client performed the call.
 
 ### Verification status
 
-The runtime at commit
-[`76e413f`](https://github.com/deva-prakash-j/continuitydb/commit/76e413fb210d0f09a507809129c168eaa31391da)
-passed the independent Astraea strict QA gate after five review/fix rounds:
+The v0.6 runtime at
+[`2c9df03`](https://github.com/deva-prakash-j/continuitydb/commit/2c9df0399dce5d31173aebe0769a81cf0dcc739b)
+and its documentation-only evidence attestation at
+[`266d856`](https://github.com/deva-prakash-j/continuitydb/commit/266d856fea0c6ba106de7cef2ad737e2a46a7d9b)
+passed the independent Astraea strict QA gate:
 
-- final verdict: **PASS**, with no P0/P1 findings;
-- full automated suite: **64/64 passing**;
-- focused security suite: **11/11 passing**;
-- OpenAPI validation: **18 paths**;
+- final verdict: **PASS**, with no P0/P1 release blockers;
+- full automated suite: **76/76 passing**, with 0 failed and 0 skipped;
+- focused security suite: **16/16 passing**;
+- focused client-interoperability suite: **11/11 passing**;
+- OpenAPI validation: **20 paths**;
+- installed Codex CLI `0.147.0`: authenticated Streamable HTTP MCP
+  initialization and `tools/list` verified;
+- exact lexical Recall@5: **9/9**, with **0 isolation violations**;
 - dependency audit: **0 known production vulnerabilities**;
-- mixed-workload smoke: **0 retrieval misses, isolation violations, or HTTP failures**;
-- concurrent first-open stress: **240/240 successful process opens** across ten
-  fresh-vault repetitions.
+- package dry-run: **71 files**; exact candidate sizes are recorded in the
+  linked verification evidence.
 
-The v0.6 interoperability candidate is additionally gated by **73/73 local
-tests**, 20 OpenAPI paths, four versioned client-contract checks, an installed
-Codex CLI authenticated transport/discovery probe, and zero known production
-dependency vulnerabilities. Independent Astraea review remains mandatory for
-the exact candidate commit before it can be described as ready.
+See the exact commands, environment, artifact identity, and evidence boundaries
+in the [v0.6 verification record](docs/build-verification-2026-09-11-v0.6.md).
+The Codex result is transport/discovery evidence, not a model-triggered tool-call
+proof; hosted Copilot, Claude Code, and OpenCode remain contract-tested until
+their real-client runs are captured.
 
 ## The problem
 
@@ -339,6 +344,21 @@ project memory. Do not put tokens in URLs, command arguments, repositories, or
 visible logs. See the versioned configurations and evidence matrix in
 [`examples/clients`](examples/clients) and
 [`docs/client-compatibility.md`](docs/client-compatibility.md).
+
+### Client compatibility evidence
+
+| Client | Current evidence grade |
+|---|---|
+| MCP TypeScript SDK 1.30.0 | **Tool-call verified** over authenticated Streamable HTTP and stdio |
+| Codex CLI 0.147.0 | **Transport verified** through initialization and `tools/list` |
+| GitHub Copilot cloud agent / code review | **Contract tested** with a read-only three-tool allowlist |
+| Claude Code | **Contract tested** for remote MCP plus `SessionStart` and `Stop` hooks |
+| OpenCode | **Contract tested** for remote MCP, compaction context, and idle checkpointing |
+| Cursor | **Contract tested** for the stdio adapter and lifecycle command shapes |
+
+These grades intentionally distinguish real client execution from configuration
+validation. Reproduce them with `npm run test:clients`,
+`npm run validate:clients`, and `npm run test:codex-client`.
 
 ### Automatic session lifecycle adapters
 
