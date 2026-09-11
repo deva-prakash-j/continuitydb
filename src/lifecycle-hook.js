@@ -50,25 +50,25 @@ function renderStartup({ handoff, context }) {
   ].join("\n");
 }
 
-function writeStartup(value, client) {
-  if (client === "cursor") process.stdout.write(`${JSON.stringify({ additional_context: value })}\n`);
-  else if (client === "claude") process.stdout.write(`${JSON.stringify({
+function writeStartup(value, client, stdout = process.stdout) {
+  if (client === "cursor") stdout.write(`${JSON.stringify({ additional_context: value })}\n`);
+  else if (client === "claude") stdout.write(`${JSON.stringify({
     hookSpecificOutput: {
       hookEventName: "SessionStart",
       additionalContext: value,
     },
   })}\n`);
-  else process.stdout.write(`${value}\n`);
+  else stdout.write(`${value}\n`);
 }
 
-const { command, flags } = parse(process.argv.slice(2));
-const client = createApiClientFromEnv();
-if (!client) {
-  process.stderr.write("CONTINUITYDB_HTTP_URL is required for lifecycle hooks\n");
-  process.exit(1);
-}
-
-try {
+export async function runLifecycleHook(argv = process.argv.slice(2), io = process) {
+  const { command, flags } = parse(argv);
+  const client = createApiClientFromEnv();
+  if (!client) {
+    io.stderr.write("CONTINUITYDB_HTTP_URL is required for lifecycle hooks\n");
+    return 1;
+  }
+  try {
   if (command === "session-start") {
     const projectId = required(flags.project || process.env.CONTINUITYDB_PROJECT_ID, "project_id");
     const taskId = required(flags.task_id || process.env.CONTINUITYDB_TASK_ID, "task_id");
@@ -84,7 +84,7 @@ try {
       token_budget: Number(flags.token_budget || process.env.CONTINUITYDB_TOKEN_BUDGET || 1200),
       exclude_types: ["handoff"],
     });
-    writeStartup(renderStartup({ handoff, context }), flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "claude");
+    writeStartup(renderStartup({ handoff, context }), flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "claude", io.stdout);
   } else if (command === "checkpoint") {
     const value = readCheckpoint(flags.file || process.env.CONTINUITYDB_HANDOFF_FILE);
     if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
@@ -100,14 +100,20 @@ try {
       }
     }
     const result = await client.saveHandoff(value);
-    process.stdout.write(`${JSON.stringify(flags.verbose
+    io.stdout.write(`${JSON.stringify(flags.verbose
       ? { saved: true, memory_id: result.record.id, checkpoint_id: result.handoff.checkpoint_id }
       : {})}\n`);
   } else {
-    process.stdout.write(`Usage:\n  continuitydb-hook session-start --project ID --task-id ID [--task TEXT] [--branch REF] [--client claude|cursor]\n  continuitydb-hook checkpoint --file HANDOFF.json [--verbose]\n`);
-    process.exitCode = command ? 1 : 0;
+    io.stdout.write(`Usage:\n  continuitydb-hook session-start --project ID --task-id ID [--task TEXT] [--branch REF] [--client claude|cursor]\n  continuitydb-hook checkpoint --file HANDOFF.json [--verbose]\n`);
+    return command ? 1 : 0;
   }
-} catch (error) {
-  process.stderr.write(`${JSON.stringify({ error: error.message, command })}\n`);
-  process.exitCode = 1;
+  return 0;
+  } catch (error) {
+    io.stderr.write(`${JSON.stringify({ error: error.message, command })}\n`);
+    return 1;
+  }
+}
+
+if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && import.meta.url === `file://${process.argv[1]}`) {
+  runLifecycleHook().then((code) => { process.exitCode = code; });
 }

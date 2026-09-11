@@ -5,6 +5,7 @@ import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { REVIEW_UI } from "./review-ui.js";
 import { ContinuityMcpHttpEndpoint } from "./mcp-http.js";
+import { VERSION } from "./version.js";
 import {
   isLoopback,
   loadTokenPolicy,
@@ -223,7 +224,7 @@ export function createContinuityServer({
     try {
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       if (request.method === "GET" && url.pathname === "/healthz") {
-        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.6.0" }, requestId);
+        return json(response, 200, { status: "ok", service: "continuitydb", version: VERSION }, requestId);
       }
 
       if (request.method === "GET" && url.pathname === OAUTH_METADATA_PATH && oidcAuthorizer) {
@@ -505,7 +506,7 @@ export function createContinuityServer({
   };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && import.meta.url === `file://${process.argv[1]}`) {
   const service = createContinuityServer();
   const address = await service.listen();
   process.stderr.write(`ContinuityDB listening on ${typeof address === "string" ? address : `${address.address}:${address.port}`}\n`);

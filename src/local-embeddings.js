@@ -1,18 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
-  statSync,
-  unlinkSync,
+  rmSync,
+  rmdirSync,
   writeFileSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { ensureEmbeddedOnnxRuntime } from "./binary-runtime.js";
+import { acquireFileLock } from "./file-lock.js";
 
 const REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 const REPOSITORY = "Xenova/bge-small-en-v1.5";
@@ -76,31 +76,96 @@ function modelRoot(home, configuredCache, spec = BUILTIN_LOCAL_MODEL) {
   return join(base, spec.cache_directory);
 }
 
-function sleep(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
+export function acquireLocalModelCacheLock({
+  home,
+  cacheDir,
+  spec = BUILTIN_LOCAL_MODEL,
+  timeoutMs = 120_000,
+} = {}) {
+  return acquireFileLock(join(modelRoot(home, cacheDir, spec), ".download.lock"), { timeoutMs });
 }
 
-async function acquireLock(path, timeoutMs = 120_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    try {
-      const descriptor = openSync(path, "wx", 0o600);
-      writeFileSync(descriptor, `${process.pid}\n${new Date().toISOString()}\n`);
-      closeSync(descriptor);
-      return;
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(path).mtimeMs > 10 * 60_000) {
-          unlinkSync(path);
-          continue;
-        }
-      } catch (statError) {
-        if (statError.code !== "ENOENT") throw statError;
-      }
-      if (Date.now() >= deadline) throw new Error("timed out waiting for the local embedding model download lock");
-      await sleep(250);
+export function snapshotLocalModelCache({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } = {}) {
+  const directory = modelRoot(home, cacheDir, spec);
+  const base = dirname(directory);
+  const directoryExisted = existsSync(directory);
+  if (directoryExisted) {
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error("local embedding model cache must be a real directory, not a symlink");
     }
+  }
+  const artifacts = spec.artifacts.map((artifact) => {
+    const path = join(directory, artifact.name);
+    if (!existsSync(path)) return { path, existed: false, bytes: null, mode: null };
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`local embedding cache artifact must be a regular file: ${path}`);
+    }
+    return { path, existed: true, bytes: readFileSync(path), mode: metadata.mode & 0o777 };
+  });
+  return {
+    cacheKey: directory,
+    base,
+    baseExisted: existsSync(base),
+    directory,
+    directoryExisted,
+    artifacts,
+  };
+}
+
+function cacheArtifactMatches(artifact) {
+  if (!artifact.existed) return !existsSync(artifact.path);
+  if (!existsSync(artifact.path)) return false;
+  const metadata = lstatSync(artifact.path);
+  return metadata.isFile() && !metadata.isSymbolicLink()
+    && (metadata.mode & 0o777) === artifact.mode
+    && readFileSync(artifact.path).equals(artifact.bytes);
+}
+
+export function restoreLocalModelCache(snapshot, expectedCurrent = null) {
+  const releaseLock = acquireFileLock(join(snapshot.directory, ".download.lock"), { timeoutMs: 120_000 });
+  try {
+    verifiedModels.delete(snapshot.cacheKey);
+    if (expectedCurrent) {
+      const conflicts = expectedCurrent.artifacts.filter((artifact) => !cacheArtifactMatches(artifact));
+      if (conflicts.length) {
+        throw new Error(`rollback conflict: local embedding cache changed concurrently: ${conflicts.map((item) => item.path).join(", ")}`);
+      }
+    }
+    for (const artifact of snapshot.artifacts) {
+      if (artifact.existed) {
+        mkdirSync(snapshot.directory, { recursive: true, mode: 0o700 });
+        const temporary = `${artifact.path}.${process.pid}.${randomUUID()}.rollback`;
+        writeFileSync(temporary, artifact.bytes, { flag: "wx", mode: artifact.mode || 0o600 });
+        if (existsSync(artifact.path)) {
+          const current = lstatSync(artifact.path);
+          if (!current.isFile() || current.isSymbolicLink()) {
+            rmSync(temporary);
+            throw new Error(`refusing to replace unexpected local embedding cache artifact: ${artifact.path}`);
+          }
+          rmSync(artifact.path);
+        }
+        renameSync(temporary, artifact.path);
+        chmodSync(artifact.path, artifact.mode || 0o600);
+      } else if (existsSync(artifact.path)) {
+        const metadata = lstatSync(artifact.path);
+        if (!metadata.isFile() || metadata.isSymbolicLink()) {
+          throw new Error(`refusing to remove unexpected local embedding cache artifact: ${artifact.path}`);
+        }
+        rmSync(artifact.path);
+      }
+    }
+    if (!snapshot.directoryExisted && existsSync(snapshot.directory)) {
+      try { rmdirSync(snapshot.directory); }
+      catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+    }
+    if (!snapshot.baseExisted && existsSync(snapshot.base)) {
+      try { rmdirSync(snapshot.base); }
+      catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+    }
+  } finally {
+    releaseLock();
   }
 }
 
@@ -149,34 +214,37 @@ export function localModelStatus({ home, cacheDir, spec = BUILTIN_LOCAL_MODEL } 
 
 export async function ensureLocalModel({ home, cacheDir, offline = false, fetchImpl = fetch, spec = BUILTIN_LOCAL_MODEL } = {}) {
   const cacheKey = modelRoot(home, cacheDir, spec);
-  if (verifiedModels.has(cacheKey)) return verifiedModels.get(cacheKey);
-  const status = localModelStatus({ home, cacheDir, spec });
-  if (!status.cache_directory_safe) throw new Error("local embedding model cache must be a real directory, not a symlink");
-  if (status.ready) {
-    verifiedModels.set(cacheKey, status);
-    return status;
-  }
-  if (offline) throw new Error("local embedding model is not cached and offline mode is enabled");
-  mkdirSync(status.directory, { recursive: true, mode: 0o700 });
-  const directoryMetadata = lstatSync(status.directory);
-  if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
-    throw new Error("local embedding model cache must be a real directory, not a symlink");
-  }
-  chmodSync(status.directory, 0o700);
-  const lock = join(status.directory, ".download.lock");
-  await acquireLock(lock);
+  const releaseLock = acquireLocalModelCacheLock({ home, cacheDir, spec });
   try {
+    if (verifiedModels.has(cacheKey)) {
+      const cached = localModelStatus({ home, cacheDir, spec });
+      if (cached.ready) return cached;
+      verifiedModels.delete(cacheKey);
+    }
+    const status = localModelStatus({ home, cacheDir, spec });
+    if (!status.cache_directory_safe) throw new Error("local embedding model cache must be a real directory, not a symlink");
+    if (status.ready) {
+      verifiedModels.set(cacheKey, status);
+      return status;
+    }
+    if (offline) throw new Error("local embedding model is not cached and offline mode is enabled");
+    mkdirSync(status.directory, { recursive: true, mode: 0o700 });
+    const directoryMetadata = lstatSync(status.directory);
+    if (!directoryMetadata.isDirectory() || directoryMetadata.isSymbolicLink()) {
+      throw new Error("local embedding model cache must be a real directory, not a symlink");
+    }
+    chmodSync(status.directory, 0o700);
     for (const artifact of spec.artifacts) {
       const destination = join(status.directory, artifact.name);
       if (!validArtifact(destination, artifact)) await downloadArtifact(status.directory, artifact, fetchImpl, spec);
     }
+    const completed = localModelStatus({ home, cacheDir, spec });
+    if (!completed.ready) throw new Error("local embedding model installation did not complete");
+    verifiedModels.set(cacheKey, completed);
+    return completed;
   } finally {
-    try { unlinkSync(lock); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    releaseLock();
   }
-  const completed = localModelStatus({ home, cacheDir, spec });
-  if (!completed.ready) throw new Error("local embedding model installation did not complete");
-  verifiedModels.set(cacheKey, completed);
-  return completed;
 }
 
 export function normalizeEmbeddingText(value) {
@@ -241,22 +309,24 @@ export class WordPieceTokenizer {
   }
 }
 
-async function loadSession(status, threads) {
+async function loadSession(status, threads, options = {}) {
   const key = `${status.directory}:${threads}`;
   if (!sessions.has(key)) {
     sessions.set(key, (async () => {
       let ort;
-      try { ort = await import("onnxruntime-web"); }
+      try { ort = await import("onnxruntime-web/wasm"); }
       catch (error) {
         if (error.code === "ERR_MODULE_NOT_FOUND") {
           throw new Error("local embeddings require the optional onnxruntime-web dependency; reinstall without --omit=optional");
         }
         throw error;
       }
+      const embeddedRuntime = ensureEmbeddedOnnxRuntime(options);
+      if (embeddedRuntime) ort.env.wasm.wasmBinary = embeddedRuntime.wasmBinary;
       ort.env.wasm.numThreads = threads;
       ort.env.wasm.proxy = false;
       const tokenizer = WordPieceTokenizer.fromFile(join(status.directory, "vocab.txt"));
-      const session = await ort.InferenceSession.create(join(status.directory, "model.onnx"), {
+      const session = await ort.InferenceSession.create(readFileSync(join(status.directory, "model.onnx")), {
         executionProviders: ["wasm"],
         graphOptimizationLevel: "all",
       });
@@ -300,7 +370,7 @@ export class LocalOnnxEmbedder {
 
   async ready() {
     const status = await ensureLocalModel({ home: this.home, cacheDir: this.cacheDir, offline: this.offline });
-    await loadSession(status, this.threads);
+    await loadSession(status, this.threads, { home: this.home, cacheDir: this.cacheDir });
     return status;
   }
 
@@ -316,7 +386,7 @@ export class LocalOnnxEmbedder {
     const input = Array.isArray(texts) ? texts : [texts];
     if (!input.length || input.length > 256) throw new Error("embedding batch must contain 1 to 256 items");
     const status = await ensureLocalModel({ home: this.home, cacheDir: this.cacheDir, offline: this.offline });
-    const { ort, tokenizer, session } = await loadSession(status, this.threads);
+    const { ort, tokenizer, session } = await loadSession(status, this.threads, { home: this.home, cacheDir: this.cacheDir });
     const vectors = [];
     for (let offset = 0; offset < input.length; offset += this.batchSize) {
       const batch = input.slice(offset, offset + this.batchSize).map((value) => tokenizer.encode(value));

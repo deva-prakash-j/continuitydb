@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { ContextVault } from "./store.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { VERSION } from "./version.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity, TokenBucketLimiter } from "./security.js";
 import { createApiClientFromEnv } from "./http-client.js";
@@ -58,7 +59,7 @@ export function createContinuityMcpServer(options = {}) {
     maxPrincipals: 10_000,
   });
   const server = new McpServer(
-    { name: "continuitydb", version: "0.6.0" },
+    { name: "continuitydb", version: VERSION },
     { instructions: MCP_SERVER_INSTRUCTIONS },
   );
   const canRead = identity.scopes.includes("memory:read") || identity.scopes.includes("memory:admin");
@@ -284,7 +285,7 @@ export async function runStdioMcp(options = {}) {
   return runtime;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && import.meta.url === `file://${process.argv[1]}`) {
   const runtime = await runStdioMcp();
   const shutdown = async () => {
     await runtime.server.close().catch(() => {});

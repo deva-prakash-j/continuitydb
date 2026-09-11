@@ -9,6 +9,8 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
+import { acquireVaultInitializationLock } from "./file-lock.js";
 import {
   freshnessScore,
   maxMarginalRelevance,
@@ -425,15 +427,28 @@ function withSqliteBusyRetry(operation, timeoutMs = 15_000) {
 }
 
 export class ContextVault {
-  constructor(rootDir = process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb")) {
+  constructor(
+    rootDir = process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb"),
+    { readOnly = false } = {},
+  ) {
     this.rootDir = rootDir;
     this.recordsDir = join(rootDir, "records");
     this.indexDir = join(rootDir, "index");
     this.linksPath = join(rootDir, "project-links.json");
     this.auditPath = join(rootDir, "audit.jsonl");
     this.transactionDepth = 0;
-    mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
+    if (readOnly) {
+      const databaseUrl = pathToFileURL(join(this.indexDir, "context-vault.db"));
+      databaseUrl.searchParams.set("immutable", "1");
+      this.db = new DatabaseSync(databaseUrl.href, { readOnly: true });
+      this.db.exec("PRAGMA foreign_keys = ON;");
+      return;
+    }
+
+    const releaseInitializationLock = acquireVaultInitializationLock(rootDir);
+    try {
+      mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
+      mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
 
     this.db = new DatabaseSync(join(this.indexDir, "context-vault.db"));
     // Configure the busy handler before WAL or schema initialization. WAL mode
@@ -645,7 +660,10 @@ export class ContextVault {
     const indexed = this.db.prepare("SELECT count(*) AS count FROM memory_records").get().count;
     const canonicalCount = readdirSync(this.recordsDir).filter((name) => name.endsWith(".md")).length;
     if (Number(indexed) === 0 && canonicalCount > 0) this.rebuildIndex();
-    this.loadProjectLinks();
+      this.loadProjectLinks();
+    } finally {
+      releaseInitializationLock();
+    }
   }
 
   migrateLegacySchema() {

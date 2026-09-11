@@ -5,6 +5,16 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Added a Node single-executable build that includes the runtime, SQLite,
+  ContinuityDB application, and integrity-pinned ONNX/WASM inference runtime.
+- Added versioned user-scoped self-install with no shell-profile mutation and
+  safe refusal to overwrite unmanaged launchers.
+- Added `setup`, `agents detect/status/connect/disconnect`, `run`, bundled
+  `hook`, and `version` commands for end-to-end binary operation.
+- Added idempotent, backup-preserving project configuration for Codex, Claude
+  Code, OpenCode, Cursor, and VS Code Copilot without storing token values.
+- Added Linux binary and semantic inference smoke tests plus a native
+  Linux/macOS/Windows release matrix, checksums, and provenance attestations.
 - Added scope-filtered MCP tool discovery with explicit read-only/non-destructive
   annotations for GitHub Copilot and other safety-aware clients.
 - Added authenticated stateful Streamable HTTP MCP sessions with identity
@@ -41,9 +51,6 @@ after the first stable release.
   CLI `--home`.
 - Changed legacy audit migration to validate and preserve existing event hashes and
   report historical corruption or SQLite/JSONL divergence instead of rewriting evidence.
-- Distributed store/query adapters and large-scale load harness.
-- Sandboxed Tree-sitter workers and Git staleness projector.
-- mTLS identity adapter and compliance purge coordinator.
 
 ## [0.5.0] - 2026-09-10
 

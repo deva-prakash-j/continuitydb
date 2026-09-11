@@ -15,7 +15,7 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.6 alpha. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.7 alpha candidate. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
 > production adapter and billion-record proof do not exist yet. Remote MCP and
@@ -24,29 +24,31 @@ returned.
 
 ### Verification status
 
-The v0.6 runtime at
-[`2c9df03`](https://github.com/deva-prakash-j/continuitydb/commit/2c9df0399dce5d31173aebe0769a81cf0dcc739b)
-and its documentation-only evidence attestation at
-[`266d856`](https://github.com/deva-prakash-j/continuitydb/commit/266d856fea0c6ba106de7cef2ad737e2a46a7d9b)
-passed the independent Astraea strict QA gate:
+The v0.7 release candidate at `8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`
+has passed its builder and supported-native CI gates:
 
-- final verdict: **PASS**, with no P0/P1 release blockers;
-- full automated suite: **76/76 passing**, with 0 failed and 0 skipped;
-- focused security suite: **16/16 passing**;
-- focused client-interoperability suite: **11/11 passing**;
+- full automated suite: **125/125 passing**, with 0 failed and 0 skipped;
 - OpenAPI validation: **20 paths**;
-- installed Codex CLI `0.147.0`: authenticated Streamable HTTP MCP
-  initialization and `tools/list` verified;
 - exact lexical Recall@5: **9/9**, with **0 isolation violations**;
 - dependency audit: **0 known production vulnerabilities**;
-- package dry-run: **71 files**; exact candidate sizes are recorded in the
-  linked verification evidence.
+- package dry-run: **86 files**;
+- Linux x64, macOS arm64, and Windows x64 standalone executables: native
+  functional smoke, local semantic inference, checksum, and artifact upload
+  **terminal green**;
+- Node 22/24, container, and Linux binary CI: **terminal green**.
 
-See the exact commands, environment, artifact identity, and evidence boundaries
-in the [v0.6 verification record](docs/build-verification-2026-09-11-v0.6.md).
-The Codex result is transport/discovery evidence, not a model-triggered tool-call
-proof; hosted Copilot, Claude Code, and OpenCode remain contract-tested until
-their real-client runs are captured.
+The candidate serializes ContinuityDB-controlled setup, first-open, connector,
+model-cache, and installer operations with crash-released SQLite transaction
+locks plus compare-and-swap rollback. Direct edits made by programs that do not
+participate in the lock protocol are rechecked immediately before replacement,
+but do not receive a portable cross-process transaction guarantee.
+
+See the exact commands, GitHub run URLs, artifact digests, environment, and
+evidence boundaries in the
+[v0.7 verification record](docs/build-verification-2026-09-11-v0.7.md).
+The independent Astraea verdict remains the final release gate. Intel macOS
+uses the npm distribution because upstream Node 25 SEA executables
+[segfault on x64 macOS](https://github.com/nodejs/node/issues/62893).
 
 ## The problem
 
@@ -141,6 +143,10 @@ and credentials when their trust domains differ.
 
 ### Interfaces and operations
 
+- standalone Linux, macOS, and Windows binary build pipeline with the Node
+  runtime and local ONNX/WASM inference runtime included;
+- idempotent user-scoped self-install plus CLI-managed project connections for
+  Codex, Claude Code, OpenCode, Cursor, and VS Code Copilot;
 - six scope-filtered agent-facing MCP tools, including structured handoff save/retrieval;
 - stateful Streamable HTTP MCP at `/mcp`, plus local stdio and HTTP-backed thin-stdio modes;
 - explicit MCP safety annotations, server instructions, bearer/OIDC identity binding,
@@ -176,6 +182,86 @@ and credentials when their trust domains differ.
 See the [architecture](docs/architecture.md) and
 [competitor-derived capability review](docs/competitive-research-2026-09-09.md)
 for design details and deliberate exclusions.
+
+## Standalone binary quick start
+
+The standalone executable does not require system Node.js or npm. Release
+automation builds native artifacts for Linux x64, macOS arm64, and Windows x64.
+Intel macOS is not published because upstream Node 25 SEA executables
+[segfault on x64 macOS](https://github.com/nodejs/node/issues/62893). Every
+supported artifact receives a SHA-256 sidecar and GitHub build-provenance
+attestation. Every successful push to `main` creates a commit-bound prerelease
+with all supported native binaries; workflow reruns update the same release
+idempotently. Pushed `v*` tags create stable releases. Intel macOS remains
+npm-only until upstream Node SEA support is available.
+
+After downloading the artifact for your platform, verify its `.sha256` sidecar,
+then preview and apply a user-scoped installation:
+
+```bash
+chmod +x ./continuitydb-linux-x64
+./continuitydb-linux-x64 install
+./continuitydb-linux-x64 install --apply
+
+export PATH="$HOME/.local/bin:$PATH"
+continuitydb version
+```
+
+`install` writes a versioned executable below `~/.local/lib/continuitydb` and
+atomically updates `~/.local/bin/continuitydb`. It does not edit shell profiles
+or replace an unmanaged launcher unless `--force` is explicit. Windows defaults
+to `%LOCALAPPDATA%\\ContinuityDB`.
+
+From a repository, initialize a private vault and connect every installed
+supported client. Both commands initialize the private vault; the first only
+previews client-config changes, while the second creates backups and applies
+them:
+
+```bash
+continuitydb setup --agents detected --project-dir "$PWD"
+continuitydb setup --agents detected --project-dir "$PWD" --apply
+
+# Or generate all five supported project configurations:
+continuitydb setup --agents all --project-dir "$PWD" --apply
+
+continuitydb agents status --project-dir "$PWD"
+continuitydb run
+```
+
+By default every project points at the same platform user-data vault:
+`~/.local/share/continuitydb` on Linux, `~/Library/Application Support/ContinuityDB`
+on macOS, and `%LOCALAPPDATA%\\ContinuityDB\\data` on Windows. `--home` remains
+an explicit override. Add `--semantic` to `setup` to download and verify the pinned 34.2 MB local
+embedding model. The binary already contains the integrity-pinned ONNX/WASM
+runtime, so no separate inference package is installed.
+
+The generated project files are:
+
+| Client | Managed project file |
+|---|---|
+| Codex | `.codex/config.toml` managed block |
+| Claude Code | `.mcp.json` → `mcpServers.continuitydb` |
+| OpenCode | `opencode.json` → `mcp.continuitydb` |
+| Cursor | `.cursor/mcp.json` → `mcpServers.continuitydb` |
+| VS Code Copilot | `.vscode/mcp.json` → `servers.continuitydb` |
+
+Single-client writes are atomic. Multi-client `setup` and `agents connect`
+operations use a two-phase batch: every selected JSON/TOML file, managed
+namespace, marker, path, and rendered output is validated before the first
+client file changes. If a later filesystem write still fails, earlier client
+changes and newly created config directories are rolled back. Symlinked config
+paths are rejected, existing files are backed up privately below the vault, and
+rerunning setup is idempotent. Static secrets are never written: remote configs
+store only a token environment variable reference. Disconnect removes only the
+ContinuityDB-owned entry:
+
+```bash
+continuitydb agents disconnect codex --project-dir "$PWD"
+continuitydb agents disconnect codex --project-dir "$PWD" --apply
+```
+
+See [binary distribution and setup](docs/binary-distribution.md) for build,
+checksum, remote transport, recovery, and platform details.
 
 ## Quick start from source
 
@@ -437,10 +523,18 @@ Run `continuitydb help` for the concise built-in usage text.
 
 | Command | Purpose |
 |---|---|
+| `version` | Show CLI version, embedded runtime mode, platform, and architecture |
+| `install` | Preview or apply a versioned user-scoped standalone-binary installation |
+| `setup` | Initialize a vault and preview/apply detected or selected agent connections |
 | `init` | Create a private local data directory and embedded database |
 | `doctor` | Check Node version, directory permissions, SQLite/FTS5, and audit-chain health |
-| `serve` | Start the HTTP service |
+| `run` / `serve` | Start the foreground HTTP and Streamable MCP service |
+| `agents detect` | Find supported client executables without running them |
+| `agents status` | Report project connection state for all supported clients |
+| `agents connect` | Preview/apply one or all project-scoped MCP configurations |
+| `agents disconnect` | Preview/remove only the ContinuityDB-managed configuration |
 | `mcp` | Start the stdio MCP server |
+| `hook` | Run bundled Claude/Cursor lifecycle hook operations from the same binary |
 | `propose` | Create a memory that remains invisible to recall |
 | `capture` | Apply automatic capture policy as an agent identity |
 | `commit` | Activate a proposed memory through the trusted CLI/admin path |

@@ -1,13 +1,44 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import {
+  chmodSync,
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { ContextVault } from "./store.js";
 import { createContinuityServer } from "./http-server.js";
 import { scanRepository } from "./repo-ingest.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
-import { ensureLocalModel, localModelStatus } from "./local-embeddings.js";
+import {
+  acquireLocalModelCacheLock,
+  ensureLocalModel,
+  localModelStatus,
+  restoreLocalModelCache,
+  snapshotLocalModelCache,
+} from "./local-embeddings.js";
+import {
+  connectAgents,
+  connectionStatus,
+  detectAgents,
+  disconnectAgents,
+  SUPPORTED_AGENTS,
+} from "./agent-connectors.js";
+import { isStandaloneBinary } from "./binary-runtime.js";
+import { installStandaloneBinary } from "./self-install.js";
+import { VERSION } from "./version.js";
+import { defaultDataHome, hasPrivateDirectoryPermissions } from "./paths.js";
+import { acquireVaultInitializationLock } from "./file-lock.js";
 
 function parse(argv) {
   const positional = [];
@@ -44,10 +75,18 @@ function usage() {
   process.stdout.write(`ContinuityDB — portable context graph for AI agents
 
 Usage:
+  continuitydb version
+  continuitydb install [--prefix PATH] --apply
+  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--apply]
   continuitydb init [--home PATH]
   continuitydb doctor [--home PATH]
-  continuitydb serve [--home PATH] [--host HOST] [--port PORT] [--review-ui]
+  continuitydb run [--home PATH] [--host HOST] [--port PORT] [--review-ui]
+  continuitydb agents detect
+  continuitydb agents status [--project-dir PATH]
+  continuitydb agents connect AGENT|all [--project-dir PATH] [--transport stdio|http] [--url URL] --apply
+  continuitydb agents disconnect AGENT|all [--project-dir PATH] --apply
   continuitydb mcp [--home PATH]
+  continuitydb hook session-start|checkpoint [HOOK OPTIONS]
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
   continuitydb capture --body TEXT --project ID [--kind working|inference|git-fact|decision]
   continuitydb commit MEMORY_ID
@@ -73,40 +112,383 @@ commit, correct, delete and graph administration remain unavailable over MCP.
 `);
 }
 
-const { positional, flags } = parse(process.argv.slice(2));
+const rawArguments = process.argv.slice(2);
+const { positional, flags } = parse(rawArguments);
 const command = positional.shift();
-const home = resolve(flags.home || process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb"));
+const home = resolve(flags.home || defaultDataHome());
 const cliTenantId = process.env.CONTINUITYDB_TENANT_ID || "local";
 const cliPrincipalId = process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user";
 const cliOwnerId = process.env.CONTINUITYDB_OWNER_ID || cliPrincipalId;
 const cliAgentId = process.env.CONTINUITYDB_AGENT_ID || null;
+const SETUP_MUTATED_PATHS = Object.freeze(["config.json", "records", "index", "models"]);
 
 if (!command || command === "help" || flags.help) {
   usage();
   process.exit(0);
 }
 
-try {
-  if (command === "init") {
-    mkdirSync(home, { recursive: true, mode: 0o700 });
-    const configPath = join(home, "config.json");
+function agentSelection(value) {
+  const requested = listFlag(value || "detected");
+  if (requested.includes("all")) return [...SUPPORTED_AGENTS];
+  if (requested.includes("detected")) return detectAgents().filter((item) => item.installed).map((item) => item.client);
+  const unsupported = requested.filter((item) => !SUPPORTED_AGENTS.includes(item));
+  if (unsupported.length) throw new Error(`unsupported agents: ${unsupported.join(", ")}`);
+  return [...new Set(requested)];
+}
+
+function agentOptions() {
+  return {
+    home,
+    projectDir: resolve(flags.project_dir || process.cwd()),
+    binary: flags.binary || null,
+    ownerId: flags.owner || cliOwnerId,
+    tenantId: flags.tenant || cliTenantId,
+    projects: listFlag(flags.projects || flags.project),
+    sensitivities: listFlag(flags.sensitivities || "public,private"),
+    transport: flags.transport || "stdio",
+    url: flags.url,
+    tokenEnv: flags.token_env,
+    apply: Boolean(flags.apply),
+  };
+}
+
+function assertSetupHome(path) {
+  if (!existsSync(path)) return;
+  const metadata = lstatSync(path);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`setup home must be a real directory, not a symlink: ${path}`);
+  }
+}
+
+function copySetupPath(source, destination) {
+  const metadata = lstatSync(source);
+  if (metadata.isSymbolicLink()) throw new Error(`setup state must not contain a symlink: ${source}`);
+  if (!metadata.isFile() && !metadata.isDirectory()) {
+    throw new Error(`setup state must contain only regular files and directories: ${source}`);
+  }
+  if (metadata.isDirectory()) {
+    mkdirSync(destination, { mode: metadata.mode & 0o777 });
+    for (const name of readdirSync(source)) copySetupPath(join(source, name), join(destination, name));
+    return;
+  }
+  cpSync(source, destination, {
+    recursive: false,
+    dereference: false,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+}
+
+function snapshotSetupHome(home, paths = SETUP_MUTATED_PATHS) {
+  const directory = mkdtempSync(join(dirname(home), `.${basename(home)}.rollback-`));
+  chmodSync(directory, 0o700);
+  const entries = [];
+  try {
+    for (const name of paths) {
+      const source = join(home, name);
+      if (!existsSync(source)) continue;
+      copySetupPath(source, join(directory, name));
+      entries.push(name);
+    }
+    return { directory, entries, home, paths: [...paths] };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function discardSetupSnapshot(snapshot) {
+  if (snapshot?.directory && existsSync(snapshot.directory)) {
+    rmSync(snapshot.directory, { recursive: true, force: true });
+  }
+}
+
+function setupPathMatches(left, right) {
+  const leftExists = existsSync(left);
+  const rightExists = existsSync(right);
+  if (leftExists !== rightExists) return false;
+  if (!leftExists) return true;
+  const leftMetadata = lstatSync(left);
+  const rightMetadata = lstatSync(right);
+  if (leftMetadata.isSymbolicLink() || rightMetadata.isSymbolicLink()) return false;
+  if (leftMetadata.isFile() !== rightMetadata.isFile() || leftMetadata.isDirectory() !== rightMetadata.isDirectory()) return false;
+  if ((leftMetadata.mode & 0o777) !== (rightMetadata.mode & 0o777)) return false;
+  if (leftMetadata.isFile()) return readFileSync(left).equals(readFileSync(right));
+  const leftNames = readdirSync(left).sort();
+  const rightNames = readdirSync(right).sort();
+  if (leftNames.length !== rightNames.length || leftNames.some((name, index) => name !== rightNames[index])) return false;
+  return leftNames.every((name) => setupPathMatches(join(left, name), join(right, name)));
+}
+
+function restoreSetupSnapshot(snapshot, expectedCurrent = null) {
+  if (!snapshot) return;
+  if (expectedCurrent) {
+    const conflicts = snapshot.paths.filter((name) => !setupPathMatches(
+      join(snapshot.home, name),
+      join(expectedCurrent.directory, name),
+    ));
+    if (conflicts.length) {
+      throw new Error(`rollback conflict: setup state changed concurrently: ${conflicts.map((name) => join(snapshot.home, name)).join(", ")}`);
+    }
+  }
+  const originals = new Set(snapshot.entries);
+  for (const name of [...snapshot.paths].reverse()) {
+    const target = join(snapshot.home, name);
+    if (existsSync(target)) {
+      const metadata = lstatSync(target);
+      if (metadata.isSymbolicLink()) throw new Error(`refusing to replace setup symlink during rollback: ${target}`);
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+  for (const name of snapshot.paths) {
+    if (!originals.has(name)) continue;
+    copySetupPath(join(snapshot.directory, name), join(snapshot.home, name));
+  }
+  discardSetupSnapshot(snapshot);
+}
+
+function inspectExistingVault(home) {
+  const databasePath = join(home, "index", "context-vault.db");
+  if (!existsSync(databasePath)) return null;
+  const metadata = lstatSync(databasePath);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`vault database must be a regular file, not a symlink: ${databasePath}`);
+  }
+  const vault = new ContextVault(home, { readOnly: true });
+  try {
+    return vault.stats();
+  } finally {
+    vault.close();
+  }
+}
+
+async function synchronizeSetupSnapshotForTest(snapshot) {
+  if (process.env.CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC !== "1") return;
+  if (process.env.NODE_ENV !== "test" || typeof process.send !== "function") {
+    throw new Error("setup snapshot synchronization is available only to IPC test children");
+  }
+  process.send({ type: "continuitydb:setup-snapshot", directory: snapshot.directory });
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("timed out waiting for setup snapshot test resume")), 30_000);
+    process.once("message", (message) => {
+      clearTimeout(timeout);
+      if (message !== "continuitydb:resume-setup") {
+        reject(new Error("invalid setup snapshot test resume message"));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function rollbackInitializedSetup(initialized) {
+  if (initialized.created) {
+    if (existsSync(initialized.home)) rmSync(initialized.home, { recursive: true, force: true });
+  } else {
+    restoreSetupSnapshot(initialized.vaultSnapshot, initialized.expectedVaultSnapshot);
+  }
+}
+
+async function initializeSetupHome(home, flags) {
+  assertSetupHome(home);
+  const existed = existsSync(home);
+  const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
+  let target = home;
+  let staging = null;
+  let vaultSnapshot = null;
+  let existingStats = null;
+  let expectedVaultSnapshot = null;
+  let modelCacheWritten = null;
+  const modelCacheSnapshot = flags.semantic && (existed || configuredCache)
+    ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
+    : null;
+
+  if (existed) {
+    existingStats = inspectExistingVault(home);
+    const paths = existingStats
+      ? [
+        ...(!existsSync(join(home, "config.json")) ? ["config.json"] : []),
+      ]
+      : SETUP_MUTATED_PATHS.filter((name) => name !== "models");
+    vaultSnapshot = snapshotSetupHome(home, paths);
+    await synchronizeSetupSnapshotForTest(vaultSnapshot);
+  } else {
+    mkdirSync(dirname(home), { recursive: true, mode: 0o700 });
+    staging = mkdtempSync(join(dirname(home), `.${basename(home)}.setup-`));
+    chmodSync(staging, 0o700);
+    target = staging;
+  }
+
+  try {
+    const configPath = join(target, "config.json");
+    let createdConfig = false;
     if (!existsSync(configPath)) {
       writeFileSync(configPath, `${JSON.stringify({
-        schema_version: 1,
+        schema_version: 2,
         mode: "local",
-        tenant_id: "local",
+        tenant_id: flags.tenant || cliTenantId,
+        owner_id: flags.owner || cliOwnerId,
         created_at: new Date().toISOString(),
       }, null, 2)}\n`, { mode: 0o600 });
+      createdConfig = true;
     }
-    const vault = new ContextVault(home);
-    const stats = vault.stats();
-    vault.close();
-    output({ initialized: true, home, config: configPath, stats });
+    if (vaultSnapshot && !createdConfig && existingStats) {
+      vaultSnapshot.paths = vaultSnapshot.paths.filter((name) => name !== "config.json");
+    }
+    let stats = existingStats;
+    if (!stats) {
+      const vault = new ContextVault(target);
+      stats = vault.stats();
+      vault.close();
+    }
+    if (vaultSnapshot) expectedVaultSnapshot = snapshotSetupHome(home, vaultSnapshot.paths);
+    let embeddings = null;
+    if (flags.semantic) {
+      embeddings = await ensureLocalModel({ home: target, cacheDir: configuredCache });
+      if (modelCacheSnapshot) {
+        modelCacheWritten = snapshotLocalModelCache({ home: target, cacheDir: configuredCache });
+      }
+    }
+    if (staging) {
+      if (existsSync(home)) throw new Error(`setup home appeared while initialization was in progress: ${home}`);
+      renameSync(staging, home);
+      staging = null;
+      if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
+    }
+    return { stats, embeddings, created: !existed, home, vaultSnapshot, expectedVaultSnapshot, modelCacheSnapshot, modelCacheWritten };
+  } catch (error) {
+    if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
+    const rollbackErrors = [];
+    if (existed) {
+      try { restoreSetupSnapshot(vaultSnapshot, expectedVaultSnapshot); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    if (modelCacheSnapshot && modelCacheWritten) {
+      try { restoreLocalModelCache(modelCacheSnapshot, modelCacheWritten); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
+    discardSetupSnapshot(expectedVaultSnapshot);
+    if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup initialization failed and rollback was incomplete");
+    throw error;
+  }
+}
+
+try {
+  if (command === "version") {
+    output({ version: VERSION, standalone: isStandaloneBinary(), node: process.version, platform: process.platform, arch: process.arch });
+  } else if (command === "install") {
+    output(installStandaloneBinary({ prefix: flags.prefix, apply: Boolean(flags.apply), force: Boolean(flags.force) }));
+  } else if (command === "setup") {
+    const selected = agentSelection(flags.agents);
+    const connectionOptions = agentOptions();
+    // Setup must fail without touching the global vault when any client
+    // configuration cannot be parsed or safely rendered.
+    const previewConnections = connectAgents(selected, { ...connectionOptions, apply: false });
+    const configPath = join(home, "config.json");
+    if (!connectionOptions.apply) {
+      output({
+        setup: true,
+        preview: true,
+        home,
+        config: configPath,
+        stats: null,
+        detected_agents: detectAgents(),
+        connections: previewConnections,
+        embeddings: flags.semantic ? { planned: true, provider: "local" } : null,
+        applied: false,
+        run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
+      });
+      process.exit(0);
+    }
+
+    const releaseInitializationLock = acquireVaultInitializationLock(home);
+    const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
+    let releaseModelCacheLock = null;
+    try {
+      releaseModelCacheLock = flags.semantic
+        ? acquireLocalModelCacheLock({ home, cacheDir: configuredCache })
+        : null;
+      const initialized = await initializeSetupHome(home, flags);
+      let connections;
+      try {
+        // Hold the vault initialization lock until connector commit succeeds or
+        // setup-owned state is restored. A concurrent first-open waits here,
+        // then initializes against the final state instead of being rewound.
+        connections = connectAgents(selected, connectionOptions);
+      } catch (error) {
+        const rollbackErrors = [];
+        try { rollbackInitializedSetup(initialized); }
+        catch (rollbackError) { rollbackErrors.push(rollbackError); }
+        if (initialized.modelCacheSnapshot && initialized.modelCacheWritten) {
+          try { restoreLocalModelCache(initialized.modelCacheSnapshot, initialized.modelCacheWritten); }
+          catch (rollbackError) { rollbackErrors.push(rollbackError); }
+        }
+        discardSetupSnapshot(initialized.expectedVaultSnapshot);
+        if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");
+        throw error;
+      }
+      discardSetupSnapshot(initialized.vaultSnapshot);
+      discardSetupSnapshot(initialized.expectedVaultSnapshot);
+      output({
+        setup: true,
+        home,
+        config: configPath,
+        stats: initialized.stats,
+        detected_agents: detectAgents(),
+        connections,
+        embeddings: initialized.embeddings,
+        applied: Boolean(flags.apply),
+        run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
+      });
+    } finally {
+      try { if (releaseModelCacheLock) releaseModelCacheLock(); }
+      finally { releaseInitializationLock(); }
+    }
+  } else if (command === "agents") {
+    const action = positional.shift() || "status";
+    if (action === "detect") output({ agents: detectAgents() });
+    else if (action === "status") output({ agents: connectionStatus(agentOptions()) });
+    else if (action === "connect" || action === "disconnect") {
+      const selected = agentSelection(positional.shift() || flags.agents || "detected");
+      const operation = action === "connect" ? connectAgents : disconnectAgents;
+      output({ action, applied: Boolean(flags.apply), results: operation(selected, agentOptions()) });
+    } else throw new Error(`unknown agents action: ${action}`);
+  } else if (command === "hook") {
+    const { runLifecycleHook } = await import("./lifecycle-hook.js");
+    process.exitCode = await runLifecycleHook(rawArguments.slice(1));
+  } else if (command === "init") {
+    const releaseInitializationLock = acquireVaultInitializationLock(home);
+    try {
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const configPath = join(home, "config.json");
+      if (!existsSync(configPath)) {
+        writeFileSync(configPath, `${JSON.stringify({
+          schema_version: 1,
+          mode: "local",
+          tenant_id: "local",
+          created_at: new Date().toISOString(),
+        }, null, 2)}\n`, { mode: 0o600 });
+      }
+      const vault = new ContextVault(home);
+      const stats = vault.stats();
+      vault.close();
+      output({ initialized: true, home, config: configPath, stats });
+    } finally {
+      releaseInitializationLock();
+    }
   } else if (command === "doctor") {
     const checks = [];
     checks.push({ name: "node", ok: Number(process.versions.node.split(".")[0]) >= 22, value: process.version });
     checks.push({ name: "home", ok: existsSync(home), value: home });
-    if (existsSync(home)) checks.push({ name: "home_permissions", ok: (statSync(home).mode & 0o077) === 0, value: (statSync(home).mode & 0o777).toString(8) });
+    if (existsSync(home)) {
+      const mode = statSync(home).mode;
+      checks.push({
+        name: "home_permissions",
+        ok: hasPrivateDirectoryPermissions(mode),
+        value: process.platform === "win32" ? "managed by Windows ACL" : (mode & 0o777).toString(8),
+      });
+    }
     try {
       const vault = new ContextVault(home);
       const audit = vault.verifyAuditLog();
@@ -122,7 +504,7 @@ try {
     }
     output({ ok: checks.every((check) => check.ok), checks });
     if (!checks.every((check) => check.ok)) process.exitCode = 1;
-  } else if (command === "serve") {
+  } else if (command === "serve" || command === "run" || command === "start") {
     process.env.CONTINUITYDB_HOME = home;
     if (flags.review_ui) process.env.CONTINUITYDB_ENABLE_REVIEW_UI = "true";
     const service = createContinuityServer({
