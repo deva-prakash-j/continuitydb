@@ -14,6 +14,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
 
@@ -59,6 +60,37 @@ function parseJson(path) {
   const value = JSON.parse(text);
   if (!value || Array.isArray(value) || typeof value !== "object") throw new Error(`configuration root must be a JSON object: ${path}`);
   return value;
+}
+
+function isPlainObject(value) {
+  if (!value || Array.isArray(value) || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function managedJsonNamespace(value, key, path) {
+  if (value[key] === undefined) value[key] = {};
+  if (!isPlainObject(value[key])) {
+    throw new Error(`configuration namespace ${key} must be a JSON object: ${path}`);
+  }
+  return value[key];
+}
+
+function validateToml(text, path) {
+  if (!text.trim()) return;
+  try { parseToml(text); }
+  catch (error) { throw new Error(`invalid TOML configuration ${path}: ${error.message}`); }
+}
+
+function managedCodexBlock(text) {
+  const start = text.indexOf(CODEX_START);
+  const end = text.indexOf(CODEX_END);
+  const duplicateStart = start !== -1 && text.indexOf(CODEX_START, start + CODEX_START.length) !== -1;
+  const duplicateEnd = end !== -1 && text.indexOf(CODEX_END, end + CODEX_END.length) !== -1;
+  if ((start === -1) !== (end === -1) || duplicateStart || duplicateEnd || (start !== -1 && end < start)) {
+    throw new Error("invalid ContinuityDB managed block in Codex config");
+  }
+  return start === -1 ? null : { start, end };
 }
 
 function backupExisting(path, backupRoot, client) {
@@ -159,15 +191,16 @@ function codexBlock(options) {
   return `${lines.join("\n")}\n`;
 }
 
-function replaceManagedToml(text, block) {
-  const start = text.indexOf(CODEX_START);
-  const end = text.indexOf(CODEX_END);
-  if ((start === -1) !== (end === -1) || (start !== -1 && end < start)) throw new Error("invalid ContinuityDB managed block in Codex config");
-  const unmanaged = start === -1 ? text : `${text.slice(0, start)}${text.slice(end + CODEX_END.length)}`;
+function replaceManagedToml(text, block, path) {
+  validateToml(text, path);
+  const managed = managedCodexBlock(text);
+  const unmanaged = managed === null ? text : `${text.slice(0, managed.start)}${text.slice(managed.end + CODEX_END.length)}`;
   if (/^\s*\[mcp_servers\.continuitydb(?:\]|\.)/m.test(unmanaged)) {
     throw new Error("an unmanaged Codex continuitydb server already exists; remove or rename it before connecting");
   }
-  return `${unmanaged.trimEnd()}${unmanaged.trim() ? "\n\n" : ""}${block}`;
+  const output = `${unmanaged.trimEnd()}${unmanaged.trim() ? "\n\n" : ""}${block}`;
+  validateToml(output, path);
+  return output;
 }
 
 function jsonTarget(client, projectDir) {
@@ -182,23 +215,19 @@ function connectedJson(client, current, options) {
   const value = structuredClone(current);
   if (client === "opencode") {
     value.$schema ||= "https://opencode.ai/config.json";
-    value.mcp ||= {};
-    value.mcp.continuitydb = connection(client, options);
+    managedJsonNamespace(value, "mcp", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   } else if (client === "copilot") {
-    value.servers ||= {};
-    value.servers.continuitydb = connection(client, options);
+    managedJsonNamespace(value, "servers", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   } else {
-    value.mcpServers ||= {};
-    value.mcpServers.continuitydb = connection(client, options);
+    managedJsonNamespace(value, "mcpServers", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   }
   return value;
 }
 
-function disconnectedJson(client, current) {
+function disconnectedJson(client, current, path) {
   const value = structuredClone(current);
-  if (client === "opencode" && value.mcp) delete value.mcp.continuitydb;
-  else if (client === "copilot" && value.servers) delete value.servers.continuitydb;
-  else if (value.mcpServers) delete value.mcpServers.continuitydb;
+  const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
+  if (value[key] !== undefined) delete managedJsonNamespace(value, key, path).continuitydb;
   return value;
 }
 
@@ -229,7 +258,7 @@ export function connectAgent(client, rawOptions = {}) {
   let result;
   if (client === "codex") {
     const path = join(options.projectDir, ".codex", "config.toml");
-    const text = replaceManagedToml(readText(path), codexBlock(options));
+    const text = replaceManagedToml(readText(path), codexBlock(options), path);
     result = atomicWrite(path, text, { root: options.projectDir, home: options.home, client, apply: options.apply });
   } else {
     const path = jsonTarget(client, options.projectDir);
@@ -247,15 +276,17 @@ export function disconnectAgent(client, rawOptions = {}) {
   if (client === "codex") {
     const path = join(options.projectDir, ".codex", "config.toml");
     const current = readText(path);
-    const start = current.indexOf(CODEX_START);
-    const end = current.indexOf(CODEX_END);
-    const text = start === -1 || end === -1 ? current : `${current.slice(0, start)}${current.slice(end + CODEX_END.length)}`.trimStart();
+    validateToml(current, path);
+    const managed = managedCodexBlock(current);
+    const text = managed === null ? current
+      : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length)}`.trimStart();
+    validateToml(text, path);
     result = atomicWrite(path, text, { root: options.projectDir, home: options.home, client, apply: options.apply });
   } else {
     const path = jsonTarget(client, options.projectDir);
     if (!existsSync(path)) return { client, project_dir: options.projectDir, path, changed: false, applied: options.apply, backup: null };
     const current = parseJson(path);
-    result = atomicWrite(path, `${JSON.stringify(disconnectedJson(client, current), null, 2)}\n`, {
+    result = atomicWrite(path, `${JSON.stringify(disconnectedJson(client, current, path), null, 2)}\n`, {
       root: options.projectDir, home: options.home, client, apply: options.apply,
     });
   }
@@ -268,11 +299,14 @@ export function connectionStatus(rawOptions = {}) {
     const path = client === "codex" ? join(options.projectDir, ".codex", "config.toml") : jsonTarget(client, options.projectDir);
     try {
       if (!existsSync(path)) return { client, connected: false, path };
-      if (client === "codex") return { client, connected: readText(path).includes(CODEX_START), path };
+      if (client === "codex") {
+        const text = readText(path);
+        validateToml(text, path);
+        return { client, connected: managedCodexBlock(text) !== null, path };
+      }
       const value = parseJson(path);
-      const connected = client === "opencode" ? Boolean(value.mcp?.continuitydb)
-        : client === "copilot" ? Boolean(value.servers?.continuitydb)
-          : Boolean(value.mcpServers?.continuitydb);
+      const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
+      const connected = value[key] === undefined ? false : Boolean(managedJsonNamespace(value, key, path).continuitydb);
       return { client, connected, path };
     } catch (error) {
       return { client, connected: false, path, error: error.message };

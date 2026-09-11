@@ -255,7 +255,7 @@ async function loadSession(status, threads, options = {}) {
         throw error;
       }
       const embeddedRuntime = ensureEmbeddedOnnxRuntime(options);
-      if (embeddedRuntime) ort.env.wasm.wasmBinary = readFileSync(embeddedRuntime.wasm);
+      if (embeddedRuntime) ort.env.wasm.wasmBinary = embeddedRuntime.wasmBinary;
       ort.env.wasm.numThreads = threads;
       ort.env.wasm.proxy = false;
       const tokenizer = WordPieceTokenizer.fromFile(join(status.directory, "vocab.txt"));

@@ -242,7 +242,8 @@ The generated project files are:
 Writes are atomic, symlinked config paths are rejected, existing files are
 backed up privately below the vault, and rerunning setup is idempotent. Static
 secrets are never written: remote configs store only a token environment
-variable reference. Disconnect removes only the ContinuityDB-owned entry:
+variable reference. Malformed JSON/TOML and non-object managed namespaces are
+rejected before mutation. Disconnect removes only the ContinuityDB-owned entry:
 
 ```bash
 continuitydb agents disconnect codex --project-dir "$PWD"

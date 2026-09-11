@@ -58,6 +58,11 @@ The smoke test proves:
 Use `npm run test:binary:semantic` for the networked model pull plus real local
 WASM inference gate.
 
+Tagged-release automation applies the same gates on every native matrix target.
+For macOS, signing happens before both the ordinary binary smoke and semantic
+inference smoke. Checksums and artifact upload happen only after those blocking
+tests pass; publication depends on the complete native matrix.
+
 ## Install
 
 Preview first:
@@ -80,6 +85,10 @@ The installer:
 - refuses symlink traversal in the installation prefix;
 - refuses an unmanaged existing launcher unless `--force` is explicit;
 - does not edit shell profiles, request administrator access, or send data.
+
+The embedded ONNX WASM bytes are verified and supplied to the inference engine
+in memory. ContinuityDB does not extract an executable runtime through a cache
+directory, including when cache ancestors are symlinks.
 
 ## Set up a project and connect clients
 
@@ -129,6 +138,12 @@ Changed client files are backed up by content hash below:
 Disconnect removes only the managed ContinuityDB entry or Codex managed block;
 unrelated client configuration remains intact. If validation fails before an
 atomic rename, the original file remains authoritative.
+
+Existing JSON client files must contain object-shaped managed namespaces.
+Existing Codex TOML must parse cleanly and contain at most one well-formed
+ContinuityDB managed block. Connect, disconnect, and status operations fail
+closed on malformed structures instead of replacing or reporting success for
+an invalid user configuration.
 
 ## Release integrity
 

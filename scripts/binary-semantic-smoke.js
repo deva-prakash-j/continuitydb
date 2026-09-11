@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -10,7 +10,11 @@ const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
   || join("dist", `continuitydb-${process.platform}-${process.arch}${extension}`));
 const root = mkdtempSync(join(tmpdir(), "continuitydb-binary-semantic-"));
 const home = join(root, "vault");
-mkdirSync(home);
+const modelCache = join(home, "models");
+const outside = join(root, "outside");
+mkdirSync(modelCache, { recursive: true });
+mkdirSync(outside);
+symlinkSync(outside, join(modelCache, ".runtime"), process.platform === "win32" ? "junction" : "dir");
 
 function run(args, environment = {}) {
   const result = spawnSync(binary, args, {
@@ -41,6 +45,7 @@ try {
     "--home", home, "--project", "api", "--allow-projects", "api",
   ], environment);
   assert.equal(searched.results.length, 1);
+  assert.deepEqual(readdirSync(outside), [], "embedded runtime must not write through a cache symlink");
   process.stdout.write(`${JSON.stringify({
     passed: true,
     model_id: model.model_id,

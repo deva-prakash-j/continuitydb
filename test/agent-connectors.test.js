@@ -11,6 +11,9 @@ import {
   SUPPORTED_AGENTS,
 } from "../src/agent-connectors.js";
 
+const CODEX_START_FOR_TEST = "# >>> continuitydb managed configuration >>>";
+const CODEX_END_FOR_TEST = "# <<< continuitydb managed configuration <<<";
+
 function fixture() {
   const root = join(tmpdir(), `continuitydb-connectors-${process.pid}-${crypto.randomUUID()}`);
   const project = join(root, "project");
@@ -132,5 +135,57 @@ test("agent detection reads PATH without executing discovered programs", () => {
     assert.equal(detected.find((item) => item.client === "claude").installed, false);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("JSON connectors reject hostile managed namespaces without changing user files", () => {
+  const cases = [
+    ["claude", ".mcp.json", "mcpServers"],
+    ["cursor", join(".cursor", "mcp.json"), "mcpServers"],
+    ["opencode", "opencode.json", "mcp"],
+    ["copilot", join(".vscode", "mcp.json"), "servers"],
+  ];
+  for (const [client, relativePath, namespace] of cases) {
+    for (const hostile of [[], "invalid", 7, null]) {
+      const value = fixture();
+      try {
+        const path = join(value.project, relativePath);
+        mkdirSync(join(path, ".."), { recursive: true });
+        const original = `${JSON.stringify({ keep: true, [namespace]: hostile }, null, 2)}\n`;
+        writeFileSync(path, original);
+        assert.throws(() => connectAgent(client, options(value)), /namespace .* must be a JSON object/);
+        assert.equal(readFileSync(path, "utf8"), original);
+        assert.throws(() => disconnectAgent(client, options(value)), /namespace .* must be a JSON object/);
+        assert.equal(readFileSync(path, "utf8"), original);
+      } finally {
+        rmSync(value.root, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("Codex connector rejects malformed TOML and invalid managed markers without mutation", () => {
+  const malformed = [
+    "[broken\nvalue = true\n",
+    `${CODEX_START_FOR_TEST}\n`,
+    `${CODEX_END_FOR_TEST}\n`,
+    `${CODEX_END_FOR_TEST}\n${CODEX_START_FOR_TEST}\n`,
+    `${CODEX_START_FOR_TEST}\n${CODEX_START_FOR_TEST}\n${CODEX_END_FOR_TEST}\n`,
+    `${CODEX_START_FOR_TEST}\n${CODEX_END_FOR_TEST}\n${CODEX_END_FOR_TEST}\n`,
+  ];
+  for (const original of malformed) {
+    const value = fixture();
+    try {
+      const directory = join(value.project, ".codex");
+      const path = join(directory, "config.toml");
+      mkdirSync(directory, { recursive: true });
+      writeFileSync(path, original);
+      assert.throws(() => connectAgent("codex", options(value)), /invalid (TOML|ContinuityDB managed block)/);
+      assert.equal(readFileSync(path, "utf8"), original);
+      assert.throws(() => disconnectAgent("codex", options(value)), /invalid (TOML|ContinuityDB managed block)/);
+      assert.equal(readFileSync(path, "utf8"), original);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
   }
 });
