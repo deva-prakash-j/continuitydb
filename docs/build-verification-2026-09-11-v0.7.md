@@ -6,16 +6,18 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `58e271b16f46c8e1d43ca14f64bac2f7e1225da4`
+- **Runtime candidate tested:** `1653bea35a28c11560155c4ec44916c1c246d5ce`
+- **Release-workflow candidate tested:** `2e1eadc7f3119b48215549dd8b436e8c4a00afdf`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
-- **Linux binary size:** `143997992` bytes
+- **Linux binary size:** `144002088` bytes
 - **Linux binary SHA-256:**
-  `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06`
-- **Repository state:** `HEAD` exactly matched the runtime candidate and the
-  tracked worktree was clean after verification.
+  `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401`
+- **Repository state:** `HEAD` exactly matched the release-workflow candidate,
+  whose runtime tree descends from the runtime candidate above, and the tracked
+  worktree was clean after verification.
 
 This file is a documentation-only attestation created after the immutable
 runtime candidate was tested. Its later commit does not replace the tested
@@ -58,42 +60,42 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **121/121** primary Node tests passed with **0 failed** and **0 skipped**;
+- **123/123** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run on the runtime candidate completed with **86 files**,
-  approximately **151.6 kB** packed and **552.5 kB** unpacked;
+- package dry-run on the candidate completed with **86 files**,
+  approximately **153.0 kB** packed and **557.8 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
   shutdown, MCP initialization and six-tool discovery, capture, and retrieval;
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
-- the Linux executable is **143,997,992 bytes**, SHA-256
-  `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06`.
+- the Linux executable is **144,002,088 bytes**, SHA-256
+  `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`58e271b16f46c8e1d43ca14f64bac2f7e1225da4`:
+`2e1eadc7f3119b48215549dd8b436e8c4a00afdf`:
 
-- [release-binaries run 34622120306](https://github.com/deva-prakash-j/continuitydb/actions/runs/34622120306):
+- [release-binaries run 34624736165](https://github.com/deva-prakash-j/continuitydb/actions/runs/34624736165):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34622120156](https://github.com/deva-prakash-j/continuitydb/actions/runs/34622120156):
+- [CI run 34624736158](https://github.com/deva-prakash-j/continuitydb/actions/runs/34624736158):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 143,997,992 | `ee07197bc063d32e6bb60005ec964e781e360fd8e70271a3483ac96b76bc1c06` |
-| macOS arm64 | 147,759,328 | `083d663eb58135635837d3f2849fcaf0f75c7e0053118fd21e844eb69c7ac25c` |
-| Windows x64 | 110,745,088 | `c42374a62837fb4f99751d09b27673ad337ef9667c882e86347062b028da5d50` |
+| Linux x64 | 144,002,088 | `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401` |
+| macOS arm64 | 147,759,328 | `6322e4130143667fef889f7f95e2cec1bd649060fa27603d754d187ee4a2b3a5` |
+| Windows x64 | 110,745,600 | `3dac78517ec534bf20f2f8d0760384d675db9a5584010f4c65038e750b69394e` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -149,6 +151,12 @@ cached developer-workspace `dist/` artifact.
 - every CI or release workflow that uploads a native binary blocks publication
   until native functional and semantic binary smoke tests pass; macOS smoke
   tests run after signing;
+- every successful push to `main` creates a commit-bound prerelease containing
+  all supported binaries and checksum sidecars; reruns update that same release
+  idempotently, while pushed `v*` tags continue to create stable releases;
+- the publish job verifies the complete six-file native release set and every
+  SHA-256 sidecar before provenance attestation and publication, then queries
+  the GitHub Release and requires all expected assets after publication;
 - privileged release actions are pinned to immutable commit SHAs;
 - standalone fresh installs and forced upgrades are transactional across the
   versioned binary, launcher, backup artifacts, and created directories;

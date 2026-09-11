@@ -24,10 +24,10 @@ returned.
 
 ### Verification status
 
-The v0.7 runtime candidate at `58e271b16f46c8e1d43ca14f64bac2f7e1225da4`
+The v0.7 release candidate at `2e1eadc7f3119b48215549dd8b436e8c4a00afdf`
 has passed its builder and supported-native CI gates:
 
-- full automated suite: **121/121 passing**, with 0 failed and 0 skipped;
+- full automated suite: **123/123 passing**, with 0 failed and 0 skipped;
 - OpenAPI validation: **20 paths**;
 - exact lexical Recall@5: **9/9**, with **0 isolation violations**;
 - dependency audit: **0 known production vulnerabilities**;
