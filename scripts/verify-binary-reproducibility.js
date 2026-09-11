@@ -20,9 +20,11 @@ function run(command, args, options = {}) {
   return result.stdout;
 }
 
-function buildCleanCheckout(name) {
+function buildCleanCheckout(name, tempName) {
   const checkout = join(temporaryRoot, name);
+  const buildTemp = join(temporaryRoot, tempName);
   mkdirSync(checkout, { recursive: true, mode: 0o700 });
+  mkdirSync(buildTemp, { recursive: true, mode: 0o700 });
   const archive = spawnSync("git", ["archive", "--format=tar", "HEAD"], { cwd: root, maxBuffer });
   if (archive.status !== 0) throw new Error(archive.stderr?.toString() || "git archive failed");
   const extract = spawnSync("tar", ["-x", "-C", checkout], { input: archive.stdout, maxBuffer });
@@ -31,12 +33,19 @@ function buildCleanCheckout(name) {
   const outputDirectory = join(checkout, "dist-proof");
   run(process.execPath, [join(checkout, "scripts", "build-binary.js")], {
     cwd: checkout,
-    env: { ...process.env, CONTINUITYDB_BINARY_OUT: outputDirectory },
+    env: {
+      ...process.env,
+      TMPDIR: buildTemp,
+      TMP: buildTemp,
+      TEMP: buildTemp,
+      CONTINUITYDB_BINARY_OUT: outputDirectory,
+    },
   });
   const binary = join(outputDirectory, `continuitydb-${process.platform}-${process.arch}`);
   const bytes = readFileSync(binary);
   return {
     checkout,
+    buildTemp,
     binary,
     bytes: statSync(binary).size,
     sha256: createHash("sha256").update(bytes).digest("hex"),
@@ -44,14 +53,15 @@ function buildCleanCheckout(name) {
 }
 
 try {
-  const first = buildCleanCheckout("checkout-a");
-  const second = buildCleanCheckout("checkout-b");
+  const first = buildCleanCheckout("checkout-a", "tmp-a");
+  const second = buildCleanCheckout("checkout-b", "tmp-b");
   if (first.bytes !== second.bytes || first.sha256 !== second.sha256) {
     throw new Error(`clean-directory binaries differ: ${first.sha256} != ${second.sha256}`);
   }
   process.stdout.write(`${JSON.stringify({
     reproducible: true,
     directories: [first.checkout, second.checkout],
+    temporaryDirectories: [first.buildTemp, second.buildTemp],
     bytes: first.bytes,
     sha256: first.sha256,
   }, null, 2)}\n`);
