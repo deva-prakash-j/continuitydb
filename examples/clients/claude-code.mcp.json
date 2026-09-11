@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "continuitydb": {
+      "type": "http",
+      "url": "https://continuitydb.example/mcp",
+      "headers": {
+        "Authorization": "Bearer ${CONTINUITYDB_MCP_TOKEN}"
+      }
+    }
+  }
+}

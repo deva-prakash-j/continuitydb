@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "continuitydb": {
+      "type": "remote",
+      "url": "https://continuitydb.example/mcp",
+      "enabled": true,
+      "oauth": false,
+      "headers": {
+        "Authorization": "Bearer {env:CONTINUITYDB_MCP_TOKEN}"
+      },
+      "timeout": 30000
+    }
+  },
+  "plugin": ["./examples/clients/opencode-continuitydb.js"]
+}

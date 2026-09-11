@@ -5,6 +5,18 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Added scope-filtered MCP tool discovery with explicit read-only/non-destructive
+  annotations for GitHub Copilot and other safety-aware clients.
+- Added authenticated stateful Streamable HTTP MCP sessions with identity
+  binding, capacity/idle limits, explicit termination, and metrics.
+- Added static bearer and verified OIDC JWT service identities, OAuth protected
+  resource metadata, and versioned Codex, Copilot, Claude Code, and OpenCode
+  client configurations.
+- Added contract tests for client adapters, a real Codex CLI transport/discovery
+  probe, corrected Claude Code hook output, and an explicit-file-only OpenCode
+  lifecycle plugin.
+- Refused symlinked or replaced lifecycle checkpoint files in both the hook CLI
+  and OpenCode adapter before parsing or capture.
 - Revalidated held handoff lineage inside the approval transaction, returning
   HTTP 409 for stale successors and allowing exactly one winner under concurrent
   reviews; valid approvals receive a fresh sequence and bounded activation TTL.
@@ -31,7 +43,7 @@ after the first stable release.
   report historical corruption or SQLite/JSONL divergence instead of rewriting evidence.
 - Distributed store/query adapters and large-scale load harness.
 - Sandboxed Tree-sitter workers and Git staleness projector.
-- OIDC/mTLS identity adapter and compliance purge coordinator.
+- mTLS identity adapter and compliance purge coordinator.
 
 ## [0.5.0] - 2026-09-10
 

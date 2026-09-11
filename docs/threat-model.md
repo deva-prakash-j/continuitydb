@@ -17,17 +17,17 @@ or become a tool instruction.
 
 ## Primary threats and controls
 
-| Threat | Controls shipped in v0.5 | Production requirement |
+| Threat | Controls shipped in v0.6 | Production requirement |
 |---|---|---|
 | Cross-tenant/owner retrieval | tenant and shared owner included in every local lookup; project/sensitivity ACLs centralized; adversarial tests | owner-aware DB row-level security, per-backend filter assertions, tenant-router tests |
-| Agent self-approval | capture/propose/approve/admin scopes are split; MCP has no approve/admin tools; server chooses status and TTL | OIDC workload claims and organization policy distribution |
+| Agent self-approval | capture/propose/approve/admin scopes are split; MCP has no approve/admin tools; server chooses status and TTL; static and verified OIDC identities bind scopes server-side | organization policy distribution and independent reviewer identities |
 | Memory poisoning | project allowlists, bounded TTLs, confidence caps, atomic per-agent quota, transactional compare-and-set handoff lineage at capture and review approval, conflict quarantine and idempotency | semantic contradiction detection, anomaly detection, reputation and organization review queues |
 | Sensitive handoff bypass | every checkpoint passes capture policy and per-agent/project quota; private checkpoints expire; sensitive/restricted checkpoints remain held until an approval transaction revalidates lineage and assigns a bounded activation TTL | organization-specific classification and DLP |
 | Prompt injection in memory | warning on every context pack; content never interpreted as policy | provenance UI, content-risk labels, tool planner separation |
 | Credential ingestion | recursive common-pattern rejection before persistence and secret-path denylist | DLP provider, organization policy and incident flow |
 | SSRF through embedding config | endpoints come from server config; remote endpoints opt-in and HTTPS-only | egress allowlist/proxy and DNS rebinding protection |
 | Local model supply-chain drift | fixed repository and revision, size caps, pinned SHA-256 digests, atomic private cache, pinned WASM runtime | artifact attestations, SBOM and independent malware/model scanning |
-| Token theft | only SHA-256 token digests in policy; constant-time comparison; no token logging | OIDC/mTLS, rotation, revocation, secret manager, TLS termination |
+| Token theft | static policies store only SHA-256 digests; OIDC JWTs require verified signature, issuer, audience, expiry, subject and tenant; tokens are never logged | short-lived workload tokens, rotation/revocation operations, secret manager, TLS termination and optional mTLS |
 | DoS / memory exhaustion | request/body/candidate/vector/depth limits, timeouts, HTTP and MCP capture rate limits, per-agent/project record quota | distributed quotas, queue limits, circuit breakers and WAF |
 | Symlink/path escape or dirty-worktree misattribution during repo scan | committed Git blobs only; symlink tree entries denied; secret paths filtered | sandboxed workers, read-only mounts, resource limits |
 | Forged Git grounding | configured read-only root, allowed-ref ancestry, path, full-file SHA-256 and exact excerpt verification | signed ingest workers and organization-controlled repository attestations |
@@ -41,7 +41,8 @@ or become a tool instruction.
 - The HTTP service binds to loopback by default. Its implicit local identity is
   read/capture/feedback only unless the operator explicitly enables the review
   UI, which adds local review authority for that process.
-- A non-loopback bind refuses startup without a token policy and an explicit
+- A non-loopback bind refuses startup without a static token policy or complete
+  OIDC configuration, a canonical HTTPS public URL for OIDC, and an explicit
   assertion that TLS terminates at the trusted proxy.
 - Personal and employer data use separate tenants; higher-risk deployments should
   also use separate stores, keys and service identities.
@@ -49,9 +50,10 @@ or become a tool instruction.
   manager and never committed.
 - The supplied token-policy file is an inert shape example, not a usable secret.
 
-## Known v0.5 gaps
+## Known v0.6 gaps
 
-- Static token files do not provide enterprise lifecycle or revocation events.
+- Static token files do not provide enterprise lifecycle or revocation events;
+  OIDC deployment still needs organization-owned rotation and revocation policy.
 - Local SQLite content is not application-level encrypted; use encrypted volumes.
 - Regex secret detection is incomplete.
 - Regex symbol extraction is less precise than sandboxed Tree-sitter workers.

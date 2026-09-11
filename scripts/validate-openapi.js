@@ -9,6 +9,8 @@ assert.equal(document.info.version, manifest.version);
 for (const path of [
   "/healthz",
   "/readyz",
+  "/.well-known/oauth-protected-resource/mcp",
+  "/mcp",
   "/v1/search",
   "/v1/context-packs",
   "/v1/memories/proposals",
@@ -18,4 +20,5 @@ for (const path of [
   assert.ok(document.paths[path], `OpenAPI path missing: ${path}`);
 }
 assert.ok(document.components.securitySchemes.bearerAuth);
+assert.equal(document.components.securitySchemes.bearerAuth.bearerFormat, "opaque-or-JWT");
 process.stdout.write(`OpenAPI parsed: ${Object.keys(document.paths).length} paths\n`);

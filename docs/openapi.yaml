@@ -1,13 +1,60 @@
 openapi: 3.1.0
 info:
   title: ContinuityDB API
-  version: 0.5.0
-  description: Versioned API for governed, portable agent memory and context packs.
+  version: 0.6.0
+  description: Versioned REST and Streamable HTTP MCP API for governed, portable agent memory and context packs.
 servers:
   - url: http://127.0.0.1:7331
 security:
   - bearerAuth: []
 paths:
+  /.well-known/oauth-protected-resource/mcp:
+    get:
+      security: []
+      operationId: getMcpProtectedResourceMetadata
+      description: RFC 9728 protected-resource metadata, available when OIDC is configured.
+      responses:
+        "200":
+          description: OAuth protected-resource metadata for the MCP endpoint
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "404": { description: OIDC is not configured }
+  /mcp:
+    post:
+      operationId: handleMcpMessage
+      description: Stateful MCP Streamable HTTP JSON-RPC initialization, discovery, and tool calls.
+      parameters:
+        - $ref: "#/components/parameters/McpSessionId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, additionalProperties: true }
+                - { type: array, items: { type: object, additionalProperties: true } }
+      responses:
+        "200": { description: MCP JSON-RPC response }
+        "400": { description: Invalid MCP request or missing initialization }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: MCP session belongs to another identity }
+    get:
+      operationId: streamMcpMessages
+      description: Resume or receive messages for an initialized MCP session.
+      parameters:
+        - $ref: "#/components/parameters/McpSessionIdRequired"
+      responses:
+        "200": { description: MCP message stream or protocol response }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      operationId: terminateMcpSession
+      description: Explicitly terminate an initialized MCP session.
+      parameters:
+        - $ref: "#/components/parameters/McpSessionIdRequired"
+      responses:
+        "200": { description: MCP session terminated }
+        "401": { $ref: "#/components/responses/Unauthorized" }
   /healthz:
     get:
       security: []
@@ -260,7 +307,19 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
+      bearerFormat: opaque-or-JWT
+      description: Private static bearer credential or an OIDC JWT verified against the configured issuer, audience, and JWKS.
   parameters:
+    McpSessionId:
+      name: MCP-Session-Id
+      in: header
+      required: false
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{16,128}$" }
+    McpSessionIdRequired:
+      name: MCP-Session-Id
+      in: header
+      required: true
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{16,128}$" }
     MemoryId:
       name: id
       in: path

@@ -3,11 +3,13 @@ import { randomUUID } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { request as httpRequest } from "node:http";
 import test from "node:test";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
 import { ContinuityApiClient } from "../src/http-client.js";
-import { sha256 } from "../src/security.js";
+import { OidcAuthorizer, sha256 } from "../src/security.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-http-test-"));
@@ -28,6 +30,22 @@ function fixture() {
     enableReviewUi: true,
   });
   return { root, vault, service };
+}
+
+function rawRequest(url, { method = "GET", headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { method, headers }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.on("error", reject);
+    request.end();
+  });
 }
 
 test("HTTP API binds identity server-side and supports approved lifecycle", async () => {
@@ -293,6 +311,66 @@ test("central HTTP adapter authenticates with a host-injected bearer value", asy
   }
 });
 
+test("HTTP service accepts verified OIDC bearer identity and advertises protected-resource metadata", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-http-oidc-test-"));
+  const vault = new ContextVault(root);
+  const { privateKey, publicKey } = await generateKeyPair("RS256");
+  const jwk = await exportJWK(publicKey);
+  jwk.kid = "http-fixture-key";
+  const issuer = "http://127.0.0.1:9444";
+  const audience = "continuitydb-http-fixture";
+  const oidcAuthorizer = new OidcAuthorizer({
+    issuer,
+    audience,
+    jwks: createLocalJWKSet({ keys: [jwk] }),
+  });
+  const service = createContinuityServer({ vault, host: "127.0.0.1", port: 0, oidcAuthorizer });
+  try {
+    const address = await service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    const unauthorized = await fetch(`${base}/v1/search`, { method: "POST" });
+    assert.equal(unauthorized.status, 401);
+    assert.match(unauthorized.headers.get("www-authenticate"), /resource_metadata=/);
+    const metadata = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
+    assert.equal(metadata.status, 200);
+    assert.equal((await metadata.json()).authorization_servers[0], issuer);
+    const hostileMetadata = await rawRequest(`${base}/.well-known/oauth-protected-resource/mcp`, {
+      headers: { host: "attacker.example" },
+    });
+    assert.equal(hostileMetadata.status, 400);
+    const hostileUnauthorized = await rawRequest(`${base}/v1/search`, {
+      method: "POST",
+      headers: { host: "attacker.example" },
+    });
+    assert.equal(hostileUnauthorized.status, 401);
+    assert.doesNotMatch(hostileUnauthorized.headers["www-authenticate"], /resource_metadata=/);
+
+    const token = await new SignJWT({
+      continuitydb_tenant: "tenant-a",
+      continuitydb_owner: "owner-a",
+      continuitydb_agent: "claude",
+      continuitydb_projects: ["api"],
+      continuitydb_sensitivities: ["private"],
+      scope: "memory:read",
+    })
+      .setProtectedHeader({ alg: "RS256", kid: "http-fixture-key" })
+      .setSubject("agent-a")
+      .setIssuer(issuer)
+      .setAudience(audience)
+      .setExpirationTime("5m")
+      .sign(privateKey);
+    const authorized = await fetch(`${base}/v1/search`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ query: "nothing", project_id: "api" }),
+    });
+    assert.equal(authorized.status, 200);
+  } finally {
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("capture-only HTTP identity can auto-capture but cannot approve or administer", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-http-capture-test-"));
   const vault = new ContextVault(root);
@@ -425,6 +503,49 @@ test("non-loopback service refuses insecure startup", () => {
   const vault = new ContextVault(root);
   try {
     assert.throws(() => createContinuityServer({ vault, host: "0.0.0.0", port: 0 }), /token policy/);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("non-loopback static policy remains valid without OIDC public metadata configuration", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-http-static-remote-test-"));
+  const policy = join(root, "policy.json");
+  writeFileSync(policy, JSON.stringify({ tokens: [{
+    token_sha256: sha256("remote-static-fixture-token-long-enough"),
+    tenant_id: "tenant-a",
+    principal_id: "agent-a",
+    scopes: ["memory:read"],
+    allowed_projects: ["api"],
+    allowed_sensitivities: ["private"],
+  }] }), { mode: 0o600 });
+  chmodSync(policy, 0o600);
+  const vault = new ContextVault(join(root, "vault"));
+  try {
+    assert.doesNotThrow(() => createContinuityServer({
+      vault,
+      host: "0.0.0.0",
+      port: 0,
+      tokenPolicyPath: policy,
+      trustProxyTls: true,
+    }));
+    const fakeOidc = { issuer: "https://identity.example", authorize: async () => null };
+    assert.throws(() => createContinuityServer({
+      vault,
+      host: "0.0.0.0",
+      port: 0,
+      trustProxyTls: true,
+      oidcAuthorizer: fakeOidc,
+    }), /PUBLIC_URL/);
+    assert.throws(() => createContinuityServer({
+      vault,
+      host: "0.0.0.0",
+      port: 0,
+      trustProxyTls: true,
+      oidcAuthorizer: fakeOidc,
+      publicUrl: "https://continuitydb.example/base",
+    }), /origin without a path/);
   } finally {
     vault.close();
     rmSync(root, { recursive: true, force: true });

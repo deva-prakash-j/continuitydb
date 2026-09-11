@@ -1,6 +1,6 @@
 {
   "name": "continuitydb",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": false,
   "description": "Portable, Git-grounded context graph for AI agents",
   "type": "module",
@@ -52,6 +52,9 @@
     "cli": "node src/cli.js",
     "test": "node --test",
     "test:security": "node --test test/security.test.js test/http-server.test.js",
+    "test:clients": "node --test test/client-adapters.test.js test/lifecycle-hook.test.js test/mcp-server.test.js",
+    "test:codex-client": "node scripts/codex-client-probe.js",
+    "validate:clients": "node scripts/validate-client-adapters.js",
     "validate:openapi": "node scripts/validate-openapi.js",
     "benchmark": "node benchmarks/lexical-benchmark.js",
     "benchmark:scale": "node benchmarks/scale-benchmark.js",
@@ -59,10 +62,11 @@
     "benchmark:hybrid": "node benchmarks/hybrid-quality-benchmark.js",
     "benchmark:local": "node benchmarks/local-quality-benchmark.js",
     "benchmark:local:performance": "node benchmarks/local-embedding-benchmark.js",
-    "release:check": "npm test && npm run validate:openapi && npm run benchmark:quality && npm audit --omit=dev && npm pack --dry-run"
+    "release:check": "npm test && npm run validate:openapi && npm run validate:clients && npm run benchmark:quality && npm audit --omit=dev && npm pack --dry-run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
+    "jose": "6.2.12",
     "zod": "4.5.4"
   },
   "optionalDependencies": {

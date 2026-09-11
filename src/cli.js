@@ -138,7 +138,15 @@ try {
   } else if (command === "mcp") {
     process.env.CONTINUITYDB_HOME = home;
     process.env.CONTEXT_VAULT_HOME = home;
-    await import("./mcp-server.js");
+    const { runStdioMcp } = await import("./mcp-server.js");
+    const runtime = await runStdioMcp();
+    const shutdown = async () => {
+      await runtime.server.close().catch(() => {});
+      runtime.vault?.close();
+      process.exit(0);
+    };
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
   } else {
     const vault = new ContextVault(home);
     const embedder = createEmbedderFromEnv({

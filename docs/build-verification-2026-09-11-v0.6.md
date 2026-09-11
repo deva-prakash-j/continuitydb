@@ -1,0 +1,59 @@
+# v0.6 interoperability verification — 2026-09-11
+
+This record captures reproducible builder-side evidence. It does not approve
+the release: readiness requires an independent Astraea `PASS` against the exact
+immutable candidate commit.
+
+## Scope
+
+- scope-filtered MCP tool discovery and safety annotations;
+- authenticated stateful Streamable HTTP MCP at `/mcp`;
+- static bearer and verified OIDC JWT identities;
+- OAuth protected-resource metadata;
+- Codex, GitHub Copilot, Claude Code and OpenCode configurations;
+- Claude Code/Cursor lifecycle output and OpenCode plugin behavior;
+- explicit checkpoint-file no-follow handling.
+
+## Automated evidence
+
+```bash
+npm test
+npm run validate:openapi
+npm run validate:clients
+npm run test:codex-client
+npm run benchmark:quality
+npm audit --omit=dev
+npm pack --dry-run
+```
+
+Observed results on the build host:
+
+- **73/73** Node tests passed;
+- OpenAPI parsed with **20 paths**;
+- Codex, Copilot, Claude Code and OpenCode example contracts validated;
+- installed `codex-cli 0.147.0` completed authenticated Streamable HTTP MCP
+  `initialize` and `tools/list` against a disposable local server;
+- exact lexical Recall@5 was **9/9** and isolation violations were **0**;
+- production dependency audit reported **0 known vulnerabilities**;
+- package dry-run completed.
+
+## Security cases exercised
+
+- MCP tools are omitted unless granted by the server-bound identity;
+- every read tool declares `readOnlyHint: true` and non-destructive hints;
+- MCP sessions reject cross-credential reuse and terminate explicitly;
+- session capacity includes in-flight initialization reservations;
+- static non-loopback deployments retain compatibility without OIDC metadata;
+- OIDC verifies JWT algorithm, signature, issuer, audience, expiry, subject,
+  tenant and scoped authorization claims;
+- a spoofed non-loopback `Host` value cannot become OAuth resource metadata;
+- lifecycle checkpoint readers reject symlinks and file replacement during open.
+
+## Evidence boundaries
+
+The Codex run proves real client transport and discovery, not a model-triggered
+tool call: standalone Codex model authentication is unavailable on this host.
+GitHub-hosted Copilot, Claude Code and OpenCode binaries were not available;
+their configurations and lifecycle contracts are tested locally but remain
+labelled **contract tested**, not tool-call verified. See
+[client compatibility](client-compatibility.md).

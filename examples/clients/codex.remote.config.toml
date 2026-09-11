@@ -1,0 +1,17 @@
+[mcp_servers.continuitydb]
+url = "https://continuitydb.example/mcp"
+bearer_token_env_var = "CONTINUITYDB_MCP_TOKEN"
+required = true
+enabled_tools = ["memory_search", "memory_context_pack", "memory_capture", "memory_feedback", "handoff_checkpoint", "handoff_latest"]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 10
+tool_timeout_sec = 30
+
+[mcp_servers.continuitydb.tools.memory_search]
+approval_mode = "auto"
+
+[mcp_servers.continuitydb.tools.memory_context_pack]
+approval_mode = "auto"
+
+[mcp_servers.continuitydb.tools.handoff_latest]
+approval_mode = "auto"

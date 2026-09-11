@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -80,13 +80,20 @@ test("lifecycle hook injects startup context and saves explicit structured check
     }));
     const saved = JSON.parse(await runHook(["checkpoint", "--file", checkpoint, "--verbose"], env));
     assert.equal(saved.saved, true);
-    const startup = await runHook(["session-start"], env);
-    assert.match(startup, /Latest structured handoff/);
-    assert.match(startup, /Regenerate the client/);
-    assert.doesNotMatch(startup, /OBSOLETE_SAME_TASK_CHECKPOINT/);
-    assert.doesNotMatch(startup, /OTHER_TASK_CHECKPOINT/);
+    const startup = JSON.parse(await runHook(["session-start"], env));
+    assert.equal(startup.hookSpecificOutput.hookEventName, "SessionStart");
+    assert.match(startup.hookSpecificOutput.additionalContext, /Latest structured handoff/);
+    assert.match(startup.hookSpecificOutput.additionalContext, /Regenerate the client/);
+    assert.doesNotMatch(startup.hookSpecificOutput.additionalContext, /OBSOLETE_SAME_TASK_CHECKPOINT/);
+    assert.doesNotMatch(startup.hookSpecificOutput.additionalContext, /OTHER_TASK_CHECKPOINT/);
     const cursor = JSON.parse(await runHook(["session-start", "--client", "cursor"], env));
     assert.match(cursor.additional_context, /Schema published/);
+    const linkedCheckpoint = join(root, "linked-handoff.json");
+    symlinkSync(checkpoint, linkedCheckpoint);
+    await assert.rejects(
+      runHook(["checkpoint", "--file", linkedCheckpoint], env),
+      /regular file, not a symlink/,
+    );
   } finally {
     await service.close().catch(() => vault.close());
     rmSync(root, { recursive: true, force: true });

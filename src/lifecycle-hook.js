@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { createApiClientFromEnv } from "./http-client.js";
 
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
@@ -24,11 +24,21 @@ function required(value, name) {
 
 function readCheckpoint(path) {
   if (!path) throw new Error("checkpoint requires --file or CONTINUITYDB_HANDOFF_FILE");
-  const size = statSync(path).size;
-  if (size > MAX_CHECKPOINT_BYTES) throw new Error("handoff checkpoint file is too large");
-  const value = JSON.parse(readFileSync(path, "utf8"));
-  if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("handoff checkpoint must be a JSON object");
-  return value;
+  const before = lstatSync(path);
+  if (before.isSymbolicLink() || !before.isFile()) throw new Error("handoff checkpoint must be a regular file, not a symlink");
+  const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
+      throw new Error("handoff checkpoint changed during secure open");
+    }
+    if (opened.size > MAX_CHECKPOINT_BYTES) throw new Error("handoff checkpoint file is too large");
+    const value = JSON.parse(readFileSync(descriptor, "utf8"));
+    if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("handoff checkpoint must be a JSON object");
+    return value;
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function renderStartup({ handoff, context }) {
@@ -42,6 +52,12 @@ function renderStartup({ handoff, context }) {
 
 function writeStartup(value, client) {
   if (client === "cursor") process.stdout.write(`${JSON.stringify({ additional_context: value })}\n`);
+  else if (client === "claude") process.stdout.write(`${JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext: value,
+    },
+  })}\n`);
   else process.stdout.write(`${value}\n`);
 }
 

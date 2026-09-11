@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
 
@@ -37,6 +38,12 @@ test("MCP exposes policy-controlled capture and feedback without admin tools", a
       "memory_search",
     ]);
     assert.equal(tools.tools.some((tool) => /commit|delete|correct|admin/.test(tool.name)), false);
+    for (const tool of tools.tools) {
+      const readOnly = ["memory_search", "memory_context_pack", "handoff_latest"].includes(tool.name);
+      assert.equal(tool.annotations.readOnlyHint, readOnly);
+      assert.equal(tool.annotations.destructiveHint, false);
+      assert.equal(tool.annotations.openWorldHint, false);
+    }
     const captured = await client.callTool({
       name: "memory_capture",
       arguments: {
@@ -106,6 +113,132 @@ test("MCP exposes policy-controlled capture and feedback without admin tools", a
   }
 });
 
+test("stdio MCP read-only profile exposes only annotated retrieval tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-read-test-"));
+  const serverPath = new URL("../src/mcp-server.js", import.meta.url).pathname;
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [serverPath],
+    env: {
+      ...process.env,
+      CONTINUITYDB_HOME: root,
+      CONTINUITYDB_MCP_SCOPES: "memory:read",
+      CONTINUITYDB_ALLOWED_PROJECTS: "api",
+    },
+  });
+  const client = new Client({ name: "continuitydb-read-profile-test", version: "0.6.0" });
+  try {
+    await client.connect(transport);
+    const tools = await client.listTools();
+    assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
+      "handoff_latest",
+      "memory_context_pack",
+      "memory_search",
+    ]);
+    assert.equal(tools.tools.every((tool) => tool.annotations.readOnlyHint === true), true);
+  } finally {
+    await client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("authenticated Streamable HTTP MCP transfers context and binds sessions to identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-streamable-mcp-test-"));
+  const vault = new ContextVault(root);
+  const captureToken = "capture-token-value-that-is-long-enough";
+  const readToken = "readonly-token-value-that-is-long-enough";
+  const policy = join(root, "tokens.json");
+  const { chmodSync, writeFileSync } = await import("node:fs");
+  const { sha256 } = await import("../src/security.js");
+  writeFileSync(policy, JSON.stringify({ tokens: [{
+    token_sha256: sha256(captureToken),
+    tenant_id: "tenant-a",
+    principal_id: "agent-a",
+    owner_id: "shared-owner",
+    agent_id: "codex",
+    scopes: ["memory:read", "memory:capture"],
+    allowed_projects: ["api"],
+    allowed_sensitivities: ["private"],
+  }, {
+    token_sha256: sha256(readToken),
+    tenant_id: "tenant-a",
+    principal_id: "agent-b",
+    owner_id: "shared-owner",
+    agent_id: "copilot-review",
+    scopes: ["memory:read"],
+    allowed_projects: ["api"],
+    allowed_sensitivities: ["private"],
+  }] }));
+  chmodSync(policy, 0o600);
+  const service = createContinuityServer({ vault, host: "127.0.0.1", port: 0, tokenPolicyPath: policy });
+  let captureClient;
+  let readClient;
+  try {
+    const address = await service.listen();
+    const endpoint = new URL(`http://127.0.0.1:${address.port}/mcp`);
+    const unauthorized = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+        protocolVersion: "2025-11-25",
+        capabilities: {},
+        clientInfo: { name: "unauthorized", version: "1" },
+      } }),
+    });
+    assert.equal(unauthorized.status, 401);
+    assert.equal(unauthorized.headers.get("www-authenticate"), "Bearer");
+
+    const captureTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { authorization: `Bearer ${captureToken}` } },
+    });
+    captureClient = new Client({ name: "codex-fixture", version: "1" });
+    await captureClient.connect(captureTransport);
+    const captureTools = await captureClient.listTools();
+    assert.equal(captureTools.tools.some((tool) => tool.name === "memory_capture"), true);
+    const captured = await captureClient.callTool({
+      name: "memory_capture",
+      arguments: { project_id: "api", memory_kind: "working", body: "RemoteMcpContext shared across clients." },
+    });
+    assert.equal(captured.structuredContent.disposition, "active");
+
+    const hijack = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${readToken}`,
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        "mcp-session-id": captureTransport.sessionId,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
+    });
+    assert.equal(hijack.status, 403);
+
+    const readTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { authorization: `Bearer ${readToken}` } },
+    });
+    readClient = new Client({ name: "copilot-review-fixture", version: "1" });
+    await readClient.connect(readTransport);
+    const readTools = await readClient.listTools();
+    assert.deepEqual(readTools.tools.map((tool) => tool.name).sort(), [
+      "handoff_latest",
+      "memory_context_pack",
+      "memory_search",
+    ]);
+    assert.equal(readTools.tools.every((tool) => tool.annotations.readOnlyHint === true), true);
+    const found = await readClient.callTool({
+      name: "memory_search",
+      arguments: { query: "RemoteMcpContext", project_id: "api" },
+    });
+    assert.equal(found.structuredContent.results.length, 1);
+    await readTransport.terminateSession();
+  } finally {
+    await captureClient?.close().catch(() => {});
+    await readClient?.close().catch(() => {});
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("stdio MCP can proxy two-agent continuity through one authoritative HTTP service", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-remote-mcp-test-"));
   const vault = new ContextVault(root);
@@ -160,6 +293,56 @@ test("stdio MCP can proxy two-agent continuity through one authoritative HTTP se
     }).record.id, saved.structuredContent.record.id);
   } finally {
     await client?.close().catch(() => {});
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Streamable HTTP MCP refuses sessions beyond configured capacity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-capacity-test-"));
+  const vault = new ContextVault(root);
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    mcpMaxSessions: 1,
+    localIdentity: {
+      tenant_id: "test",
+      principal_id: "capacity-agent",
+      owner_id: "shared-owner",
+      agent_id: "capacity-agent",
+      scopes: ["memory:read"],
+      allowed_projects: ["api"],
+      allowed_sensitivities: ["private"],
+    },
+  });
+  let firstClient;
+  try {
+    const address = await service.listen();
+    const endpoint = new URL(`http://127.0.0.1:${address.port}/mcp`);
+    firstClient = new Client({ name: "capacity-first", version: "1.0.0" });
+    await firstClient.connect(new StreamableHTTPClientTransport(endpoint));
+    const second = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-11-25",
+          capabilities: {},
+          clientInfo: { name: "capacity-second", version: "1.0.0" },
+        },
+      }),
+    });
+    assert.equal(second.status, 503);
+    assert.match((await second.json()).error.message, /capacity/);
+  } finally {
+    await firstClient?.close().catch(() => {});
     await service.close().catch(() => vault.close());
     rmSync(root, { recursive: true, force: true });
   }

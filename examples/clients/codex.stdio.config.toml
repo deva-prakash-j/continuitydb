@@ -1,0 +1,16 @@
+[mcp_servers.continuitydb]
+command = "continuitydb"
+args = ["mcp", "--home", "/absolute/private/path/continuitydb-data"]
+required = true
+enabled_tools = ["memory_search", "memory_context_pack", "memory_capture", "memory_feedback", "handoff_checkpoint", "handoff_latest"]
+default_tools_approval_mode = "writes"
+startup_timeout_sec = 10
+tool_timeout_sec = 30
+
+[mcp_servers.continuitydb.env]
+CONTINUITYDB_TENANT_ID = "example-org"
+CONTINUITYDB_PRINCIPAL_ID = "codex-agent-1"
+CONTINUITYDB_OWNER_ID = "example-user"
+CONTINUITYDB_AGENT_ID = "codex"
+CONTINUITYDB_ALLOWED_PROJECTS = "service-a,schema-a"
+CONTINUITYDB_ALLOWED_SENSITIVITIES = "public,private"

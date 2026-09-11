@@ -4,10 +4,12 @@ import { ContextVault } from "./store.js";
 import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { REVIEW_UI } from "./review-ui.js";
+import { ContinuityMcpHttpEndpoint } from "./mcp-http.js";
 import {
   isLoopback,
   loadTokenPolicy,
   normalizeIdentity,
+  createOidcAuthorizerFromEnv,
   requireScope,
   TokenAuthorizer,
   TokenBucketLimiter,
@@ -15,6 +17,33 @@ import {
 
 const JSON_TYPE = "application/json; charset=utf-8";
 const MAX_BODY_BYTES = Number(process.env.CONTINUITYDB_MAX_BODY_BYTES || 1_048_576);
+const OAUTH_METADATA_PATH = "/.well-known/oauth-protected-resource/mcp";
+
+function validatedPublicUrl(value, host, required = false) {
+  if (!value) {
+    if (!required || isLoopback(host)) return null;
+    throw new Error("CONTINUITYDB_PUBLIC_URL is required for non-loopback OIDC service");
+  }
+  const url = new URL(value);
+  if (url.username || url.password || url.search || url.hash) throw new Error("CONTINUITYDB_PUBLIC_URL must not contain credentials, query, or fragment");
+  if (url.pathname !== "/") throw new Error("CONTINUITYDB_PUBLIC_URL must be an origin without a path");
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
+    throw new Error("CONTINUITYDB_PUBLIC_URL must use HTTPS unless it is loopback");
+  }
+  return url.href.replace(/\/$/, "");
+}
+
+function requestPublicBase(request, configuredPublicUrl) {
+  if (configuredPublicUrl) return configuredPublicUrl;
+  const hostHeader = request.headers.host;
+  if (typeof hostHeader !== "string" || hostHeader.length > 300 || /[\\/?#@]/.test(hostHeader)) return null;
+  try {
+    const candidate = new URL(`http://${hostHeader}`);
+    return isLoopback(candidate.hostname) ? candidate.origin : null;
+  } catch {
+    return null;
+  }
+}
 
 function json(response, status, value, requestId) {
   const body = JSON.stringify(value);
@@ -147,11 +176,16 @@ export function createContinuityServer({
   capturePolicy = new CapturePolicy(loadCapturePolicy(process.env.CONTINUITYDB_CAPTURE_POLICY_FILE || null)),
   limiter = new TokenBucketLimiter(),
   enableReviewUi = process.env.CONTINUITYDB_ENABLE_REVIEW_UI === "true",
+  oidcAuthorizer = createOidcAuthorizerFromEnv(),
+  publicUrl = process.env.CONTINUITYDB_PUBLIC_URL || null,
+  mcpMaxSessions = Number(process.env.CONTINUITYDB_MCP_MAX_SESSIONS || 1_000),
+  mcpSessionTtlMs = Number(process.env.CONTINUITYDB_MCP_SESSION_TTL_MS || 30 * 60 * 1_000),
 } = {}) {
   const entries = loadTokenPolicy(tokenPolicyPath);
-  if (!isLoopback(host) && (!entries.length || !trustProxyTls)) {
-    throw new Error("non-loopback HTTP requires a token policy and CONTINUITYDB_TRUST_PROXY_TLS=true");
+  if (!isLoopback(host) && ((!entries.length && !oidcAuthorizer) || !trustProxyTls)) {
+    throw new Error("non-loopback HTTP requires a token policy or OIDC plus CONTINUITYDB_TRUST_PROXY_TLS=true");
   }
+  const configuredPublicUrl = validatedPublicUrl(publicUrl, host, Boolean(oidcAuthorizer));
   const authorizer = new TokenAuthorizer(entries);
   const fallbackIdentity = normalizeIdentity(localIdentity || {
     tenant_id: process.env.CONTINUITYDB_TENANT_ID || "local",
@@ -165,6 +199,18 @@ export function createContinuityServer({
     allowed_sensitivities: (process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private").split(",").filter(Boolean),
   });
   const engine = new HybridEngine(vault, embedder);
+  const mcpEndpoint = new ContinuityMcpHttpEndpoint({
+    vault,
+    engine,
+    capturePolicy,
+    captureLimiter: new TokenBucketLimiter({
+      capacity: Number(process.env.CONTINUITYDB_MCP_CAPTURE_BURST || 30),
+      refillPerSecond: Number(process.env.CONTINUITYDB_MCP_CAPTURE_PER_SECOND || 0.5),
+      maxPrincipals: 100_000,
+    }),
+    maxSessions: mcpMaxSessions,
+    sessionTtlMs: mcpSessionTtlMs,
+  });
   const metrics = { requests: 0, errors: 0, rate_limited: 0, started_at: Date.now() };
 
   const server = createServer(async (request, response) => {
@@ -173,13 +219,29 @@ export function createContinuityServer({
     try {
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       if (request.method === "GET" && url.pathname === "/healthz") {
-        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.5.0" }, requestId);
+        return json(response, 200, { status: "ok", service: "continuitydb", version: "0.6.0" }, requestId);
       }
 
-      const identity = entries.length
-        ? authorizer.authorize(request.headers.authorization)
-        : isLoopback(host) ? fallbackIdentity : null;
-      if (!identity) return json(response, 401, { error: "unauthorized", request_id: requestId }, requestId);
+      if (request.method === "GET" && url.pathname === OAUTH_METADATA_PATH && oidcAuthorizer) {
+        const base = requestPublicBase(request, configuredPublicUrl);
+        if (!base) return json(response, 400, { error: "invalid public resource origin", request_id: requestId }, requestId);
+        return json(response, 200, {
+          resource: `${base}/mcp`,
+          authorization_servers: [oidcAuthorizer.issuer],
+          scopes_supported: ["memory:read", "memory:capture", "memory:feedback"],
+          bearer_methods_supported: ["header"],
+        }, requestId);
+      }
+
+      let identity = entries.length ? authorizer.authorize(request.headers.authorization) : null;
+      if (!identity && oidcAuthorizer) identity = await oidcAuthorizer.authorize(request.headers.authorization);
+      if (!identity && !entries.length && !oidcAuthorizer && isLoopback(host)) identity = fallbackIdentity;
+      if (!identity) {
+        const base = requestPublicBase(request, configuredPublicUrl);
+        const metadata = oidcAuthorizer && base ? ` resource_metadata="${base}${OAUTH_METADATA_PATH}"` : "";
+        response.setHeader("www-authenticate", `Bearer${metadata}`);
+        return json(response, 401, { error: "unauthorized", request_id: requestId }, requestId);
+      }
       if (!limiter.consume(`${identity.tenant_id}:${identity.principal_id}`)) {
         metrics.rate_limited += 1;
         response.setHeader("retry-after", "1");
@@ -189,6 +251,9 @@ export function createContinuityServer({
       if (request.method === "GET" && url.pathname === "/readyz") {
         vault.db.prepare("SELECT 1").get();
         return json(response, 200, { status: "ready" }, requestId);
+      }
+      if (url.pathname === "/mcp") {
+        return await mcpEndpoint.handle(request, response, identity, readJson);
       }
       if (request.method === "GET" && url.pathname === "/ui") {
         if (!enableReviewUi) return json(response, 404, { error: "review UI is disabled", request_id: requestId }, requestId);
@@ -202,6 +267,11 @@ export function createContinuityServer({
           `continuitydb_http_requests_total ${metrics.requests}`,
           `continuitydb_http_errors_total ${metrics.errors}`,
           `continuitydb_http_rate_limited_total ${metrics.rate_limited}`,
+          `continuitydb_mcp_sessions ${mcpEndpoint.sessions.size}`,
+          `continuitydb_mcp_initializations_total ${mcpEndpoint.metrics.initializations}`,
+          `continuitydb_mcp_tool_lists_total ${mcpEndpoint.metrics.tool_lists}`,
+          `continuitydb_mcp_tool_calls_total ${mcpEndpoint.metrics.tool_calls}`,
+          `continuitydb_mcp_identity_mismatches_total ${mcpEndpoint.metrics.identity_mismatches}`,
           `continuitydb_uptime_seconds ${Math.floor((Date.now() - metrics.started_at) / 1000)}`,
           "",
         ].join("\n"));
@@ -415,6 +485,7 @@ export function createContinuityServer({
     server,
     vault,
     metrics,
+    mcpEndpoint,
     async listen() {
       await new Promise((resolve, reject) => {
         server.once("error", reject);
@@ -423,6 +494,7 @@ export function createContinuityServer({
       return server.address();
     },
     async close() {
+      await mcpEndpoint.close();
       await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       vault.close();
     },

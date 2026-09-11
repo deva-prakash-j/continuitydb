@@ -15,7 +15,7 @@ returned.
 
 ## Project status
 
-> **Project status:** v0.5 alpha. The embedded SQLite/FTS5 mode is implemented,
+> **Project status:** v0.6 alpha candidate. The embedded SQLite/FTS5 mode is implemented,
 > tested, and suitable for local evaluation. The repository includes a
 > PostgreSQL/pgvector reference schema and distributed architecture, but the
 > production adapter and billion-record proof do not exist yet. Current `main`
@@ -37,8 +37,11 @@ passed the independent Astraea strict QA gate after five review/fix rounds:
 - concurrent first-open stress: **240/240 successful process opens** across ten
   fresh-vault repetitions.
 
-This README update is documentation-only and does not change runtime behaviour.
-CI remains the authoritative check for the exact published head.
+The v0.6 interoperability candidate is additionally gated by **73/73 local
+tests**, 20 OpenAPI paths, four versioned client-contract checks, an installed
+Codex CLI authenticated transport/discovery probe, and zero known production
+dependency vulnerabilities. Independent Astraea review remains mandatory for
+the exact candidate commit before it can be described as ready.
 
 ## The problem
 
@@ -133,9 +136,12 @@ and credentials when their trust domains differ.
 
 ### Interfaces and operations
 
-- six agent-facing MCP tools, including structured handoff save/retrieval;
-- HTTP-backed stdio MCP mode so many clients can share one authoritative service;
-- lifecycle hook adapter plus Claude Code and Cursor configuration examples;
+- six scope-filtered agent-facing MCP tools, including structured handoff save/retrieval;
+- stateful Streamable HTTP MCP at `/mcp`, plus local stdio and HTTP-backed thin-stdio modes;
+- explicit MCP safety annotations, server instructions, bearer/OIDC identity binding,
+  session expiry/capacity controls, and cross-credential session-hijack rejection;
+- versioned Codex, Copilot, Claude Code, OpenCode, Cursor, and generic MCP examples;
+- lifecycle hook adapters for Claude Code, Cursor, and OpenCode without transcript mining;
 - opt-in local review inbox for approval, correction, provenance inspection, and context preview;
 - versioned HTTP API with server-bound identity and scoped authorization;
 - CLI for setup, health checks, capture, lifecycle, retrieval, graph links,
@@ -281,41 +287,58 @@ continuitydb mcp --home /absolute/private/path/continuitydb-data
 
 The MCP surface is intentionally small:
 
-| Tool | Purpose | Can change lifecycle or permissions? |
-|---|---|---|
-| `memory_search` | Retrieve approved, scoped memories | No |
-| `memory_context_pack` | Build a cited, token-budgeted pack for a task | No |
-| `memory_capture` | Submit memory through server-side risk policy | Cannot approve, delete, correct, or change scope |
-| `memory_feedback` | Mark a visible memory helpful, incorrect, or outdated | No; ranking influence is bounded |
-| `handoff_checkpoint` | Save goal/state/completed work/questions/next actions/files as one checkpoint | Cannot approve other memories or change permissions |
-| `handoff_latest` | Retrieve the latest task/project/branch-applicable checkpoint | No |
+| Tool | Required scope | MCP annotation | Purpose |
+|---|---|---|---|
+| `memory_search` | `memory:read` | read-only | Retrieve approved, scoped memories |
+| `memory_context_pack` | `memory:read` | read-only | Build a cited, token-budgeted pack for a task |
+| `handoff_latest` | `memory:read` | read-only | Retrieve the latest task/project/branch-applicable checkpoint |
+| `memory_capture` | `memory:capture` | write, non-destructive | Submit memory through server-side risk policy |
+| `handoff_checkpoint` | `memory:capture` | write, non-destructive | Save explicit structured continuation state |
+| `memory_feedback` | `memory:feedback` | write, non-destructive | Record bounded helpful/incorrect/outdated feedback |
 
-Use [`examples/mcp.vscode.example.json`](examples/mcp.vscode.example.json) as a
-VS Code/Copilot-compatible starting point. Other clients can launch the same
-stdio command using their MCP configuration format.
+Tool discovery is scope-filtered. A read-only token receives only the three
+read tools, all with `annotations.readOnlyHint: true`; this is the recommended
+profile for GitHub Copilot code review.
 
 ### Use one central store from many MCP clients
 
-Run one authoritative service, then make each local stdio MCP process a thin
-HTTP adapter instead of constructing its own `ContextVault`:
+Run one authoritative service. Modern clients connect directly to the stateful
+Streamable HTTP MCP endpoint at `/mcp`:
 
 ```bash
 # Authoritative service
 CONTINUITYDB_ALLOWED_PROJECTS=service-a,schema-a \
 continuitydb serve --home /absolute/private/path/continuitydb-data
 
-# MCP process launched by each client
+# Configure the client with this endpoint and a host-owned bearer value:
+# https://continuitydb.example/mcp
+```
+
+Clients limited to stdio can still launch a thin adapter:
+
+```bash
+# MCP process launched by a stdio-only client
 CONTINUITYDB_HTTP_URL=http://127.0.0.1:7331 \
 continuitydb mcp
 ```
 
+Every HTTP MCP session is bound to the credential's tenant, principal, owner,
+agent, scopes, project allowlist, and sensitivity allowlist. Reusing a session
+ID with another credential returns HTTP 403. Sessions use random IDs, have an
+idle TTL and capacity limit, and support explicit MCP `DELETE` termination.
+
 Configure embeddings on the authoritative service only. Thin HTTP-backed MCP
 adapters do not need the model runtime, cache, or provider credentials.
 
-For a remote HTTPS service, set `CONTINUITYDB_HTTP_TOKEN_ENV` to the name of a
-host-injected credential entry. Do not put a token in the URL, MCP arguments,
-repository, or visible logs. The client rejects plaintext non-loopback URLs.
-See [`examples/mcp.remote.vscode.example.json`](examples/mcp.remote.vscode.example.json).
+Remote service authentication supports private static bearer-token policies or
+verified OIDC JWTs. OIDC requires `sub` and `continuitydb_tenant`; it accepts
+optional `continuitydb_owner`, `continuitydb_agent`,
+`continuitydb_projects`, `continuitydb_sensitivities`, and standard `scope` or
+`scp` claims. Unknown scopes are ignored and absent project grants expose no
+project memory. Do not put tokens in URLs, command arguments, repositories, or
+visible logs. See the versioned configurations and evidence matrix in
+[`examples/clients`](examples/clients) and
+[`docs/client-compatibility.md`](docs/client-compatibility.md).
 
 ### Automatic session lifecycle adapters
 
@@ -351,14 +374,16 @@ continuitydb-hook checkpoint --file .continuitydb-handoff.json --verbose
 ```
 
 Start from [`examples/handoff.example.json`](examples/handoff.example.json).
-Copy the relevant hook shape into Claude Code or Cursor:
+Copy the relevant adapter shape for Claude Code, Cursor, or OpenCode:
 
 - [`examples/claude-code-hooks.example.json`](examples/claude-code-hooks.example.json)
 - [`examples/cursor-hooks.example.json`](examples/cursor-hooks.example.json)
+- [`examples/clients/opencode-continuitydb.js`](examples/clients/opencode-continuitydb.js)
 
-The examples follow the clients' command-hook contracts: Claude Code receives
-plain `SessionStart` stdout as context, while Cursor receives
-`additional_context` JSON. Cursor cloud agents currently do not run
+The examples follow the clients' lifecycle contracts: Claude Code receives
+`hookSpecificOutput.additionalContext`, Cursor receives `additional_context`
+JSON, and OpenCode injects bounded context during compaction and saves an
+explicit checkpoint on `session.idle`. Cursor cloud agents currently do not run
 `sessionStart`; use its MCP surface or a self-hosted/local session there.
 
 Employers may disable custom MCP servers. Do not ingest employer repositories
@@ -444,7 +469,7 @@ for incremental scans. Limits can be set with `--max-files` and
 
 The scanner reads blobs from the resolved commit tree, not working-directory
 files, so an uncommitted edit cannot be cited as committed `HEAD` evidence. It
-does not execute repository code. v0.5 uses bounded pattern-based
+does not execute repository code. v0.6 uses bounded pattern-based
 symbol and manifest extraction; sandboxed Tree-sitter workers remain planned.
 
 ## HTTP API
@@ -470,6 +495,8 @@ policy and a trusted frontend boundary instead.
 | Endpoint | Required scope |
 |---|---|
 | `GET /healthz` | Public liveness only |
+| `GET /.well-known/oauth-protected-resource/mcp` | Public OIDC resource metadata when OIDC is configured |
+| `POST`, `GET`, `DELETE /mcp` | Scope-filtered Streamable HTTP MCP session |
 | `GET /readyz` | Authenticated identity |
 | `POST /v1/search`, `POST /v1/context-packs`, `GET /v1/memories/{id}` | `memory:read` |
 | `POST /v1/memories/captures` | `memory:capture` |
@@ -485,10 +512,14 @@ The complete request and response contract is in
 [`docs/openapi.yaml`](docs/openapi.yaml).
 
 Loopback mode can use its configured local identity. A non-loopback bind refuses
-to start without both a private token-policy file containing only SHA-256 token
-digests and `CONTINUITYDB_TRUST_PROXY_TLS=true`. Set that flag only when a
-trusted reverse proxy actually terminates TLS. Static tokens are an alpha
-adapter; production deployments need OIDC or mTLS.
+to start without either a private token-policy file containing only SHA-256
+token digests or a complete OIDC configuration, plus
+`CONTINUITYDB_TRUST_PROXY_TLS=true`. Set that flag only when a trusted reverse
+proxy actually terminates TLS. OIDC validates signature, issuer, audience,
+expiry, subject, tenant and ContinuityDB authorization claims against the
+configured JWKS. Static policies remain useful for private deployments; larger
+installations should use OIDC workload identities or an mTLS-authenticating
+gateway.
 
 `memory:capture`, `memory:propose`, `memory:approve`, and `memory:admin` are
 separate authorities. `memory:admin` is privileged and satisfies all scope
@@ -511,11 +542,18 @@ checks; do not assign it to agent identities.
 | `CONTINUITYDB_ALLOWED_SENSITIVITIES` | `public,private` | Comma-separated sensitivity allowlist |
 | `CONTINUITYDB_CAPTURE_POLICY_FILE` | unset | Private JSON capture-policy path |
 | `CONTINUITYDB_TOKEN_POLICY_FILE` | unset | Private HTTP token-policy path containing token digests |
+| `CONTINUITYDB_OIDC_ISSUER` | unset | Expected HTTPS OIDC issuer; configure with audience and JWKS URL |
+| `CONTINUITYDB_OIDC_AUDIENCE` | unset | Required JWT audience for ContinuityDB |
+| `CONTINUITYDB_OIDC_JWKS_URL` | unset | HTTPS JWKS endpoint used to verify OIDC JWT signatures |
+| `CONTINUITYDB_PUBLIC_URL` | unset | Canonical HTTPS service origin required for non-loopback OIDC discovery |
 | `CONTINUITYDB_TRUST_PROXY_TLS` | `false` | Assert trusted TLS termination for non-loopback service |
 | `CONTINUITYDB_ENABLE_REVIEW_UI` | `false` | Enable the loopback approval/provenance/context-preview UI |
 | `CONTINUITYDB_MAX_BODY_BYTES` | `1048576` | Maximum HTTP request body size |
 | `CONTINUITYDB_MCP_CAPTURE_BURST` | `30` | MCP capture/feedback token-bucket capacity |
 | `CONTINUITYDB_MCP_CAPTURE_PER_SECOND` | `0.5` | MCP capture limiter refill rate |
+| `CONTINUITYDB_MCP_MAX_SESSIONS` | `1000` | Maximum live Streamable HTTP MCP sessions |
+| `CONTINUITYDB_MCP_SESSION_TTL_MS` | `1800000` | MCP session idle expiry, bounded from 10 seconds to 24 hours |
+| `CONTINUITYDB_MCP_SCOPES` | `memory:read,memory:capture,memory:feedback` | Comma-separated scopes for local stdio MCP tool discovery |
 | `CONTINUITYDB_HTTP_URL` | unset | Make stdio MCP/lifecycle hooks use one authoritative HTTP service |
 | `CONTINUITYDB_HTTP_TOKEN_ENV` | `CONTINUITYDB_HTTP_TOKEN` | Name of the host-injected service credential entry |
 | `CONTINUITYDB_HTTP_TIMEOUT_MS` | `15000` | HTTP adapter request timeout |
@@ -650,7 +688,7 @@ invalid rather than silently replaced with a newly valid-looking chain.
 
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
-encryption and remote signed audit checkpoints are not implemented in v0.5.
+encryption and remote signed audit checkpoints are not implemented in v0.6.
 
 ## Deployment and scale
 
@@ -686,6 +724,10 @@ npm run benchmark:local:performance
 
 # Tests, OpenAPI parse, quality baseline, dependency audit, and package check
 npm run release:check
+
+# Versioned client contracts and real installed-Codex transport discovery
+npm run test:clients
+npm run test:codex-client
 ```
 
 ### Current measured evidence
@@ -754,11 +796,13 @@ Important shipped controls include:
 - idempotent writes, conflict quarantine, expiry, supersession, and tombstones;
 - serialized concurrent first-open bootstrap, transactionally serialized
   hash-chained audit log, legacy-chain preservation, and verifier;
+- regular-file/no-follow validation for explicit lifecycle checkpoint inputs;
 - pinned lockfile, minimal dependencies, CI audit, and non-root container.
 
-Known gaps include static-token lifecycle, application-level encryption,
-complete DLP, precise AST parsing, signed audit checkpoints, Git staleness
-projection, distributed purge acknowledgement, and production OIDC/mTLS.
+Known gaps include application-level encryption, complete DLP, precise AST
+parsing, signed audit checkpoints, Git staleness projection, distributed purge
+acknowledgement, mTLS-native identity, and organization-specific OIDC rotation
+and revocation operations.
 
 Read [`SECURITY.md`](SECURITY.md) and the
 [threat model](docs/threat-model.md) before network deployment. Report
@@ -778,7 +822,7 @@ issue.
 - Repository symbol extraction is pattern-based rather than AST-precise.
 - Regex credential detection reduces common accidents but is not complete DLP.
 - Local data relies on host/volume encryption.
-- OIDC/mTLS, projector freshness, distributed deletion, and chaos-tested failover remain pending.
+- mTLS-native identity, projector freshness, distributed deletion, and chaos-tested failover remain pending.
 
 The active roadmap is maintained in [`CHANGELOG.md`](CHANGELOG.md). Contributions
 that close a documented limitation with tests and evidence are especially welcome.
@@ -789,12 +833,14 @@ that close a documented limitation with tests and evidence are especially welcom
 |---|---|
 | [Architecture](docs/architecture.md) | Embedded and distributed design, record model, retrieval, consistency |
 | [OpenAPI](docs/openapi.yaml) | Versioned HTTP contract |
+| [Client compatibility](docs/client-compatibility.md) | Evidence-graded Codex, Copilot, Claude Code, OpenCode and Cursor interoperability |
 | [Scalability](docs/scalability.md) | Deployment envelopes, invariants, sharding plan, scale gates |
 | [Threat model](docs/threat-model.md) | Assets, boundaries, threats, shipped controls, production requirements |
 | [Benchmark report](docs/benchmark-report-2026-09-10.md) | Reproduction, hardware, raw metrics, saturation verdict |
 | [Local embeddings](docs/local-embeddings.md) | Pinned model, setup, quality, performance, security, and footprint |
 | [v0.4 verification](docs/build-verification-2026-09-10-v0.4.md) | Central MCP, handoff, UI, provenance, branch, budget and audit gates |
 | [v0.5 verification](docs/build-verification-2026-09-10-v0.5.md) | Pinned local model, integrity, quality, footprint, and CLI backfill gates |
+| [v0.6 verification](docs/build-verification-2026-09-11-v0.6.md) | Remote MCP, OIDC, client contracts, lifecycle adapters, and interoperability evidence |
 | [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
 | [Security policy](SECURITY.md) | Supported line and private reporting process |
 | [Contributing](CONTRIBUTING.md) | Development and pull-request expectations |

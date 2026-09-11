@@ -1,4 +1,4 @@
-# ContinuityDB architecture v0.5
+# ContinuityDB architecture v0.6
 
 ## Design principles
 
@@ -17,6 +17,7 @@
 CLI admin ----------------------------------------------------+
                                                                v
 local MCP --------> identity + capture policy ----------------> SQLite records/FTS5/vectors/edges
+remote MCP ------> authenticated Streamable HTTP MCP ----------^        |
 remote stdio MCP -> authenticated HTTP v1 -> authoritative API          |
 lifecycle hooks ---------------------------------------------+          +-> canonical Markdown
 review inbox ------------------------------------------------+          +-> serialized audit table
@@ -116,12 +117,13 @@ Typed project and memory edges carry weight, provenance and validity windows.
 
 - JavaScript library: `ContextVault`, `HybridEngine` and security/ranking helpers.
 - CLI: `continuitydb` lifecycle, graph, export, repo scan, doctor and serve commands.
-- HTTP: versioned `/v1` API described by `docs/openapi.yaml`.
+- HTTP: versioned `/v1` API and authenticated stateful Streamable HTTP MCP
+  endpoint described by `docs/openapi.yaml`.
 - MCP: memory search/context/capture/feedback plus structured handoff checkpoint/latest;
   no approval or administration tools. It can run against local storage or proxy
   to the authoritative HTTP service.
 
-## Explicit non-goals for v0.5
+## Explicit non-goals for v0.6
 
 - passive screen, clipboard or raw-chat surveillance;
 - treating retrieved text as policy or authorization;

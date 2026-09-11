@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const VALID_SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
 const VALID_SCOPES = new Set([
@@ -22,18 +23,21 @@ export function safeEqualHex(left, right) {
 }
 
 export function normalizeIdentity(input = {}) {
-  const scopes = [...new Set((input.scopes || ["memory:read"]).filter((scope) => VALID_SCOPES.has(scope)))];
-  const sensitivities = [...new Set(
+  const scopes = Object.freeze([...new Set((input.scopes || ["memory:read"]).filter((scope) => VALID_SCOPES.has(scope)))]);
+  const sensitivities = Object.freeze([...new Set(
     (input.allowed_sensitivities || ["public", "private"]).filter((value) => VALID_SENSITIVITIES.has(value)),
-  )];
+  )]);
   const principalId = requiredIdentifier(input.principal_id || "local-user", "principal_id");
+  const allowedProjects = Object.freeze(
+    [...new Set(input.allowed_projects || [])].map((id) => requiredIdentifier(id, "project_id")),
+  );
   return Object.freeze({
     tenant_id: requiredIdentifier(input.tenant_id || "local", "tenant_id"),
     principal_id: principalId,
     owner_id: requiredIdentifier(input.owner_id || principalId, "owner_id"),
     agent_id: input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null,
     scopes,
-    allowed_projects: [...new Set(input.allowed_projects || [])].map((id) => requiredIdentifier(id, "project_id")),
+    allowed_projects: allowedProjects,
     allowed_sensitivities: sensitivities,
   });
 }
@@ -81,6 +85,74 @@ export class TokenAuthorizer {
     }
     return null;
   }
+}
+
+function secureServiceUrl(value, name) {
+  const url = new URL(value);
+  if (url.username || url.password || url.search || url.hash) throw new Error(`${name} must not contain credentials, query, or fragment`);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
+    throw new Error(`${name} must use HTTPS unless it is loopback`);
+  }
+  return url;
+}
+
+function stringArrayClaim(value, name) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new Error(`${name} claim must be an array of strings`);
+  }
+  return value;
+}
+
+export class OidcAuthorizer {
+  constructor({ issuer, audience, jwksUrl = null, jwks = null }) {
+    this.issuer = secureServiceUrl(issuer, "OIDC issuer").href.replace(/\/$/, "");
+    if (typeof audience !== "string" || !audience || audience.length > 500 || /\s/.test(audience)) {
+      throw new Error("OIDC audience contains invalid characters or length");
+    }
+    this.audience = audience;
+    if (!jwks && !jwksUrl) throw new Error("OIDC JWKS URL is required");
+    this.keySet = jwks || createRemoteJWKSet(secureServiceUrl(jwksUrl, "OIDC JWKS URL"));
+  }
+
+  async authorize(header) {
+    const match = typeof header === "string" && header.match(/^Bearer ([^\s]{24,8192})$/);
+    if (!match || match[1].split(".").length !== 3) return null;
+    try {
+      const { payload } = await jwtVerify(match[1], this.keySet, {
+        issuer: this.issuer,
+        audience: this.audience,
+        algorithms: ["RS256", "PS256", "ES256", "EdDSA"],
+        clockTolerance: 5,
+      });
+      const scopes = typeof payload.scope === "string"
+        ? payload.scope.split(/\s+/).filter(Boolean)
+        : stringArrayClaim(payload.scp, "scp");
+      if (typeof payload.sub !== "string" || typeof payload.continuitydb_tenant !== "string") {
+        throw new Error("OIDC token is missing required subject or tenant claims");
+      }
+      return normalizeIdentity({
+        tenant_id: payload.continuitydb_tenant,
+        principal_id: payload.sub,
+        owner_id: payload.continuitydb_owner || payload.sub,
+        agent_id: payload.continuitydb_agent || null,
+        scopes,
+        allowed_projects: stringArrayClaim(payload.continuitydb_projects, "continuitydb_projects"),
+        allowed_sensitivities: stringArrayClaim(payload.continuitydb_sensitivities, "continuitydb_sensitivities"),
+      });
+    } catch {
+      return null;
+    }
+  }
+}
+
+export function createOidcAuthorizerFromEnv(env = process.env) {
+  const values = [env.CONTINUITYDB_OIDC_ISSUER, env.CONTINUITYDB_OIDC_AUDIENCE, env.CONTINUITYDB_OIDC_JWKS_URL];
+  if (values.every((value) => !value)) return null;
+  if (values.some((value) => !value)) {
+    throw new Error("CONTINUITYDB_OIDC_ISSUER, CONTINUITYDB_OIDC_AUDIENCE, and CONTINUITYDB_OIDC_JWKS_URL must be configured together");
+  }
+  return new OidcAuthorizer({ issuer: values[0], audience: values[1], jwksUrl: values[2] });
 }
 
 export class TokenBucketLimiter {
