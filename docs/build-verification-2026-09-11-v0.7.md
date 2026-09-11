@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `b48184b90de5f036d917d821e278fba0ba17e66e`
+- **Runtime candidate tested:** `e49ce7c4f1dd0cd971c1a557b59d431a72fbccf3`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
-- **Linux binary size:** `143989800` bytes
+- **Linux binary size:** `143993896` bytes
 - **Linux binary SHA-256:**
-  `cef46ce211365004d3e31c321b8dd4ddc3bc78f6b57dd1072a94450fdcc49438`
+  `d38db47d86f884c2e74f98f4076bd76e205efa623e2eb7218cc3714f81db98d5`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -57,15 +57,15 @@ npm run test:binary:semantic
 
 Observed results on the build host:
 
-- **103/103** primary Node tests passed with **0 failed** and **0 skipped**;
+- **106/106** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run completed with **84 files**, **143.6 kB** packed and
-  **523.3 kB** unpacked;
+- package dry-run completed with **84 files**, **144,997 bytes** packed and
+  **528,871 bytes** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -78,6 +78,13 @@ Observed results on the build host:
 - `setup --apply` preflights every selected connector before mutation, builds a
   new vault in a private staging directory, atomically installs it, and removes
   that newly-created vault if the final connector transaction fails;
+- for a pre-existing vault, setup snapshots every path it may mutate
+  (`config.json`, `records/`, `index/`, and internal `models/`) into a private
+  sibling directory before opening SQLite; a later failure removes the mutated
+  versions and restores the original directory tree, modes, and file bytes;
+- source and compiled-binary regressions verify exact recursive restoration for
+  a pre-existing empty `index/`, an initialized valid database, and live SQLite
+  WAL/SHM sidecars on POSIX;
 - initialization failure occurs before connector mutation and removes only the
   setup artifacts created by the failed invocation, preserving pre-existing
   vault data and client configuration byte-for-byte;
