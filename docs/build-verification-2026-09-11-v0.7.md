@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `e49ce7c4f1dd0cd971c1a557b59d431a72fbccf3`
+- **Runtime candidate tested:** `fd3ac23aa132711478669ecf98d67b350b14dc58`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143993896` bytes
 - **Linux binary SHA-256:**
-  `d38db47d86f884c2e74f98f4076bd76e205efa623e2eb7218cc3714f81db98d5`
+  `0047c85d0dba28d4411ec04c0ee3344952aa612782a42bf3910b1a2fc28224bd`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -57,21 +57,29 @@ npm run test:binary:semantic
 
 Observed results on the build host:
 
-- **106/106** primary Node tests passed with **0 failed** and **0 skipped**;
+- **107/107** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run completed with **84 files**, **144,997 bytes** packed and
-  **528,871 bytes** unpacked;
+- package dry-run on the runtime candidate completed with **84 files**,
+  **145,216 bytes** packed and **529,517 bytes** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
   shutdown, MCP initialization and six-tool discovery, capture, and retrieval;
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
+
+Clean-checkout reproducibility was verified in a new detached Git worktree at
+the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
+exist. A fresh `npm ci --ignore-scripts && npm run release:check` completed
+successfully, built the executable required by the generated Codex
+configuration probe, and was followed by functional and semantic smoke tests
+against that same binary. The release gate therefore does not depend on a
+cached developer-workspace `dist/` artifact.
 
 ## Remediations covered by this candidate
 
@@ -103,7 +111,9 @@ Observed results on the build host:
   tests run after signing;
 - privileged release actions are pinned to immutable commit SHAs;
 - the required `package:check` and `test:codex-config` release aliases are
-  present and exercised.
+  present and exercised; the generated Codex configuration probe builds its
+  required standalone binary before use so it is reproducible from a clean
+  checkout.
 
 ## Evidence boundaries
 
