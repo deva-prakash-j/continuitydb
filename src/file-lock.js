@@ -1,92 +1,111 @@
-import {
-  chmodSync,
-  closeSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
+import { chmodSync, closeSync, existsSync, lstatSync, mkdirSync, openSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
-const WAIT_BUFFER = new Int32Array(new SharedArrayBuffer(4));
 const HELD_LOCKS = new Map();
 
-function processExists(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return true;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error?.code === "EPERM";
+function lockDirectory() {
+  const identity = typeof process.getuid === "function" ? String(process.getuid()) : "default";
+  const directory = join(tmpdir(), `continuitydb-resource-locks-${identity}`);
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(directory);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`resource lock directory must be a real directory: ${directory}`);
   }
+  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+    throw new Error(`resource lock directory must be owned by the current user: ${directory}`);
+  }
+  if (process.platform !== "win32") chmodSync(directory, 0o700);
+  return directory;
 }
 
-function removeDeadOwner(lockPath) {
-  let metadata;
-  try { metadata = lstatSync(lockPath); }
-  catch (error) { if (error.code === "ENOENT") return true; throw error; }
-  if (!metadata.isFile() || metadata.isSymbolicLink()) {
-    throw new Error(`lock path must be a regular file, not a symlink: ${lockPath}`);
-  }
-  let owner;
-  try { owner = JSON.parse(readFileSync(lockPath, "utf8")); }
-  catch { return false; }
-  if (processExists(Number(owner?.pid))) return false;
-  try { unlinkSync(lockPath); return true; }
-  catch (error) { if (error.code === "ENOENT") return true; throw error; }
+function databasePath(resourcePath) {
+  const digest = createHash("sha256").update(resolve(resourcePath)).digest("hex");
+  return join(lockDirectory(), `${digest}.sqlite`);
 }
 
 export function acquireFileLock(lockPath, { timeoutMs = 15_000 } = {}) {
-  const path = resolve(lockPath);
-  const held = HELD_LOCKS.get(path);
+  const resource = resolve(lockPath);
+  const held = HELD_LOCKS.get(resource);
   if (held) {
     held.depth += 1;
     return () => {
-      held.depth -= 1;
-      if (held.depth === 0) held.release();
+      const current = HELD_LOCKS.get(resource);
+      if (!current) return;
+      current.depth -= 1;
+      if (current.depth === 0) current.release();
     };
   }
 
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const deadline = Date.now() + timeoutMs;
-  let descriptor;
-  const token = randomUUID();
-  const payload = `${JSON.stringify({ pid: process.pid, token, created_at: new Date().toISOString() })}\n`;
-  while (descriptor === undefined) {
+  const path = databasePath(resource);
+  if (!existsSync(path)) {
     try {
-      descriptor = openSync(path, "wx", 0o600);
-      writeFileSync(descriptor, payload);
-      chmodSync(path, 0o600);
+      const descriptor = openSync(path, "wx", 0o600);
+      closeSync(descriptor);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      if (removeDeadOwner(path)) continue;
-      if (Date.now() >= deadline) throw new Error(`timed out waiting for lock: ${path}`);
-      Atomics.wait(WAIT_BUFFER, 0, 0, 25);
     }
+  }
+  if (existsSync(path)) {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`resource lock database must be a regular file: ${path}`);
+    }
+    if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
+      throw new Error(`resource lock database must be owned by the current user: ${path}`);
+    }
+  }
+  const database = new DatabaseSync(path);
+  if (process.platform !== "win32") chmodSync(path, 0o600);
+  database.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.trunc(timeoutMs))}`);
+  try {
+    database.exec("BEGIN IMMEDIATE");
+  } catch (error) {
+    database.close();
+    if (String(error?.code || "").includes("BUSY")) {
+      throw new Error(`timed out waiting for lock: ${resource}`);
+    }
+    throw error;
   }
 
   let released = false;
   const release = () => {
     if (released) return;
     released = true;
-    try { closeSync(descriptor); }
+    try { database.exec("COMMIT"); }
     finally {
-      try {
-        if (readFileSync(path, "utf8") !== payload) throw new Error(`lock ownership changed before release: ${path}`);
-        unlinkSync(path);
-      } catch (error) { if (error.code !== "ENOENT") throw error; }
-      HELD_LOCKS.delete(path);
+      database.close();
+      HELD_LOCKS.delete(resource);
     }
   };
-  HELD_LOCKS.set(path, { depth: 1, release });
+  HELD_LOCKS.set(resource, { depth: 1, release });
   return () => {
-    const current = HELD_LOCKS.get(path);
+    const current = HELD_LOCKS.get(resource);
     if (!current) return;
     current.depth -= 1;
     if (current.depth === 0) current.release();
+  };
+}
+
+export function acquireFileLocks(lockPaths, options) {
+  const releases = [];
+  try {
+    for (const path of [...new Set(lockPaths.map((value) => resolve(value)))].sort()) {
+      releases.push(acquireFileLock(path, options));
+    }
+  } catch (error) {
+    for (const release of releases.reverse()) release();
+    throw error;
+  }
+  return () => {
+    const errors = [];
+    for (const release of releases.reverse()) {
+      try { release(); }
+      catch (error) { errors.push(error); }
+    }
+    if (errors.length) throw new AggregateError(errors, "failed to release resource locks");
   };
 }
 

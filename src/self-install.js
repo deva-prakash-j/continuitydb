@@ -17,6 +17,7 @@ import {
 import { basename, delimiter, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { defaultInstallPrefix } from "./agent-connectors.js";
 import { isStandaloneBinary } from "./binary-runtime.js";
+import { acquireFileLock } from "./file-lock.js";
 import { VERSION } from "./version.js";
 
 function sha256(path) {
@@ -164,7 +165,12 @@ export function installStandaloneBinary({
   const plan = { prefix: installationPrefix, source: sourcePath, versioned_binary: versionedBinary, launcher, path_configured: pathConfigured };
   if (!apply) return { installed: false, preview: true, ...plan };
 
-  assertNoSymlinkAncestors(installationPrefix);
+  const releaseInstallLock = acquireFileLock(
+    join(dirname(installationPrefix), `.${basename(installationPrefix)}.continuitydb-install.lock`),
+    { timeoutMs: 120_000 },
+  );
+  try {
+    assertNoSymlinkAncestors(installationPrefix);
   const originalVersioned = entrySnapshot(versionedBinary);
   const originalLauncher = entrySnapshot(launcher);
   if (existsSync(versionedBinary) && sha256(versionedBinary) !== sha256(sourcePath)) {
@@ -248,7 +254,10 @@ export function installStandaloneBinary({
     }
     throw error;
   }
-  return { installed: true, preview: false, ...plan, sha256: sha256(versionedBinary), launcher_backup: launcherBackup?.path || null };
+    return { installed: true, preview: false, ...plan, sha256: sha256(versionedBinary), launcher_backup: launcherBackup?.path || null };
+  } finally {
+    releaseInstallLock();
+  }
 }
 
 function lstatSafe(path) {

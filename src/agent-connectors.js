@@ -19,7 +19,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
-import { acquireFileLock } from "./file-lock.js";
+import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
 
 export const SUPPORTED_AGENTS = Object.freeze(["codex", "claude", "opencode", "cursor", "copilot"]);
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -166,6 +166,10 @@ function cleanupCreatedDirectories(plan, result) {
   }
 }
 
+function configurationLockPath(path) {
+  return join(dirname(path), `.${basename(path)}.continuitydb.lock`);
+}
+
 function atomicWrite(path, content, { root, home, client, apply, expected, beforeReplace }) {
   const createdDirectories = ensureSafeParents(root, path, apply);
   if (!apply) {
@@ -176,7 +180,7 @@ function atomicWrite(path, content, { root, home, client, apply, expected, befor
       : { path, changed: true, applied: false, backup: null, createdDirectories };
   }
 
-  const lockPath = join(dirname(path), `.${basename(path)}.continuitydb.lock`);
+  const lockPath = configurationLockPath(path);
   const releaseLock = acquireFileLock(lockPath);
   try {
     const beforeState = currentSnapshot(path);
@@ -231,27 +235,32 @@ function snapshot(path) {
 function restoreSnapshot(plan, result) {
   const { path, original } = plan;
   if (result.changed === false) return;
-  const current = currentSnapshot(path);
-  const expected = result.written || { existed: true, content: plan.content, mode: 0o600 };
-  if (!sameSnapshot(current, expected)) {
+  const releaseLock = acquireFileLock(configurationLockPath(path));
+  try {
+    const current = currentSnapshot(path);
+    const expected = result.written || { existed: true, content: plan.content, mode: 0o600 };
+    if (!sameSnapshot(current, expected)) {
+      cleanupCreatedDirectories(plan, result);
+      cleanupBackupArtifacts(result.backupArtifacts);
+      throw new Error(`rollback conflict: configuration changed concurrently: ${path}`);
+    }
+    if (original.existed) {
+      const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
+      writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
+      renameSync(temporary, path);
+      chmodSync(path, original.mode || 0o600);
+    } else if (existsSync(path)) {
+      const metadata = lstatSync(path);
+      if (!metadata.isFile() || metadata.isSymbolicLink()) {
+        throw new Error(`refusing to roll back non-file configuration target: ${path}`);
+      }
+      rmSync(path);
+    }
     cleanupCreatedDirectories(plan, result);
     cleanupBackupArtifacts(result.backupArtifacts);
-    throw new Error(`rollback conflict: configuration changed concurrently: ${path}`);
+  } finally {
+    releaseLock();
   }
-  if (original.existed) {
-    const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
-    writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
-    renameSync(temporary, path);
-    chmodSync(path, original.mode || 0o600);
-  } else if (existsSync(path)) {
-    const metadata = lstatSync(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new Error(`refusing to roll back non-file configuration target: ${path}`);
-    }
-    rmSync(path);
-  }
-  cleanupCreatedDirectories(plan, result);
-  cleanupBackupArtifacts(result.backupArtifacts);
 }
 
 function publicResult(plan, result) {
@@ -433,6 +442,7 @@ function applyAgentPlans(plans) {
       })));
   }
 
+  const releaseBatchLocks = acquireFileLocks(plans.map((plan) => configurationLockPath(plan.path)));
   const committed = [];
   try {
     for (const plan of plans) {
@@ -483,6 +493,8 @@ function applyAgentPlans(plans) {
       throw new AggregateError([error], `agent configuration batch failed and rollback was incomplete: ${rollbackErrors.join("; ")}`);
     }
     throw error;
+  } finally {
+    releaseBatchLocks();
   }
 }
 

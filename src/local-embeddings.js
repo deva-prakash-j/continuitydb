@@ -1,21 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
-  closeSync,
   existsSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
   rmSync,
   rmdirSync,
-  statSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { ensureEmbeddedOnnxRuntime } from "./binary-runtime.js";
+import { acquireFileLock } from "./file-lock.js";
 
 const REVISION = "ea104dacec62c0de699686887e3f920caeb4f3e3";
 const REPOSITORY = "Xenova/bge-small-en-v1.5";
@@ -118,71 +115,48 @@ function cacheArtifactMatches(artifact) {
 }
 
 export function restoreLocalModelCache(snapshot, expectedCurrent = null) {
-  verifiedModels.delete(snapshot.cacheKey);
-  if (expectedCurrent) {
-    const conflicts = expectedCurrent.artifacts.filter((artifact) => !cacheArtifactMatches(artifact));
-    if (conflicts.length) {
-      throw new Error(`rollback conflict: local embedding cache changed concurrently: ${conflicts.map((item) => item.path).join(", ")}`);
+  const releaseLock = acquireFileLock(join(snapshot.directory, ".download.lock"), { timeoutMs: 120_000 });
+  try {
+    verifiedModels.delete(snapshot.cacheKey);
+    if (expectedCurrent) {
+      const conflicts = expectedCurrent.artifacts.filter((artifact) => !cacheArtifactMatches(artifact));
+      if (conflicts.length) {
+        throw new Error(`rollback conflict: local embedding cache changed concurrently: ${conflicts.map((item) => item.path).join(", ")}`);
+      }
     }
-  }
-  for (const artifact of snapshot.artifacts) {
-    if (artifact.existed) {
-      mkdirSync(snapshot.directory, { recursive: true, mode: 0o700 });
-      const temporary = `${artifact.path}.${process.pid}.${randomUUID()}.rollback`;
-      writeFileSync(temporary, artifact.bytes, { flag: "wx", mode: artifact.mode || 0o600 });
-      if (existsSync(artifact.path)) {
-        const current = lstatSync(artifact.path);
-        if (!current.isFile() || current.isSymbolicLink()) {
-          rmSync(temporary);
-          throw new Error(`refusing to replace unexpected local embedding cache artifact: ${artifact.path}`);
+    for (const artifact of snapshot.artifacts) {
+      if (artifact.existed) {
+        mkdirSync(snapshot.directory, { recursive: true, mode: 0o700 });
+        const temporary = `${artifact.path}.${process.pid}.${randomUUID()}.rollback`;
+        writeFileSync(temporary, artifact.bytes, { flag: "wx", mode: artifact.mode || 0o600 });
+        if (existsSync(artifact.path)) {
+          const current = lstatSync(artifact.path);
+          if (!current.isFile() || current.isSymbolicLink()) {
+            rmSync(temporary);
+            throw new Error(`refusing to replace unexpected local embedding cache artifact: ${artifact.path}`);
+          }
+          rmSync(artifact.path);
+        }
+        renameSync(temporary, artifact.path);
+        chmodSync(artifact.path, artifact.mode || 0o600);
+      } else if (existsSync(artifact.path)) {
+        const metadata = lstatSync(artifact.path);
+        if (!metadata.isFile() || metadata.isSymbolicLink()) {
+          throw new Error(`refusing to remove unexpected local embedding cache artifact: ${artifact.path}`);
         }
         rmSync(artifact.path);
       }
-      renameSync(temporary, artifact.path);
-      chmodSync(artifact.path, artifact.mode || 0o600);
-    } else if (existsSync(artifact.path)) {
-      const metadata = lstatSync(artifact.path);
-      if (!metadata.isFile() || metadata.isSymbolicLink()) {
-        throw new Error(`refusing to remove unexpected local embedding cache artifact: ${artifact.path}`);
-      }
-      rmSync(artifact.path);
     }
-  }
-  if (!snapshot.directoryExisted && existsSync(snapshot.directory)) {
-    try { rmdirSync(snapshot.directory); }
-    catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
-  }
-  if (!snapshot.baseExisted && existsSync(snapshot.base)) {
-    try { rmdirSync(snapshot.base); }
-    catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
-  }
-}
-
-function sleep(milliseconds) {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, milliseconds));
-}
-
-async function acquireLock(path, timeoutMs = 120_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    try {
-      const descriptor = openSync(path, "wx", 0o600);
-      writeFileSync(descriptor, `${process.pid}\n${new Date().toISOString()}\n`);
-      closeSync(descriptor);
-      return;
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      try {
-        if (Date.now() - statSync(path).mtimeMs > 10 * 60_000) {
-          unlinkSync(path);
-          continue;
-        }
-      } catch (statError) {
-        if (statError.code !== "ENOENT") throw statError;
-      }
-      if (Date.now() >= deadline) throw new Error("timed out waiting for the local embedding model download lock");
-      await sleep(250);
+    if (!snapshot.directoryExisted && existsSync(snapshot.directory)) {
+      try { rmdirSync(snapshot.directory); }
+      catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
     }
+    if (!snapshot.baseExisted && existsSync(snapshot.base)) {
+      try { rmdirSync(snapshot.base); }
+      catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
+    }
+  } finally {
+    releaseLock();
   }
 }
 
@@ -250,14 +224,14 @@ export async function ensureLocalModel({ home, cacheDir, offline = false, fetchI
   }
   chmodSync(status.directory, 0o700);
   const lock = join(status.directory, ".download.lock");
-  await acquireLock(lock);
+  const releaseLock = acquireFileLock(lock, { timeoutMs: 120_000 });
   try {
     for (const artifact of spec.artifacts) {
       const destination = join(status.directory, artifact.name);
       if (!validArtifact(destination, artifact)) await downloadArtifact(status.directory, artifact, fetchImpl, spec);
     }
   } finally {
-    try { unlinkSync(lock); } catch (error) { if (error.code !== "ENOENT") throw error; }
+    releaseLock();
   }
   const completed = localModelStatus({ home, cacheDir, spec });
   if (!completed.ready) throw new Error("local embedding model installation did not complete");
