@@ -1,12 +1,50 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import { BUILTIN_LOCAL_MODEL } from "../src/local-embeddings.js";
 import { ContextVault } from "../src/store.js";
 import { VERSION } from "../src/version.js";
+
+function snapshotTree(root) {
+  if (!existsSync(root)) return [];
+  const entries = [];
+  const walk = (directory, relative = "") => {
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name);
+      const child = relative ? `${relative}/${name}` : name;
+      const metadata = lstatSync(path);
+      if (metadata.isDirectory()) {
+        entries.push({ path: `${child}/`, type: "directory", mode: metadata.mode & 0o777 });
+        walk(path, child);
+      } else {
+        assert.equal(metadata.isFile(), true, `unexpected non-regular setup artifact: ${child}`);
+        entries.push({
+          path: child,
+          type: "file",
+          mode: metadata.mode & 0o777,
+          bytes: metadata.size,
+          sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+        });
+      }
+    }
+  };
+  walk(root);
+  return entries;
+}
+
+function forceSetupConnectorFailure({ cli, home, project }) {
+  mkdirSync(join(project, ".codex"), { recursive: true });
+  writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+  writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+  return spawnSync(process.execPath, [
+    cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+  ], { encoding: "utf8" });
+}
 
 test("CLI version matches the package version", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
@@ -110,6 +148,81 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
     assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
     assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup restores a pre-existing empty index directory byte-for-byte", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-empty-index-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(home, "index"), { recursive: true });
+    mkdirSync(project);
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(home);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.deepEqual(snapshotTree(home), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup restores a pre-existing valid vault database byte-for-byte", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-valid-db-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(project);
+    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr);
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(home);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(snapshotTree(home), before);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-wal-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  let database;
+  try {
+    mkdirSync(project);
+    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr);
+    database = new DatabaseSync(join(home, "index", "context-vault.db"));
+    database.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS rollback_probe(value TEXT); INSERT INTO rollback_probe VALUES ('before');");
+    assert.equal(existsSync(join(home, "index", "context-vault.db-wal")), true);
+    assert.equal(existsSync(join(home, "index", "context-vault.db-shm")), true);
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(home);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.deepEqual(snapshotTree(home), before);
+  } finally {
+    database?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

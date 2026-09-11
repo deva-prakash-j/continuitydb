@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 import {
   chmodSync,
+  cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -116,6 +118,7 @@ const cliTenantId = process.env.CONTINUITYDB_TENANT_ID || "local";
 const cliPrincipalId = process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user";
 const cliOwnerId = process.env.CONTINUITYDB_OWNER_ID || cliPrincipalId;
 const cliAgentId = process.env.CONTINUITYDB_AGENT_ID || null;
+const SETUP_MUTATED_PATHS = Object.freeze(["config.json", "records", "index", "models"]);
 
 if (!command || command === "help" || flags.help) {
   usage();
@@ -155,11 +158,73 @@ function assertSetupHome(path) {
   }
 }
 
-function removeCreatedSetupArtifacts(home, before) {
-  const paths = ["config.json", "records", "index", "models"];
-  for (const name of paths.reverse()) {
-    const path = join(home, name);
-    if (!before.has(name) && existsSync(path)) rmSync(path, { recursive: true, force: true });
+function copySetupPath(source, destination) {
+  const metadata = lstatSync(source);
+  if (metadata.isSymbolicLink()) throw new Error(`setup state must not contain a symlink: ${source}`);
+  if (!metadata.isFile() && !metadata.isDirectory()) {
+    throw new Error(`setup state must contain only regular files and directories: ${source}`);
+  }
+  if (metadata.isDirectory()) {
+    mkdirSync(destination, { mode: metadata.mode & 0o777 });
+    for (const name of readdirSync(source)) copySetupPath(join(source, name), join(destination, name));
+    return;
+  }
+  cpSync(source, destination, {
+    recursive: false,
+    dereference: false,
+    errorOnExist: true,
+    force: false,
+    preserveTimestamps: true,
+  });
+}
+
+function snapshotSetupHome(home) {
+  const directory = mkdtempSync(join(dirname(home), `.${basename(home)}.rollback-`));
+  chmodSync(directory, 0o700);
+  const entries = [];
+  try {
+    for (const name of SETUP_MUTATED_PATHS) {
+      const source = join(home, name);
+      if (!existsSync(source)) continue;
+      copySetupPath(source, join(directory, name));
+      entries.push(name);
+    }
+    return { directory, entries, home };
+  } catch (error) {
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function discardSetupSnapshot(snapshot) {
+  if (snapshot?.directory && existsSync(snapshot.directory)) {
+    rmSync(snapshot.directory, { recursive: true, force: true });
+  }
+}
+
+function restoreSetupSnapshot(snapshot) {
+  if (!snapshot) return;
+  const originals = new Set(snapshot.entries);
+  for (const name of [...SETUP_MUTATED_PATHS].reverse()) {
+    const target = join(snapshot.home, name);
+    if (existsSync(target)) {
+      const metadata = lstatSync(target);
+      if (metadata.isSymbolicLink()) throw new Error(`refusing to replace setup symlink during rollback: ${target}`);
+      rmSync(target, { recursive: true, force: true });
+    }
+  }
+  for (const name of SETUP_MUTATED_PATHS) {
+    if (!originals.has(name)) continue;
+    copySetupPath(join(snapshot.directory, name), join(snapshot.home, name));
+  }
+  discardSetupSnapshot(snapshot);
+}
+
+function rollbackInitializedSetup(initialized) {
+  if (initialized.created) {
+    if (existsSync(initialized.home)) rmSync(initialized.home, { recursive: true, force: true });
+  } else {
+    restoreSetupSnapshot(initialized.vaultSnapshot);
   }
 }
 
@@ -169,13 +234,13 @@ async function initializeSetupHome(home, flags) {
   const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
   let target = home;
   let staging = null;
-  let before = new Set();
+  let vaultSnapshot = null;
   const externalCacheSnapshot = flags.semantic && configuredCache
     ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
     : null;
 
   if (existed) {
-    before = new Set(["config.json", "records", "index", "models"].filter((name) => existsSync(join(home, name))));
+    vaultSnapshot = snapshotSetupHome(home);
   } else {
     mkdirSync(dirname(home), { recursive: true, mode: 0o700 });
     staging = mkdtempSync(join(dirname(home), `.${basename(home)}.setup-`));
@@ -207,16 +272,19 @@ async function initializeSetupHome(home, flags) {
       staging = null;
       if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
     }
-    return { stats, embeddings, created: !existed, before, externalCacheSnapshot };
+    return { stats, embeddings, created: !existed, home, vaultSnapshot, externalCacheSnapshot };
   } catch (error) {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
-    if (existed) removeCreatedSetupArtifacts(home, before);
+    const rollbackErrors = [];
+    if (existed) {
+      try { restoreSetupSnapshot(vaultSnapshot); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
+    }
     if (externalCacheSnapshot) {
       try { restoreLocalModelCache(externalCacheSnapshot); }
-      catch (rollbackError) {
-        throw new AggregateError([error, rollbackError], "setup initialization failed and external model-cache rollback was incomplete");
-      }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
+    if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup initialization failed and rollback was incomplete");
     throw error;
   }
 }
@@ -257,16 +325,17 @@ try {
       // remove it as well so setup remains end-to-end atomic.
       connections = connectAgents(selected, connectionOptions);
     } catch (error) {
-      if (initialized.created && existsSync(home)) rmSync(home, { recursive: true, force: true });
-      else removeCreatedSetupArtifacts(home, initialized.before);
+      const rollbackErrors = [];
+      try { rollbackInitializedSetup(initialized); }
+      catch (rollbackError) { rollbackErrors.push(rollbackError); }
       if (initialized.externalCacheSnapshot) {
         try { restoreLocalModelCache(initialized.externalCacheSnapshot); }
-        catch (rollbackError) {
-          throw new AggregateError([error, rollbackError], "setup failed and external model-cache rollback was incomplete");
-        }
+        catch (rollbackError) { rollbackErrors.push(rollbackError); }
       }
+      if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");
       throw error;
     }
+    discardSetupSnapshot(initialized.vaultSnapshot);
     output({
       setup: true,
       home,

@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -21,6 +23,56 @@ function run(args) {
   const result = spawnSync(binary, args, { encoding: "utf8", timeout: 30_000 });
   assert.equal(result.status, 0, `${args.join(" ")} failed: ${result.stderr}`);
   return result.stdout.trim() ? JSON.parse(result.stdout) : null;
+}
+
+function snapshotTree(directory) {
+  const entries = [];
+  const walk = (root, relative = "") => {
+    for (const name of readdirSync(root).sort()) {
+      const path = join(root, name);
+      const child = relative ? `${relative}/${name}` : name;
+      const metadata = lstatSync(path);
+      if (metadata.isDirectory()) {
+        entries.push({ path: `${child}/`, type: "directory", mode: metadata.mode & 0o777 });
+        walk(path, child);
+      } else {
+        assert.equal(metadata.isFile(), true, `unexpected non-regular vault entry: ${child}`);
+        entries.push({
+          path: child,
+          type: "file",
+          mode: metadata.mode & 0o777,
+          bytes: metadata.size,
+          sha256: createHash("sha256").update(readFileSync(path)).digest("hex"),
+        });
+      }
+    }
+  };
+  walk(directory);
+  return entries;
+}
+
+function assertFailedSetupRestoresVault(name, initialize) {
+  const caseRoot = join(root, `rollback-${name}`);
+  const caseProject = join(caseRoot, "project");
+  const caseHome = join(caseRoot, "vault");
+  mkdirSync(caseProject, { recursive: true });
+  mkdirSync(caseHome, { recursive: true });
+  let close = null;
+  try {
+    close = initialize(caseHome);
+    mkdirSync(join(caseProject, ".codex"), { recursive: true });
+    writeFileSync(join(caseProject, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(caseHome, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(caseHome);
+    const result = spawnSync(binary, [
+      "setup", "--home", caseHome, "--project-dir", caseProject, "--agents", "codex", "--apply",
+    ], { encoding: "utf8", timeout: 30_000 });
+    assert.notEqual(result.status, 0, `${name} rollback probe unexpectedly succeeded`);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.deepEqual(snapshotTree(caseHome), before, `${name} vault changed after failed setup`);
+  } finally {
+    close?.();
+  }
 }
 
 async function proveHttpService(expectedVersion) {
@@ -77,6 +129,23 @@ try {
   assert.equal(JSON.parse(installedResult.stdout).version, version.version);
   await proveHttpService(version.version);
 
+  assertFailedSetupRestoresVault("empty-index", (caseHome) => {
+    mkdirSync(join(caseHome, "index"), { recursive: true });
+  });
+  assertFailedSetupRestoresVault("valid-db", (caseHome) => {
+    run(["init", "--home", caseHome]);
+  });
+  if (process.platform !== "win32") {
+    assertFailedSetupRestoresVault("wal-shm", (caseHome) => {
+      run(["init", "--home", caseHome]);
+      const database = new DatabaseSync(join(caseHome, "index", "context-vault.db"));
+      database.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS rollback_probe(value TEXT); INSERT INTO rollback_probe VALUES ('before');");
+      assert.equal(existsSync(join(caseHome, "index", "context-vault.db-wal")), true);
+      assert.equal(existsSync(join(caseHome, "index", "context-vault.db-shm")), true);
+      return () => database.close();
+    });
+  }
+
   const transport = new StdioClientTransport({
     command: binary,
     args: ["mcp", "--home", home],
@@ -115,7 +184,7 @@ try {
     version: version.version,
     platform: version.platform,
     arch: version.arch,
-    checks: ["self-install", "setup", "doctor", "five-agent-config", "http-service", "mcp-tools", "capture-search"],
+    checks: ["self-install", "setup", "doctor", "five-agent-config", "http-service", "setup-rollback", "mcp-tools", "capture-search"],
   }, null, 2)}\n`);
 } finally {
   rmSync(root, { recursive: true, force: true });
