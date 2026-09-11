@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `fd3ac23aa132711478669ecf98d67b350b14dc58`
+- **Runtime candidate tested:** `b14cf051d532557ab1bb039617b42309723c0a8a`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143993896` bytes
 - **Linux binary SHA-256:**
-  `0047c85d0dba28d4411ec04c0ee3344952aa612782a42bf3910b1a2fc28224bd`
+  `39a079fc1b0fa5b9d294a17eb6ccbf55302a277e94d95b880822d7a5bce5278f`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -53,25 +53,29 @@ npm run package:check
 npm run test:codex-config
 npm run test:binary
 npm run test:binary:semantic
+npm run test:binary:reproducible
 ```
 
 Observed results on the build host:
 
-- **107/107** primary Node tests passed with **0 failed** and **0 skipped**;
+- **108/108** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
 - client adapter and release-workflow validators passed;
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
-- package dry-run on the runtime candidate completed with **84 files**,
-  **145,216 bytes** packed and **529,517 bytes** unpacked;
+- package dry-run on the runtime candidate completed with **85 files**,
+  **147,307 bytes** packed and **536,382 bytes** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
   shutdown, MCP initialization and six-tool discovery, capture, and retrieval;
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
+- two independent clean-directory builds produced byte-identical Linux
+  executables: **143,993,896 bytes**, SHA-256
+  `39a079fc1b0fa5b9d294a17eb6ccbf55302a277e94d95b880822d7a5bce5278f`.
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -86,13 +90,13 @@ cached developer-workspace `dist/` artifact.
 - `setup --apply` preflights every selected connector before mutation, builds a
   new vault in a private staging directory, atomically installs it, and removes
   that newly-created vault if the final connector transaction fails;
-- for a pre-existing vault, setup snapshots every path it may mutate
-  (`config.json`, `records/`, `index/`, and internal `models/`) into a private
-  sibling directory before opening SQLite; a later failure removes the mutated
-  versions and restores the original directory tree, modes, and file bytes;
-- source and compiled-binary regressions verify exact recursive restoration for
-  a pre-existing empty `index/`, an initialized valid database, and live SQLite
-  WAL/SHM sidecars on POSIX;
+- for a pre-existing initialized vault, setup opens the existing database in
+  immutable read-only mode and never snapshots, restores, or rewinds live
+  SQLite files; a concurrent capture committed while setup is paused remains
+  present after a later connector failure;
+- only setup-owned configuration or internal model-cache paths are eligible for
+  rollback, while connector configuration changes use their own reversible
+  transaction;
 - initialization failure occurs before connector mutation and removes only the
   setup artifacts created by the failed invocation, preserving pre-existing
   vault data and client configuration byte-for-byte;
@@ -114,6 +118,9 @@ cached developer-workspace `dist/` artifact.
   present and exercised; the generated Codex configuration probe builds its
   required standalone binary before use so it is reproducible from a clean
   checkout.
+- Node SEA builds run from a stable versioned staging path, and
+  `test:binary:reproducible` builds in two independent clean directories and
+  rejects any byte or SHA-256 difference.
 
 ## Evidence boundaries
 
