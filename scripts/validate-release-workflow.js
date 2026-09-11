@@ -87,11 +87,43 @@ export function validateReleaseWorkflow(document) {
     invariant(verifyCommand.includes(asset), `release verification must require ${asset}`);
   }
   invariant(verifyCommand.includes("sha256sum -c"), "release artifact checksums must be verified before publication");
+  const identityStep = publishSteps.find((step) => String(step.name || "").includes("Resolve idempotent release identity"));
+  const identityCommand = String(identityStep?.run || "");
+  invariant(identityCommand.includes('tag=main-${GITHUB_SHA}') && !identityCommand.includes('tag=main-${GITHUB_SHA:0:'),
+    "main prerelease tag must contain the complete commit SHA");
   const releaseCommand = String(publishSteps[releaseIndex]?.run || "");
+  const releaseEnvironment = publishSteps[releaseIndex]?.env || {};
+  invariant(String(releaseEnvironment.GH_REPO || "").includes("github.repository"),
+    "publish commands require an explicit GH_REPO outside a Git checkout");
+  invariant(releaseCommand.includes('--repo "$GH_REPO"'),
+    "every release operation must explicitly target GH_REPO");
   invariant(releaseCommand.includes("gh release upload") && releaseCommand.includes("--clobber"),
     "release publication must be idempotent on workflow reruns");
   invariant(releaseCommand.includes("--target \"$GITHUB_SHA\"") && releaseCommand.includes("--prerelease"),
     "main pushes must create commit-bound prereleases");
+  invariant(releaseCommand.includes("targetCommitish") && releaseCommand.includes('[[ "$existing_target" == "$GITHUB_SHA" ]]'),
+    "an existing main prerelease must be bound to the exact commit before refresh");
+  invariant(releaseCommand.includes("isPrerelease") && releaseCommand.includes('[[ "$existing_prerelease" == "true" ]]'),
+    "an existing main release must remain a prerelease before refresh");
+
+  const publishedVerifyCommand = String(publishSteps[publishedVerifyIndex]?.run || "");
+  const publishedVerifyEnvironment = publishSteps[publishedVerifyIndex]?.env || {};
+  invariant(String(publishedVerifyEnvironment.GH_REPO || "").includes("github.repository"),
+    "post-publication verification requires explicit GH_REPO");
+  invariant(publishedVerifyCommand.includes("gh release download") && publishedVerifyCommand.includes('--repo "$GH_REPO"'),
+    "post-publication verification must download from the explicit repository");
+  invariant(publishedVerifyCommand.includes('[[ "${actual[*]}" == "${expected[*]}" ]]'),
+    "post-publication verification must enforce the exact six-asset set");
+  invariant(publishedVerifyCommand.includes('sha256sum "$verify_dir/$binary"') &&
+    publishedVerifyCommand.includes('sha256sum "release/$binary"'),
+    "published binary digests must match the verified build inputs");
+  invariant(publishedVerifyCommand.includes("sha256sum -c"),
+    "downloaded checksum sidecars must be verified");
+  invariant(publishedVerifyCommand.includes("gh attestation verify") &&
+    publishedVerifyCommand.includes('--repo "$GH_REPO"'),
+    "published binaries must pass provenance verification");
+  invariant(publishedVerifyCommand.includes("targetCommitish") && publishedVerifyCommand.includes("isPrerelease"),
+    "published release identity must be verified after publication");
   return { valid: true, native_targets: [...names].sort() };
 }
 

@@ -75,7 +75,8 @@ WASM inference gate.
 Pull requests, pushes to `main`, and tagged-release automation apply the same
 gates on every supported native matrix target. Every successful `main` push
 creates or refreshes one commit-bound GitHub prerelease named
-`main-<12-character-commit>`. A workflow rerun updates that same prerelease
+`main-<full-commit-sha>`. A workflow rerun updates that same prerelease only
+after confirming its target commit and prerelease state
 instead of creating a duplicate. A pushed `v*` tag creates the stable release
 for that tag.
 For macOS, signing happens before both the ordinary binary smoke and semantic
@@ -83,7 +84,10 @@ inference smoke. Checksums and artifact upload happen only after those blocking
 tests pass; publication depends on the complete native matrix. Before
 publication, the workflow requires all three supported binaries and their
 SHA-256 sidecars, verifies each checksum, creates build-provenance attestations,
-and then verifies that every expected asset exists on the GitHub Release.
+and then downloads the published assets into a clean directory. It requires
+the exact six-file set, compares released binary digests with the verified
+build inputs, checks all three sidecars, and verifies build provenance for each
+released binary.
 
 ## Install
 

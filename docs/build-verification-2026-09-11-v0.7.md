@@ -153,10 +153,13 @@ cached developer-workspace `dist/` artifact.
   tests run after signing;
 - every successful push to `main` creates a commit-bound prerelease containing
   all supported binaries and checksum sidecars; reruns update that same release
-  idempotently, while pushed `v*` tags continue to create stable releases;
+  idempotently only after verifying the full target SHA and prerelease state,
+  while pushed `v*` tags continue to create stable releases;
 - the publish job verifies the complete six-file native release set and every
-  SHA-256 sidecar before provenance attestation and publication, then queries
-  the GitHub Release and requires all expected assets after publication;
+  SHA-256 sidecar before provenance attestation and publication, then downloads
+  the exact six released files into a clean directory, compares their bytes to
+  the verified build inputs, checks every sidecar, and verifies provenance for
+  each released binary;
 - privileged release actions are pinned to immutable commit SHAs;
 - standalone fresh installs and forced upgrades are transactional across the
   versioned binary, launcher, backup artifacts, and created directories;

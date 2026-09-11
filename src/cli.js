@@ -204,8 +204,34 @@ function discardSetupSnapshot(snapshot) {
   }
 }
 
-function restoreSetupSnapshot(snapshot) {
+function setupPathMatches(left, right) {
+  const leftExists = existsSync(left);
+  const rightExists = existsSync(right);
+  if (leftExists !== rightExists) return false;
+  if (!leftExists) return true;
+  const leftMetadata = lstatSync(left);
+  const rightMetadata = lstatSync(right);
+  if (leftMetadata.isSymbolicLink() || rightMetadata.isSymbolicLink()) return false;
+  if (leftMetadata.isFile() !== rightMetadata.isFile() || leftMetadata.isDirectory() !== rightMetadata.isDirectory()) return false;
+  if ((leftMetadata.mode & 0o777) !== (rightMetadata.mode & 0o777)) return false;
+  if (leftMetadata.isFile()) return readFileSync(left).equals(readFileSync(right));
+  const leftNames = readdirSync(left).sort();
+  const rightNames = readdirSync(right).sort();
+  if (leftNames.length !== rightNames.length || leftNames.some((name, index) => name !== rightNames[index])) return false;
+  return leftNames.every((name) => setupPathMatches(join(left, name), join(right, name)));
+}
+
+function restoreSetupSnapshot(snapshot, expectedCurrent = null) {
   if (!snapshot) return;
+  if (expectedCurrent) {
+    const conflicts = snapshot.paths.filter((name) => !setupPathMatches(
+      join(snapshot.home, name),
+      join(expectedCurrent.directory, name),
+    ));
+    if (conflicts.length) {
+      throw new Error(`rollback conflict: setup state changed concurrently: ${conflicts.map((name) => join(snapshot.home, name)).join(", ")}`);
+    }
+  }
   const originals = new Set(snapshot.entries);
   for (const name of [...snapshot.paths].reverse()) {
     const target = join(snapshot.home, name);
@@ -260,7 +286,7 @@ function rollbackInitializedSetup(initialized) {
   if (initialized.created) {
     if (existsSync(initialized.home)) rmSync(initialized.home, { recursive: true, force: true });
   } else {
-    restoreSetupSnapshot(initialized.vaultSnapshot);
+    restoreSetupSnapshot(initialized.vaultSnapshot, initialized.expectedVaultSnapshot);
   }
 }
 
@@ -272,8 +298,9 @@ async function initializeSetupHome(home, flags) {
   let staging = null;
   let vaultSnapshot = null;
   let existingStats = null;
-  let externalCacheWritten = null;
-  const externalCacheSnapshot = flags.semantic && configuredCache
+  let expectedVaultSnapshot = null;
+  let modelCacheWritten = null;
+  const modelCacheSnapshot = flags.semantic && (existed || configuredCache)
     ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
     : null;
 
@@ -282,9 +309,8 @@ async function initializeSetupHome(home, flags) {
     const paths = existingStats
       ? [
         ...(!existsSync(join(home, "config.json")) ? ["config.json"] : []),
-        ...(flags.semantic && !configuredCache ? ["models"] : []),
       ]
-      : SETUP_MUTATED_PATHS;
+      : SETUP_MUTATED_PATHS.filter((name) => name !== "models");
     vaultSnapshot = snapshotSetupHome(home, paths);
     await synchronizeSetupSnapshotForTest(vaultSnapshot);
   } else {
@@ -296,6 +322,7 @@ async function initializeSetupHome(home, flags) {
 
   try {
     const configPath = join(target, "config.json");
+    let createdConfig = false;
     if (!existsSync(configPath)) {
       writeFileSync(configPath, `${JSON.stringify({
         schema_version: 2,
@@ -304,6 +331,10 @@ async function initializeSetupHome(home, flags) {
         owner_id: flags.owner || cliOwnerId,
         created_at: new Date().toISOString(),
       }, null, 2)}\n`, { mode: 0o600 });
+      createdConfig = true;
+    }
+    if (vaultSnapshot && !createdConfig && existingStats) {
+      vaultSnapshot.paths = vaultSnapshot.paths.filter((name) => name !== "config.json");
     }
     let stats = existingStats;
     if (!stats) {
@@ -311,11 +342,12 @@ async function initializeSetupHome(home, flags) {
       stats = vault.stats();
       vault.close();
     }
+    if (vaultSnapshot) expectedVaultSnapshot = snapshotSetupHome(home, vaultSnapshot.paths);
     let embeddings = null;
     if (flags.semantic) {
       embeddings = await ensureLocalModel({ home: target, cacheDir: configuredCache });
-      if (externalCacheSnapshot) {
-        externalCacheWritten = snapshotLocalModelCache({ home: target, cacheDir: configuredCache });
+      if (modelCacheSnapshot) {
+        modelCacheWritten = snapshotLocalModelCache({ home: target, cacheDir: configuredCache });
       }
     }
     if (staging) {
@@ -324,18 +356,19 @@ async function initializeSetupHome(home, flags) {
       staging = null;
       if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
     }
-    return { stats, embeddings, created: !existed, home, vaultSnapshot, externalCacheSnapshot, externalCacheWritten };
+    return { stats, embeddings, created: !existed, home, vaultSnapshot, expectedVaultSnapshot, modelCacheSnapshot, modelCacheWritten };
   } catch (error) {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     const rollbackErrors = [];
     if (existed) {
-      try { restoreSetupSnapshot(vaultSnapshot); }
+      try { restoreSetupSnapshot(vaultSnapshot, expectedVaultSnapshot); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
-    if (externalCacheSnapshot && externalCacheWritten) {
-      try { restoreLocalModelCache(externalCacheSnapshot, externalCacheWritten); }
+    if (modelCacheSnapshot && modelCacheWritten) {
+      try { restoreLocalModelCache(modelCacheSnapshot, modelCacheWritten); }
       catch (rollbackError) { rollbackErrors.push(rollbackError); }
     }
+    discardSetupSnapshot(expectedVaultSnapshot);
     if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup initialization failed and rollback was incomplete");
     throw error;
   }
@@ -371,9 +404,9 @@ try {
 
     const releaseInitializationLock = acquireVaultInitializationLock(home);
     const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
-    let releaseExternalCacheLock = null;
+    let releaseModelCacheLock = null;
     try {
-      releaseExternalCacheLock = flags.semantic && configuredCache
+      releaseModelCacheLock = flags.semantic
         ? acquireLocalModelCacheLock({ home, cacheDir: configuredCache })
         : null;
       const initialized = await initializeSetupHome(home, flags);
@@ -387,14 +420,16 @@ try {
         const rollbackErrors = [];
         try { rollbackInitializedSetup(initialized); }
         catch (rollbackError) { rollbackErrors.push(rollbackError); }
-        if (initialized.externalCacheSnapshot && initialized.externalCacheWritten) {
-          try { restoreLocalModelCache(initialized.externalCacheSnapshot, initialized.externalCacheWritten); }
+        if (initialized.modelCacheSnapshot && initialized.modelCacheWritten) {
+          try { restoreLocalModelCache(initialized.modelCacheSnapshot, initialized.modelCacheWritten); }
           catch (rollbackError) { rollbackErrors.push(rollbackError); }
         }
+        discardSetupSnapshot(initialized.expectedVaultSnapshot);
         if (rollbackErrors.length) throw new AggregateError([error, ...rollbackErrors], "setup failed and rollback was incomplete");
         throw error;
       }
       discardSetupSnapshot(initialized.vaultSnapshot);
+      discardSetupSnapshot(initialized.expectedVaultSnapshot);
       output({
         setup: true,
         home,
@@ -407,7 +442,7 @@ try {
         run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
       });
     } finally {
-      try { if (releaseExternalCacheLock) releaseExternalCacheLock(); }
+      try { if (releaseModelCacheLock) releaseModelCacheLock(); }
       finally { releaseInitializationLock(); }
     }
   } else if (command === "agents") {

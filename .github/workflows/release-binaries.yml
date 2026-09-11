@@ -95,7 +95,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF" == refs/heads/main ]]; then
-            echo "tag=main-${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
+            echo "tag=main-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
             echo "title=ContinuityDB main build ${GITHUB_SHA:0:12}" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           else
@@ -105,22 +105,33 @@ jobs:
           fi
       - env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
           RELEASE_TITLE: ${{ steps.release.outputs.title }}
           RELEASE_PRERELEASE: ${{ steps.release.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" release/* --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            existing_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+            if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+              existing_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
+              [[ "$existing_target" == "$GITHUB_SHA" ]]
+              [[ "$existing_prerelease" == "true" ]]
+            else
+              [[ "$existing_prerelease" == "false" ]]
+            fi
+            gh release upload "$RELEASE_TAG" release/* --clobber --repo "$GH_REPO"
           elif [[ "$RELEASE_PRERELEASE" == "true" ]]; then
             gh release create "$RELEASE_TAG" release/* \
+              --repo "$GH_REPO" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_TITLE" \
               --generate-notes \
               --prerelease
           else
             gh release create "$RELEASE_TAG" release/* \
+              --repo "$GH_REPO" \
               --verify-tag \
               --title "$RELEASE_TITLE" \
               --generate-notes
@@ -128,17 +139,45 @@ jobs:
       - name: Verify published release assets
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_PRERELEASE: ${{ steps.release.outputs.prerelease }}
         shell: bash
         run: |
           set -euo pipefail
-          assets="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name')"
-          for expected in \
-            continuitydb-linux-x64 \
-            continuitydb-linux-x64.sha256 \
-            continuitydb-darwin-arm64 \
-            continuitydb-darwin-arm64.sha256 \
-            continuitydb-win32-x64.exe \
-            continuitydb-win32-x64.exe.sha256; do
-            grep -Fx "$expected" <<<"$assets" >/dev/null
+          published_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+          if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
+            published_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
+            [[ "$published_target" == "$GITHUB_SHA" ]]
+            [[ "$published_prerelease" == "true" ]]
+          else
+            [[ "$published_prerelease" == "false" ]]
+          fi
+
+          verify_dir="$(mktemp -d)"
+          gh release download "$RELEASE_TAG" --repo "$GH_REPO" --dir "$verify_dir"
+          expected=(
+            continuitydb-darwin-arm64
+            continuitydb-darwin-arm64.sha256
+            continuitydb-linux-x64
+            continuitydb-linux-x64.sha256
+            continuitydb-win32-x64.exe
+            continuitydb-win32-x64.exe.sha256
+          )
+          mapfile -t actual < <(find "$verify_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+          [[ "${actual[*]}" == "${expected[*]}" ]]
+
+          for binary in continuitydb-linux-x64 continuitydb-darwin-arm64 continuitydb-win32-x64.exe; do
+            expected_digest="$(sha256sum "release/$binary" | cut -d ' ' -f 1)"
+            actual_digest="$(sha256sum "$verify_dir/$binary" | cut -d ' ' -f 1)"
+            [[ "$actual_digest" == "$expected_digest" ]]
+          done
+          (
+            cd "$verify_dir"
+            sha256sum -c continuitydb-linux-x64.sha256
+            sha256sum -c continuitydb-darwin-arm64.sha256
+            sha256sum -c continuitydb-win32-x64.exe.sha256
+          )
+          for binary in continuitydb-linux-x64 continuitydb-darwin-arm64 continuitydb-win32-x64.exe; do
+            gh attestation verify "$verify_dir/$binary" --repo "$GH_REPO"
           done
