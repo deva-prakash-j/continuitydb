@@ -178,18 +178,18 @@ function copySetupPath(source, destination) {
   });
 }
 
-function snapshotSetupHome(home) {
+function snapshotSetupHome(home, paths = SETUP_MUTATED_PATHS) {
   const directory = mkdtempSync(join(dirname(home), `.${basename(home)}.rollback-`));
   chmodSync(directory, 0o700);
   const entries = [];
   try {
-    for (const name of SETUP_MUTATED_PATHS) {
+    for (const name of paths) {
       const source = join(home, name);
       if (!existsSync(source)) continue;
       copySetupPath(source, join(directory, name));
       entries.push(name);
     }
-    return { directory, entries, home };
+    return { directory, entries, home, paths: [...paths] };
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
     throw error;
@@ -205,7 +205,7 @@ function discardSetupSnapshot(snapshot) {
 function restoreSetupSnapshot(snapshot) {
   if (!snapshot) return;
   const originals = new Set(snapshot.entries);
-  for (const name of [...SETUP_MUTATED_PATHS].reverse()) {
+  for (const name of [...snapshot.paths].reverse()) {
     const target = join(snapshot.home, name);
     if (existsSync(target)) {
       const metadata = lstatSync(target);
@@ -213,11 +213,45 @@ function restoreSetupSnapshot(snapshot) {
       rmSync(target, { recursive: true, force: true });
     }
   }
-  for (const name of SETUP_MUTATED_PATHS) {
+  for (const name of snapshot.paths) {
     if (!originals.has(name)) continue;
     copySetupPath(join(snapshot.directory, name), join(snapshot.home, name));
   }
   discardSetupSnapshot(snapshot);
+}
+
+function inspectExistingVault(home) {
+  const databasePath = join(home, "index", "context-vault.db");
+  if (!existsSync(databasePath)) return null;
+  const metadata = lstatSync(databasePath);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`vault database must be a regular file, not a symlink: ${databasePath}`);
+  }
+  const vault = new ContextVault(home, { readOnly: true });
+  try {
+    return vault.stats();
+  } finally {
+    vault.close();
+  }
+}
+
+async function synchronizeSetupSnapshotForTest(snapshot) {
+  if (process.env.CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC !== "1") return;
+  if (process.env.NODE_ENV !== "test" || typeof process.send !== "function") {
+    throw new Error("setup snapshot synchronization is available only to IPC test children");
+  }
+  process.send({ type: "continuitydb:setup-snapshot", directory: snapshot.directory });
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("timed out waiting for setup snapshot test resume")), 30_000);
+    process.once("message", (message) => {
+      clearTimeout(timeout);
+      if (message !== "continuitydb:resume-setup") {
+        reject(new Error("invalid setup snapshot test resume message"));
+        return;
+      }
+      resolve();
+    });
+  });
 }
 
 function rollbackInitializedSetup(initialized) {
@@ -235,12 +269,21 @@ async function initializeSetupHome(home, flags) {
   let target = home;
   let staging = null;
   let vaultSnapshot = null;
+  let existingStats = null;
   const externalCacheSnapshot = flags.semantic && configuredCache
     ? snapshotLocalModelCache({ home: target, cacheDir: configuredCache })
     : null;
 
   if (existed) {
-    vaultSnapshot = snapshotSetupHome(home);
+    existingStats = inspectExistingVault(home);
+    const paths = existingStats
+      ? [
+        ...(!existsSync(join(home, "config.json")) ? ["config.json"] : []),
+        ...(flags.semantic && !configuredCache ? ["models"] : []),
+      ]
+      : SETUP_MUTATED_PATHS;
+    vaultSnapshot = snapshotSetupHome(home, paths);
+    await synchronizeSetupSnapshotForTest(vaultSnapshot);
   } else {
     mkdirSync(dirname(home), { recursive: true, mode: 0o700 });
     staging = mkdtempSync(join(dirname(home), `.${basename(home)}.setup-`));
@@ -259,9 +302,12 @@ async function initializeSetupHome(home, flags) {
         created_at: new Date().toISOString(),
       }, null, 2)}\n`, { mode: 0o600 });
     }
-    const vault = new ContextVault(target);
-    const stats = vault.stats();
-    vault.close();
+    let stats = existingStats;
+    if (!stats) {
+      const vault = new ContextVault(target);
+      stats = vault.stats();
+      vault.close();
+    }
     let embeddings = null;
     if (flags.semantic) {
       embeddings = await ensureLocalModel({ home: target, cacheDir: configuredCache });

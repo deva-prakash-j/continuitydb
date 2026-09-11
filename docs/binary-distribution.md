@@ -43,8 +43,15 @@ their runtime and have no Node requirement on the destination host.
 ```bash
 npm ci --ignore-scripts
 npm run test:binary
+npm run test:binary:reproducible
 npm run checksum:binaries
 ```
+
+SEA construction stages the bundle, embedded WASM asset, configuration, and
+intermediate executable at a checkout-independent path. The reproducibility
+gate archives the exact `HEAD` into two separate clean directories, installs
+the locked dependencies in each, builds both Linux executables, and requires
+their byte counts and SHA-256 digests to match.
 
 The smoke test proves:
 
@@ -160,6 +167,12 @@ new vault. Multi-client apply tracks both configuration writes and newly
 created immutable backup artifacts; a later failure restores the original
 client files and removes backup files/directories created by that failed
 batch.
+
+For an existing valid vault, setup inspects SQLite through immutable read-only
+mode and never includes `index/` or `records/` in its rollback set. A failed
+connector update therefore cannot rewind WAL commits or canonical records made
+concurrently after setup began. Incomplete vault initialization and local or
+external model-cache changes retain their scoped rollback behavior.
 
 ## Release integrity
 

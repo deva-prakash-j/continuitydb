@@ -9,6 +9,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { pathToFileURL } from "node:url";
 import {
   freshnessScore,
   maxMarginalRelevance,
@@ -425,13 +426,24 @@ function withSqliteBusyRetry(operation, timeoutMs = 15_000) {
 }
 
 export class ContextVault {
-  constructor(rootDir = process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb")) {
+  constructor(
+    rootDir = process.env.CONTINUITYDB_HOME || process.env.CONTEXT_VAULT_HOME || join(process.cwd(), ".continuitydb"),
+    { readOnly = false } = {},
+  ) {
     this.rootDir = rootDir;
     this.recordsDir = join(rootDir, "records");
     this.indexDir = join(rootDir, "index");
     this.linksPath = join(rootDir, "project-links.json");
     this.auditPath = join(rootDir, "audit.jsonl");
     this.transactionDepth = 0;
+    if (readOnly) {
+      const databaseUrl = pathToFileURL(join(this.indexDir, "context-vault.db"));
+      databaseUrl.searchParams.set("immutable", "1");
+      this.db = new DatabaseSync(databaseUrl.href, { readOnly: true });
+      this.db.exec("PRAGMA foreign_keys = ON;");
+      return;
+    }
+
     mkdirSync(this.recordsDir, { recursive: true, mode: 0o700 });
     mkdirSync(this.indexDir, { recursive: true, mode: 0o700 });
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { fork, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,6 +44,31 @@ function forceSetupConnectorFailure({ cli, home, project }) {
   return spawnSync(process.execPath, [
     cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
   ], { encoding: "utf8" });
+}
+
+function waitForChildExit(child) {
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code, signal) => resolve({ code, signal, stdout, stderr }));
+  });
+}
+
+function waitForSetupSnapshot(child) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error("timed out waiting for setup snapshot")), 30_000);
+    child.once("message", (message) => {
+      clearTimeout(timeout);
+      if (message?.type !== "continuitydb:setup-snapshot") {
+        reject(new Error(`unexpected setup IPC message: ${JSON.stringify(message)}`));
+        return;
+      }
+      resolve(message);
+    });
+  });
 }
 
 test("CLI version matches the package version", () => {
@@ -223,6 +248,56 @@ test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { sk
     assert.deepEqual(snapshotTree(home), before);
   } finally {
     database?.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup preserves a commit made after its rollback snapshot", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-concurrent-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  let original;
+  let reopened;
+  try {
+    mkdirSync(project);
+    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr);
+    original = new ContextVault(home);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+
+    const child = fork(cli, [
+      "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], {
+      env: { ...process.env, NODE_ENV: "test", CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC: "1" },
+      silent: true,
+    });
+    const exit = waitForChildExit(child);
+    const snapshot = await waitForSetupSnapshot(child);
+    assert.equal(existsSync(snapshot.directory), true);
+
+    const proposed = original.propose({
+      body: "Committed after setup created its rollback snapshot.",
+      project_id: "concurrent-project",
+      owner_id: "local-user",
+    });
+    const committed = original.commit(proposed.record.id);
+    child.send("continuitydb:resume-setup");
+
+    const result = await exit;
+    assert.notEqual(result.code, 0, result.stderr);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.equal(original.get(committed.id)?.body, committed.body, "commit must survive failed setup on original handle");
+    original.close();
+    original = null;
+
+    reopened = new ContextVault(home);
+    assert.equal(reopened.get(committed.id)?.body, committed.body, "commit must survive original close and reopen");
+  } finally {
+    original?.close();
+    reopened?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

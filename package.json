@@ -53,6 +53,7 @@
     "smoke:binary:semantic": "node scripts/binary-semantic-smoke.js",
     "test:binary": "npm run build:binary && node scripts/binary-smoke.js",
     "test:binary:semantic": "npm run build:binary && node scripts/binary-semantic-smoke.js",
+    "test:binary:reproducible": "node scripts/verify-binary-reproducibility.js",
     "start:mcp": "node src/mcp-server.js",
     "start:http": "node src/http-server.js",
     "cli": "node src/cli.js",
