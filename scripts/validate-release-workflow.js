@@ -25,6 +25,8 @@ function validatePinnedActions(steps) {
 }
 
 export function validateReleaseWorkflow(document) {
+  invariant(document?.on?.pull_request !== undefined,
+    "pull_request trigger is required so native release gates run before merge");
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
   invariant(build && publish, "build and publish jobs are required");
@@ -34,6 +36,11 @@ export function validateReleaseWorkflow(document) {
   for (const required of ["linux-x64", "macos-x64", "macos-arm64", "windows-x64"]) {
     invariant(names.has(required), `native target ${required} is missing`);
   }
+  const targetByName = new Map(targets.map((target) => [target.name, target]));
+  invariant(targetByName.get("macos-x64")?.os === "macos-15-intel",
+    "macos-x64 must use the supported macos-15-intel runner");
+  invariant(targetByName.get("macos-arm64")?.os === "macos-15",
+    "macos-arm64 must use the supported macos-15 runner");
 
   const steps = build.steps || [];
   validatePinnedActions(steps);

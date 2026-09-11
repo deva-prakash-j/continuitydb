@@ -23,8 +23,8 @@ byte sizes and SHA-256 digests, and stores it in a private cache.
 | Target | Release workflow | Evidence before first v0.7 release |
 |---|---:|---|
 | Linux x64 | Yes | Locally built and end-to-end tested |
-| macOS x64 | Yes | Build matrix configured; native CI result required |
-| macOS arm64 | Yes | Build matrix configured; native CI result required |
+| macOS x64 | Yes | `macos-15-intel` build matrix; native CI result required |
+| macOS arm64 | Yes | `macos-15` build matrix; native CI result required |
 | Windows x64 | Yes | Build matrix configured; native CI result required |
 
 Do not describe an artifact as verified until its native build and binary smoke
@@ -67,7 +67,7 @@ The smoke test proves:
 Use `npm run test:binary:semantic` for the networked model pull plus real local
 WASM inference gate.
 
-Tagged-release automation applies the same gates on every native matrix target.
+Pull requests and tagged-release automation apply the same gates on every native matrix target.
 For macOS, signing happens before both the ordinary binary smoke and semantic
 inference smoke. Checksums and artifact upload happen only after those blocking
 tests pass; publication depends on the complete native matrix.
