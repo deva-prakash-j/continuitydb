@@ -24,29 +24,25 @@ returned.
 
 ### Verification status
 
-The v0.6 runtime at
-[`2c9df03`](https://github.com/deva-prakash-j/continuitydb/commit/2c9df0399dce5d31173aebe0769a81cf0dcc739b)
-and its documentation-only evidence attestation at
-[`266d856`](https://github.com/deva-prakash-j/continuitydb/commit/266d856fea0c6ba106de7cef2ad737e2a46a7d9b)
-passed the independent Astraea strict QA gate:
+The v0.7 candidate at `e0dcf163959e055f180107250dbfa062390b2c44`
+has passed its builder and supported-native CI gates:
 
-- final verdict: **PASS**, with no P0/P1 release blockers;
-- full automated suite: **76/76 passing**, with 0 failed and 0 skipped;
-- focused security suite: **16/16 passing**;
-- focused client-interoperability suite: **11/11 passing**;
+- full automated suite: **111/111 passing**, with 0 failed and 0 skipped;
 - OpenAPI validation: **20 paths**;
-- installed Codex CLI `0.147.0`: authenticated Streamable HTTP MCP
-  initialization and `tools/list` verified;
 - exact lexical Recall@5: **9/9**, with **0 isolation violations**;
 - dependency audit: **0 known production vulnerabilities**;
-- package dry-run: **71 files**; exact candidate sizes are recorded in the
-  linked verification evidence.
+- package dry-run: **85 files**;
+- Linux x64, macOS arm64, and Windows x64 standalone executables: native
+  functional smoke, local semantic inference, checksum, and artifact upload
+  **terminal green**;
+- Node 22/24, container, and Linux binary CI: **terminal green**.
 
-See the exact commands, environment, artifact identity, and evidence boundaries
-in the [v0.6 verification record](docs/build-verification-2026-09-11-v0.6.md).
-The Codex result is transport/discovery evidence, not a model-triggered tool-call
-proof; hosted Copilot, Claude Code, and OpenCode remain contract-tested until
-their real-client runs are captured.
+See the exact commands, GitHub run URLs, artifact digests, environment, and
+evidence boundaries in the
+[v0.7 verification record](docs/build-verification-2026-09-11-v0.7.md).
+The independent Astraea verdict remains the final release gate. Intel macOS
+uses the npm distribution because upstream Node 25 SEA executables
+[segfault on x64 macOS](https://github.com/nodejs/node/issues/62893).
 
 ## The problem
 

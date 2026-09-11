@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `b14cf051d532557ab1bb039617b42309723c0a8a`
+- **Runtime candidate tested:** `e0dcf163959e055f180107250dbfa062390b2c44`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `143993896` bytes
 - **Linux binary SHA-256:**
-  `39a079fc1b0fa5b9d294a17eb6ccbf55302a277e94d95b880822d7a5bce5278f`
+  `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -58,7 +58,7 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **108/108** primary Node tests passed with **0 failed** and **0 skipped**;
+- **111/111** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
@@ -66,16 +66,34 @@ Observed results on the build host:
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
 - package dry-run on the runtime candidate completed with **85 files**,
-  **147,307 bytes** packed and **536,382 bytes** unpacked;
+  approximately **148.3 kB** packed and **539.5 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
   shutdown, MCP initialization and six-tool discovery, capture, and retrieval;
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
-- two independent clean-directory builds produced byte-identical Linux
-  executables: **143,993,896 bytes**, SHA-256
-  `39a079fc1b0fa5b9d294a17eb6ccbf55302a277e94d95b880822d7a5bce5278f`.
+- the Linux executable is **143,993,896 bytes**, SHA-256
+  `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b`.
+
+## Native CI evidence
+
+GitHub Actions ran the supported native matrix against exact head
+`e0dcf163959e055f180107250dbfa062390b2c44`:
+
+- [release-binaries run 34612003965](https://github.com/deva-prakash-j/continuitydb/actions/runs/34612003965):
+  Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
+  functional smoke, local semantic inference, checksum, and artifact upload;
+- [CI run 34612003919](https://github.com/deva-prakash-j/continuitydb/actions/runs/34612003919):
+  Node 22, Node 24, container, and Linux binary jobs all passed.
+
+Downloaded artifact contents matched their uploaded SHA-256 sidecars:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| Linux x64 | 143,993,896 | `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b` |
+| macOS arm64 | 147,759,328 | `6b58909e44eaec31908de206e52de5b16e633ecd986df9cbe706a2d7e8a8027a` |
+| Windows x64 | 110,739,456 | `b0b097daff4b1bbc071c40966fb2ffeef30742cb88e6d11c802d9f23556d2473` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -124,12 +142,10 @@ cached developer-workspace `dist/` artifact.
 
 ## Evidence boundaries
 
-Only the Linux x64 executable was built and run on this host. macOS arm64 and
-Windows x64 jobs are configured but are **not verified** until their
-native GitHub runners complete terminal-green build, post-signing smoke,
-semantic inference, checksum, and artifact-upload gates for the exact release
-commit. Project-owned Developer ID and Authenticode signing identities are not
-configured.
+Linux x64 was additionally built and run on the local verification host.
+macOS arm64 and Windows x64 were verified on native GitHub-hosted runners for
+the exact candidate head. macOS uses ad-hoc signing; project-owned Developer ID
+and Windows Authenticode signing identities are not configured.
 
 macOS x64 is intentionally unsupported for the v0.7 standalone binary because
 upstream Node 25 SEA executables [segfault on Intel macOS](https://github.com/nodejs/node/issues/62893).
@@ -140,6 +156,5 @@ it is not bundled into the executable. The executable includes its Node runtime
 and ONNX/WASM inference runtime and does not require Node.js or npm on the
 destination host.
 
-GitHub CI tied to the runtime candidate SHA was not available during this local
-verification. Independent Astraea review remains the release gate and must cite
-the exact reviewed base/head pair and this runtime evidence SHA.
+Independent Astraea review remains the release gate and must cite the exact
+reviewed base/head pair and this runtime evidence SHA.

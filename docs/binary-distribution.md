@@ -22,9 +22,9 @@ byte sizes and SHA-256 digests, and stores it in a private cache.
 
 | Target | Release workflow | Evidence before first v0.7 release |
 |---|---:|---|
-| Linux x64 | Yes | Locally built and end-to-end tested |
-| macOS arm64 | Yes | `macos-15` build matrix; native CI result required |
-| Windows x64 | Yes | Build matrix configured; native CI result required |
+| Linux x64 | Yes | Native functional + semantic CI green at `e0dcf16` |
+| macOS arm64 | Yes | Post-sign functional + semantic CI green at `e0dcf16` |
+| Windows x64 | Yes | Native functional + semantic CI green at `e0dcf16` |
 
 Intel macOS is intentionally not a release target. Node 25 Single Executable
 Applications [segfault on x64 macOS](https://github.com/nodejs/node/issues/62893),
