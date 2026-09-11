@@ -6,15 +6,15 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `1653bea35a28c11560155c4ec44916c1c246d5ce`
-- **Release-workflow candidate tested:** `2e1eadc7f3119b48215549dd8b436e8c4a00afdf`
+- **Runtime candidate tested:** `d714e11d7158178298a15648de4169a4a6232d75`
+- **Release-workflow candidate tested:** `d714e11d7158178298a15648de4169a4a6232d75`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
 - **Linux binary size:** `144002088` bytes
 - **Linux binary SHA-256:**
-  `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401`
+  `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89`
 - **Repository state:** `HEAD` exactly matched the release-workflow candidate,
   whose runtime tree descends from the runtime candidate above, and the tracked
   worktree was clean after verification.
@@ -60,7 +60,7 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **123/123** primary Node tests passed with **0 failed** and **0 skipped**;
+- **125/125** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
@@ -68,7 +68,7 @@ Observed results on the build host:
 - exact lexical Recall@5 was **9/9** and isolation violations were **0**;
 - production dependency audit reported **0 known vulnerabilities**;
 - package dry-run on the candidate completed with **86 files**,
-  approximately **153.0 kB** packed and **557.8 kB** unpacked;
+  approximately **154.3 kB** packed and **563.2 kB** unpacked;
 - the generated Codex configuration was accepted by installed Codex CLI
   `0.147.0`;
 - the Linux executable passed self-install, setup, HTTP readiness and clean
@@ -76,26 +76,26 @@ Observed results on the build host:
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
 - the Linux executable is **144,002,088 bytes**, SHA-256
-  `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401`.
+  `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`2e1eadc7f3119b48215549dd8b436e8c4a00afdf`:
+`d714e11d7158178298a15648de4169a4a6232d75`:
 
-- [release-binaries run 34624736165](https://github.com/deva-prakash-j/continuitydb/actions/runs/34624736165):
+- [release-binaries run 34626768941](https://github.com/deva-prakash-j/continuitydb/actions/runs/34626768941):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34624736158](https://github.com/deva-prakash-j/continuitydb/actions/runs/34624736158):
+- [CI run 34626768881](https://github.com/deva-prakash-j/continuitydb/actions/runs/34626768881):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 144,002,088 | `2b11da641452fd104df1a324fc070044a16859c251298069b5a2449ad4314401` |
-| macOS arm64 | 147,759,328 | `6322e4130143667fef889f7f95e2cec1bd649060fa27603d754d187ee4a2b3a5` |
-| Windows x64 | 110,745,600 | `3dac78517ec534bf20f2f8d0760384d675db9a5584010f4c65038e750b69394e` |
+| Linux x64 | 144,002,088 | `10f86f3d7360b34acd587ccbbf9bc51df30ee8a98f67bf78d37fc27242577d89` |
+| macOS arm64 | 147,759,328 | `b648b5af12feb121ccc1b1f937ea90b4bc39c6ed81e6849094cc76c039f06608` |
+| Windows x64 | 110,746,112 | `9185d51b353261ac6a0f69a255fcdc38be74b40ae02e01ecd1ac887a95ad1413` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
