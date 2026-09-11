@@ -49,6 +49,9 @@ export class ContinuityMcpHttpEndpoint {
     captureLimiter,
     maxSessions = Number(process.env.CONTINUITYDB_MCP_MAX_SESSIONS || 1_000),
     sessionTtlMs = Number(process.env.CONTINUITYDB_MCP_SESSION_TTL_MS || 30 * 60 * 1_000),
+    sweepIntervalMs = null,
+    now = Date.now,
+    beforeInitialize = null,
   }) {
     if (!Number.isInteger(maxSessions) || maxSessions < 1 || maxSessions > 100_000) {
       throw new Error("MCP max sessions must be an integer between 1 and 100000");
@@ -56,29 +59,56 @@ export class ContinuityMcpHttpEndpoint {
     if (!Number.isFinite(sessionTtlMs) || sessionTtlMs < 10_000 || sessionTtlMs > 24 * 60 * 60 * 1_000) {
       throw new Error("MCP session TTL must be between 10000 and 86400000 milliseconds");
     }
+    const effectiveSweepIntervalMs = sweepIntervalMs ?? Math.min(Math.max(Math.floor(sessionTtlMs / 2), 1_000), 30_000);
+    if (!Number.isInteger(effectiveSweepIntervalMs) || effectiveSweepIntervalMs < 5 || effectiveSweepIntervalMs > 60_000) {
+      throw new Error("MCP sweep interval must be an integer between 5 and 60000 milliseconds");
+    }
+    if (typeof now !== "function") throw new Error("MCP clock must be a function");
+    if (beforeInitialize !== null && typeof beforeInitialize !== "function") {
+      throw new Error("MCP initialization hook must be a function");
+    }
     this.vault = vault;
     this.engine = engine;
     this.capturePolicy = capturePolicy;
     this.captureLimiter = captureLimiter;
     this.maxSessions = maxSessions;
     this.sessionTtlMs = sessionTtlMs;
+    this.now = now;
+    this.beforeInitialize = beforeInitialize;
     this.sessions = new Map();
-    this.pendingInitializations = 0;
+    this.pendingInitializations = new Set();
+    this.closed = false;
+    this.closePromise = null;
     this.metrics = {
       initializations: 0,
       tool_lists: 0,
       tool_calls: 0,
       terminations: 0,
       identity_mismatches: 0,
+      expirations: 0,
     };
+    this.sweepTimer = setInterval(() => {
+      void this.sweepExpired().catch(() => {});
+    }, effectiveSweepIntervalMs);
+    this.sweepTimer.unref?.();
   }
 
-  async sweepExpired(now = Date.now()) {
+  async closeEntry(entry) {
+    if (!entry.closePromise) {
+      entry.closePromise = entry.server.close()
+        .catch(() => entry.transport.close().catch(() => {}));
+    }
+    return entry.closePromise;
+  }
+
+  async sweepExpired(now = this.now()) {
+    if (this.closed) return;
     const expired = [...this.sessions.entries()]
-      .filter(([, entry]) => now - entry.lastUsedAt > this.sessionTtlMs);
+      .filter(([, entry]) => entry.inFlight === 0 && now - entry.lastUsedAt >= this.sessionTtlMs);
     for (const [sessionId, entry] of expired) {
       this.sessions.delete(sessionId);
-      await entry.server.close().catch(() => entry.transport.close().catch(() => {}));
+      this.metrics.expirations += 1;
+      await this.closeEntry(entry);
     }
   }
 
@@ -92,35 +122,49 @@ export class ContinuityMcpHttpEndpoint {
       this.metrics.identity_mismatches += 1;
       return { error: [403, "MCP session identity mismatch"] };
     }
-    entry.lastUsedAt = Date.now();
     return { sessionId, entry };
   }
 
+  async useEntry(entry, operation) {
+    entry.inFlight += 1;
+    entry.lastUsedAt = this.now();
+    try {
+      return await operation();
+    } finally {
+      entry.inFlight -= 1;
+      entry.lastUsedAt = this.now();
+    }
+  }
+
   async handle(request, response, identity, readBody) {
+    if (this.closed) return rpcError(response, 503, "MCP endpoint is closed");
     await this.sweepExpired();
+    if (this.closed) return rpcError(response, 503, "MCP endpoint is closed");
     const resolved = this.entryFor(request, identity);
     if (resolved.error) return rpcError(response, ...resolved.error);
 
     if (request.method === "POST") {
       const body = await readBody(request);
+      if (this.closed) return rpcError(response, 503, "MCP endpoint is closed");
       const messages = Array.isArray(body) ? body : [body];
       this.metrics.tool_lists += messages.filter((message) => message?.method === "tools/list").length;
       this.metrics.tool_calls += messages.filter((message) => message?.method === "tools/call").length;
-      if (resolved.entry) return resolved.entry.transport.handleRequest(request, response, body);
+      if (resolved.entry) {
+        return this.useEntry(resolved.entry, () => resolved.entry.transport.handleRequest(request, response, body));
+      }
       if (!isInitializeRequest(body)) return rpcError(response, 400, "MCP initialize request required");
       this.metrics.initializations += 1;
-      if (this.sessions.size + this.pendingInitializations >= this.maxSessions) {
+      if (this.sessions.size + this.pendingInitializations.size >= this.maxSessions) {
         return rpcError(response, 503, "MCP session capacity reached");
       }
-      this.pendingInitializations += 1;
 
       let entry;
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         enableJsonResponse: true,
         onsessioninitialized: (sessionId) => {
-          entry.lastUsedAt = Date.now();
-          this.sessions.set(sessionId, entry);
+          entry.lastUsedAt = this.now();
+          if (!this.closed) this.sessions.set(sessionId, entry);
         },
       });
       const runtime = createContinuityMcpServer({
@@ -135,35 +179,54 @@ export class ContinuityMcpHttpEndpoint {
         transport,
         server: runtime.server,
         identityKey: identityKey(identity),
-        lastUsedAt: Date.now(),
+        lastUsedAt: this.now(),
+        inFlight: 1,
+        closePromise: null,
       };
+      let resolveDone;
+      entry.done = new Promise((resolve) => { resolveDone = resolve; });
+      this.pendingInitializations.add(entry);
       transport.onclose = () => {
         const sessionId = transport.sessionId;
         if (sessionId) this.sessions.delete(sessionId);
       };
       try {
+        await this.beforeInitialize?.(entry);
+        if (this.closed) throw new Error("MCP endpoint closed during initialization");
         await runtime.server.connect(transport);
+        if (this.closed) throw new Error("MCP endpoint closed during initialization");
         return await transport.handleRequest(request, response, body);
       } catch (error) {
-        await runtime.server.close().catch(() => transport.close().catch(() => {}));
+        await this.closeEntry(entry);
         throw error;
       } finally {
-        this.pendingInitializations -= 1;
+        entry.inFlight -= 1;
+        entry.lastUsedAt = this.now();
+        this.pendingInitializations.delete(entry);
+        resolveDone();
       }
     }
 
     if (!resolved.entry) return rpcError(response, 400, "MCP session ID required");
     if (request.method === "GET" || request.method === "DELETE") {
       if (request.method === "DELETE") this.metrics.terminations += 1;
-      return resolved.entry.transport.handleRequest(request, response);
+      return this.useEntry(resolved.entry, () => resolved.entry.transport.handleRequest(request, response));
     }
     response.setHeader("allow", "GET, POST, DELETE");
     return rpcError(response, 405, "Method not allowed");
   }
 
   async close() {
-    const entries = [...this.sessions.values()];
+    if (this.closePromise) return this.closePromise;
+    this.closed = true;
+    clearInterval(this.sweepTimer);
+    const pending = [...this.pendingInitializations];
+    const entries = [...new Set([...this.sessions.values(), ...pending])];
     this.sessions.clear();
-    await Promise.all(entries.map((entry) => entry.server.close().catch(() => entry.transport.close().catch(() => {}))));
+    this.closePromise = Promise.all([
+      ...entries.map((entry) => this.closeEntry(entry)),
+      ...pending.map((entry) => entry.done),
+    ]).then(() => undefined);
+    return this.closePromise;
   }
 }

@@ -42,8 +42,10 @@ or become a tool instruction.
   read/capture/feedback only unless the operator explicitly enables the review
   UI, which adds local review authority for that process.
 - A non-loopback bind refuses startup without a static token policy or complete
-  OIDC configuration, a canonical HTTPS public URL for OIDC, and an explicit
+  OIDC configuration and an explicit
   assertion that TLS terminates at the trusted proxy.
+- Every OIDC deployment requires a canonical HTTPS public URL, including when
+  the process binds to loopback behind a reverse proxy.
 - Personal and employer data use separate tenants; higher-risk deployments should
   also use separate stores, keys and service identities.
 - Token policy files and provider credentials are mounted by the host secret

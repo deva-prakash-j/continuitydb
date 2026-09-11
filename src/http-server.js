@@ -19,17 +19,15 @@ const JSON_TYPE = "application/json; charset=utf-8";
 const MAX_BODY_BYTES = Number(process.env.CONTINUITYDB_MAX_BODY_BYTES || 1_048_576);
 const OAUTH_METADATA_PATH = "/.well-known/oauth-protected-resource/mcp";
 
-function validatedPublicUrl(value, host, required = false) {
+function validatedPublicUrl(value, required = false) {
   if (!value) {
-    if (!required || isLoopback(host)) return null;
-    throw new Error("CONTINUITYDB_PUBLIC_URL is required for non-loopback OIDC service");
+    if (!required) return null;
+    throw new Error("CONTINUITYDB_PUBLIC_URL is required when OIDC is configured");
   }
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash) throw new Error("CONTINUITYDB_PUBLIC_URL must not contain credentials, query, or fragment");
   if (url.pathname !== "/") throw new Error("CONTINUITYDB_PUBLIC_URL must be an origin without a path");
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopback(url.hostname))) {
-    throw new Error("CONTINUITYDB_PUBLIC_URL must use HTTPS unless it is loopback");
-  }
+  if (url.protocol !== "https:") throw new Error("CONTINUITYDB_PUBLIC_URL must use HTTPS");
   return url.href.replace(/\/$/, "");
 }
 
@@ -180,12 +178,15 @@ export function createContinuityServer({
   publicUrl = process.env.CONTINUITYDB_PUBLIC_URL || null,
   mcpMaxSessions = Number(process.env.CONTINUITYDB_MCP_MAX_SESSIONS || 1_000),
   mcpSessionTtlMs = Number(process.env.CONTINUITYDB_MCP_SESSION_TTL_MS || 30 * 60 * 1_000),
+  mcpSweepIntervalMs = null,
+  mcpNow = Date.now,
+  mcpBeforeInitialize = null,
 } = {}) {
   const entries = loadTokenPolicy(tokenPolicyPath);
   if (!isLoopback(host) && ((!entries.length && !oidcAuthorizer) || !trustProxyTls)) {
     throw new Error("non-loopback HTTP requires a token policy or OIDC plus CONTINUITYDB_TRUST_PROXY_TLS=true");
   }
-  const configuredPublicUrl = validatedPublicUrl(publicUrl, host, Boolean(oidcAuthorizer));
+  const configuredPublicUrl = validatedPublicUrl(publicUrl, Boolean(oidcAuthorizer));
   const authorizer = new TokenAuthorizer(entries);
   const fallbackIdentity = normalizeIdentity(localIdentity || {
     tenant_id: process.env.CONTINUITYDB_TENANT_ID || "local",
@@ -210,6 +211,9 @@ export function createContinuityServer({
     }),
     maxSessions: mcpMaxSessions,
     sessionTtlMs: mcpSessionTtlMs,
+    sweepIntervalMs: mcpSweepIntervalMs,
+    now: mcpNow,
+    beforeInitialize: mcpBeforeInitialize,
   });
   const metrics = { requests: 0, errors: 0, rate_limited: 0, started_at: Date.now() };
 

@@ -545,7 +545,7 @@ checks; do not assign it to agent identities.
 | `CONTINUITYDB_OIDC_ISSUER` | unset | Expected HTTPS OIDC issuer; configure with audience and JWKS URL |
 | `CONTINUITYDB_OIDC_AUDIENCE` | unset | Required JWT audience for ContinuityDB |
 | `CONTINUITYDB_OIDC_JWKS_URL` | unset | HTTPS JWKS endpoint used to verify OIDC JWT signatures |
-| `CONTINUITYDB_PUBLIC_URL` | unset | Canonical HTTPS service origin required for non-loopback OIDC discovery |
+| `CONTINUITYDB_PUBLIC_URL` | unset | Canonical HTTPS service origin required whenever OIDC is configured, including loopback bind behind a reverse proxy |
 | `CONTINUITYDB_TRUST_PROXY_TLS` | `false` | Assert trusted TLS termination for non-loopback service |
 | `CONTINUITYDB_ENABLE_REVIEW_UI` | `false` | Enable the loopback approval/provenance/context-preview UI |
 | `CONTINUITYDB_MAX_BODY_BYTES` | `1048576` | Maximum HTTP request body size |

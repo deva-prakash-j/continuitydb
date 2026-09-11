@@ -21,7 +21,7 @@ Evidence captured on 2026-09-11:
 
 | Client | Tested version | MCP transport | Lifecycle adapter | Evidence |
 |---|---|---|---|---|
-| MCP TypeScript SDK | `@modelcontextprotocol/sdk` 1.30.0 | Authenticated Streamable HTTP and stdio; cross-owner transfer, scoped tool lists, calls, session termination and identity-swap denial | N/A | **Tool-call verified** |
+| MCP TypeScript SDK | `@modelcontextprotocol/sdk` 1.30.0 | Authenticated Streamable HTTP and stdio; cross-agent shared-owner transfer, scoped tool lists, calls, session termination and identity-swap denial | N/A | **Tool-call verified** |
 | Codex CLI | 0.147.0 | Authenticated Streamable HTTP initialization and `tools/list` | Project `AGENTS.md` workflow; Codex has no ContinuityDB-specific native hook here | **Transport verified** |
 | GitHub Copilot cloud agent / code review | Official repository MCP JSON contract current on 2026-09-11 | Remote HTTP with explicit three-tool allowlist; all listed tools carry `readOnlyHint: true` | None | **Contract tested**; real GitHub-hosted run pending |
 | Claude Code | Official MCP and hook contracts current on 2026-09-11 | Remote HTTP configuration | `SessionStart` emits `hookSpecificOutput.additionalContext`; `Stop` saves only an explicit structured file | **Contract tested**; binary unavailable on the test VM |
@@ -53,8 +53,11 @@ agents can invoke enabled tools autonomously.
 Each stateful HTTP MCP session is bound to the normalized tenant, principal,
 owner, agent, scopes, project allowlist, and sensitivity allowlist from the
 credential that initialized it. Reusing that session ID with another credential
-returns HTTP 403. Sessions are random, capacity-bounded, idle-expiring, and can
-be explicitly terminated with MCP `DELETE`.
+returns HTTP 403. Sessions are random, capacity-bounded (including concurrent
+pending initializations), actively idle-expiring without requiring later
+traffic, and can be explicitly terminated with MCP `DELETE`. Endpoint shutdown
+rejects new initialization and waits for already-started initialization paths to
+settle before closing the vault.
 
 ## Reproducing
 

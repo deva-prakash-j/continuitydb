@@ -324,26 +324,46 @@ test("HTTP service accepts verified OIDC bearer identity and advertises protecte
     audience,
     jwks: createLocalJWKSet({ keys: [jwk] }),
   });
-  const service = createContinuityServer({ vault, host: "127.0.0.1", port: 0, oidcAuthorizer });
+  assert.throws(
+    () => createContinuityServer({ vault, host: "127.0.0.1", port: 0, oidcAuthorizer }),
+    /PUBLIC_URL is required when OIDC is configured/,
+  );
+  const publicUrl = "https://continuitydb.example";
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    oidcAuthorizer,
+    publicUrl,
+  });
   try {
     const address = await service.listen();
     const base = `http://127.0.0.1:${address.port}`;
     const unauthorized = await fetch(`${base}/v1/search`, { method: "POST" });
     assert.equal(unauthorized.status, 401);
-    assert.match(unauthorized.headers.get("www-authenticate"), /resource_metadata=/);
+    assert.equal(
+      unauthorized.headers.get("www-authenticate"),
+      `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource/mcp"`,
+    );
     const metadata = await fetch(`${base}/.well-known/oauth-protected-resource/mcp`);
     assert.equal(metadata.status, 200);
-    assert.equal((await metadata.json()).authorization_servers[0], issuer);
+    const metadataBody = await metadata.json();
+    assert.equal(metadataBody.authorization_servers[0], issuer);
+    assert.equal(metadataBody.resource, `${publicUrl}/mcp`);
     const hostileMetadata = await rawRequest(`${base}/.well-known/oauth-protected-resource/mcp`, {
       headers: { host: "attacker.example" },
     });
-    assert.equal(hostileMetadata.status, 400);
+    assert.equal(hostileMetadata.status, 200);
+    assert.equal(JSON.parse(hostileMetadata.body).resource, `${publicUrl}/mcp`);
     const hostileUnauthorized = await rawRequest(`${base}/v1/search`, {
       method: "POST",
       headers: { host: "attacker.example" },
     });
     assert.equal(hostileUnauthorized.status, 401);
-    assert.doesNotMatch(hostileUnauthorized.headers["www-authenticate"], /resource_metadata=/);
+    assert.equal(
+      hostileUnauthorized.headers["www-authenticate"],
+      `Bearer resource_metadata="${publicUrl}/.well-known/oauth-protected-resource/mcp"`,
+    );
 
     const token = await new SignJWT({
       continuitydb_tenant: "tenant-a",
@@ -533,6 +553,12 @@ test("non-loopback static policy remains valid without OIDC public metadata conf
     const fakeOidc = { issuer: "https://identity.example", authorize: async () => null };
     assert.throws(() => createContinuityServer({
       vault,
+      host: "127.0.0.1",
+      port: 0,
+      oidcAuthorizer: fakeOidc,
+    }), /PUBLIC_URL/);
+    assert.throws(() => createContinuityServer({
+      vault,
       host: "0.0.0.0",
       port: 0,
       trustProxyTls: true,
@@ -546,6 +572,13 @@ test("non-loopback static policy remains valid without OIDC public metadata conf
       oidcAuthorizer: fakeOidc,
       publicUrl: "https://continuitydb.example/base",
     }), /origin without a path/);
+    assert.throws(() => createContinuityServer({
+      vault,
+      host: "127.0.0.1",
+      port: 0,
+      oidcAuthorizer: fakeOidc,
+      publicUrl: "http://127.0.0.1:7331",
+    }), /must use HTTPS/);
   } finally {
     vault.close();
     rmSync(root, { recursive: true, force: true });

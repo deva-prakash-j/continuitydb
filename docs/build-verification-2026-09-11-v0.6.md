@@ -42,12 +42,18 @@ Observed results on the build host:
 - MCP tools are omitted unless granted by the server-bound identity;
 - every read tool declares `readOnlyHint: true` and non-destructive hints;
 - MCP sessions reject cross-credential reuse and terminate explicitly;
-- session capacity includes in-flight initialization reservations;
+- an active timer expires idle sessions without a subsequent request;
+- session capacity includes in-flight initialization reservations, exercised
+  with a deterministic pending-initialization barrier;
+- shutdown marks the endpoint closed, closes pending runtimes, and waits for a
+  deliberately paused initialization path to settle;
 - static non-loopback deployments retain compatibility without OIDC metadata;
 - OIDC verifies JWT algorithm, signature, issuer, audience, expiry, subject,
   tenant and scoped authorization claims;
-- a spoofed non-loopback `Host` value cannot become OAuth resource metadata;
-- lifecycle checkpoint readers reject symlinks and file replacement during open.
+- OIDC startup requires an explicit canonical HTTPS public origin even when the
+  process binds to loopback behind a reverse proxy; discovery ignores `Host`;
+- lifecycle checkpoint readers reject symlinks; inode/device checks guard the
+  open path, but replacement-during-open is not claimed as separately tested.
 
 ## Evidence boundaries
 

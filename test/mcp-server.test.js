@@ -9,6 +9,27 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
 
+async function waitUntil(predicate, timeoutMs = 1_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("condition was not met before timeout");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function initializeRequest(name = "raw-client") {
+  return {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-11-25",
+      capabilities: {},
+      clientInfo: { name, version: "1.0.0" },
+    },
+  };
+}
+
 test("MCP exposes policy-controlled capture and feedback without admin tools", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-test-"));
   const serverPath = new URL("../src/mcp-server.js", import.meta.url).pathname;
@@ -344,6 +365,124 @@ test("Streamable HTTP MCP refuses sessions beyond configured capacity", async ()
   } finally {
     await firstClient?.close().catch(() => {});
     await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Streamable HTTP MCP actively expires idle sessions without subsequent traffic", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-expiry-test-"));
+  const vault = new ContextVault(root);
+  let now = 1_000;
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    mcpSessionTtlMs: 10_000,
+    mcpSweepIntervalMs: 5,
+    mcpNow: () => now,
+    localIdentity: {
+      tenant_id: "test",
+      principal_id: "expiry-agent",
+      owner_id: "shared-owner",
+      agent_id: "expiry-agent",
+      scopes: ["memory:read"],
+      allowed_projects: ["api"],
+      allowed_sensitivities: ["private"],
+    },
+  });
+  let client;
+  try {
+    const address = await service.listen();
+    const endpoint = new URL(`http://127.0.0.1:${address.port}/mcp`);
+    client = new Client({ name: "expiry-client", version: "1.0.0" });
+    await client.connect(new StreamableHTTPClientTransport(endpoint));
+    assert.equal(service.mcpEndpoint.sessions.size, 1);
+    now += 10_000;
+    await waitUntil(() => service.mcpEndpoint.sessions.size === 0);
+    assert.equal(service.mcpEndpoint.metrics.expirations, 1);
+  } finally {
+    await client?.close().catch(() => {});
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Streamable HTTP MCP reserves capacity for concurrent pending initialization", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-pending-capacity-test-"));
+  const vault = new ContextVault(root);
+  let releaseInitialization;
+  let markEntered;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const barrier = new Promise((resolve) => { releaseInitialization = resolve; });
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    mcpMaxSessions: 1,
+    mcpBeforeInitialize: async () => { markEntered(); await barrier; },
+  });
+  try {
+    const address = await service.listen();
+    const endpoint = `http://127.0.0.1:${address.port}/mcp`;
+    const headers = { "content-type": "application/json", accept: "application/json, text/event-stream" };
+    const first = fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initializeRequest("pending-first")),
+    });
+    await entered;
+    assert.equal(service.mcpEndpoint.pendingInitializations.size, 1);
+    const second = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(initializeRequest("pending-second")),
+    });
+    assert.equal(second.status, 503);
+    assert.match((await second.json()).error.message, /capacity/);
+    releaseInitialization();
+    assert.equal((await first).status, 200);
+  } finally {
+    releaseInitialization?.();
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Streamable HTTP MCP shutdown waits for and rejects racing initialization", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-shutdown-race-test-"));
+  const vault = new ContextVault(root);
+  let releaseInitialization;
+  let markEntered;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const barrier = new Promise((resolve) => { releaseInitialization = resolve; });
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    mcpBeforeInitialize: async () => { markEntered(); await barrier; },
+  });
+  let closed = false;
+  try {
+    const address = await service.listen();
+    const initializing = fetch(`http://127.0.0.1:${address.port}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+      body: JSON.stringify(initializeRequest("shutdown-racer")),
+    }).catch((error) => error);
+    await entered;
+    const closing = service.close().then(() => { closed = true; });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(closed, false);
+    releaseInitialization();
+    await closing;
+    const outcome = await initializing;
+    if (outcome instanceof Response) assert.equal(outcome.status >= 500, true);
+    assert.equal(service.mcpEndpoint.closed, true);
+    assert.equal(service.mcpEndpoint.sessions.size, 0);
+    assert.equal(service.mcpEndpoint.pendingInitializations.size, 0);
+  } finally {
+    releaseInitialization?.();
+    if (!closed) await service.close().catch(() => vault.close());
     rmSync(root, { recursive: true, force: true });
   }
 });
