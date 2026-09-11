@@ -6,14 +6,14 @@ requires an independent Astraea `PASS` against the exact immutable candidate.
 
 ## Evidence identity
 
-- **Runtime candidate tested:** `e0dcf163959e055f180107250dbfa062390b2c44`
+- **Runtime candidate tested:** `daa43b201c5242abb8ff2fadaafee92860f921df`
 - **Verification date:** 2026-09-11
 - **Build host:** Linux `6.8.0-137-generic` x86_64
 - **Build runtime:** Node `v25.9.0`, npm `11.12.1`
 - **Linux binary:** `dist/continuitydb-linux-x64`
-- **Linux binary size:** `143993896` bytes
+- **Linux binary size:** `143997992` bytes
 - **Linux binary SHA-256:**
-  `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b`
+  `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49`
 - **Repository state:** `HEAD` exactly matched the runtime candidate and the
   tracked worktree was clean after verification.
 
@@ -58,7 +58,7 @@ npm run test:binary:reproducible
 
 Observed results on the build host:
 
-- **111/111** primary Node tests passed with **0 failed** and **0 skipped**;
+- **116/116** primary Node tests passed with **0 failed** and **0 skipped**;
 - the focused security subset passed **16/16**;
 - the focused client interoperability subset passed **11/11**;
 - OpenAPI parsed with **20 paths**;
@@ -73,27 +73,27 @@ Observed results on the build host:
   shutdown, MCP initialization and six-tool discovery, capture, and retrieval;
 - the Linux executable completed checksum-verified model loading and real local
   ONNX/WASM semantic inference.
-- the Linux executable is **143,993,896 bytes**, SHA-256
-  `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b`.
+- the Linux executable is **143,997,992 bytes**, SHA-256
+  `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49`.
 
 ## Native CI evidence
 
 GitHub Actions ran the supported native matrix against exact head
-`e0dcf163959e055f180107250dbfa062390b2c44`:
+`daa43b201c5242abb8ff2fadaafee92860f921df`:
 
-- [release-binaries run 34612003965](https://github.com/deva-prakash-j/continuitydb/actions/runs/34612003965):
+- [release-binaries run 34615456695](https://github.com/deva-prakash-j/continuitydb/actions/runs/34615456695):
   Linux x64, post-sign macOS arm64, and Windows x64 all passed build,
   functional smoke, local semantic inference, checksum, and artifact upload;
-- [CI run 34612003919](https://github.com/deva-prakash-j/continuitydb/actions/runs/34612003919):
+- [CI run 34615456681](https://github.com/deva-prakash-j/continuitydb/actions/runs/34615456681):
   Node 22, Node 24, container, and Linux binary jobs all passed.
 
 Downloaded artifact contents matched their uploaded SHA-256 sidecars:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| Linux x64 | 143,993,896 | `62ecad425ea3e2a33b93c859309c3e0b61bb94bf193e4d40d3a71cdd88d7030b` |
-| macOS arm64 | 147,759,328 | `6b58909e44eaec31908de206e52de5b16e633ecd986df9cbe706a2d7e8a8027a` |
-| Windows x64 | 110,739,456 | `b0b097daff4b1bbc071c40966fb2ffeef30742cb88e6d11c802d9f23556d2473` |
+| Linux x64 | 143,997,992 | `337d1d819445f991cbbeeea3ea4002832e0a0b2f52a05bc3e4f15a22c9fffd49` |
+| macOS arm64 | 147,759,328 | `6cecf376306cdc3ee821adf4e670a39048999041a5c856d4bf62e89d2ecd6f13` |
+| Windows x64 | 110,742,528 | `4c1a94fd919e1df4088cc8ad5c454837e8cdba68744120691740dfd907785ffa` |
 
 Clean-checkout reproducibility was verified in a new detached Git worktree at
 the exact runtime SHA. Before the gate, `dist/continuitydb-linux-x64` did not
@@ -123,6 +123,11 @@ cached developer-workspace `dist/` artifact.
   pre-existing files byte-for-byte, and invalidates stale in-process cache
   verification state;
 - multi-client operations preflight every target before any mutation;
+- connector preflight and rollback use compare-and-swap snapshots; rollback
+  restores only bytes written by the failed transaction and preserves a file
+  changed by a concurrent writer while reporting the conflict;
+- external model-cache rollback applies the same compare-and-swap rule and
+  never overwrites a newer concurrent cache artifact;
 - a later commit failure restores changed files and removes backup artifacts
   and empty directories created by the failed batch;
 - malformed JSON/TOML or malformed managed namespaces fail closed;
@@ -132,6 +137,10 @@ cached developer-workspace `dist/` artifact.
   until native functional and semantic binary smoke tests pass; macOS smoke
   tests run after signing;
 - privileged release actions are pinned to immutable commit SHAs;
+- standalone fresh installs and forced upgrades are transactional across the
+  versioned binary, launcher, backup artifacts, and created directories;
+  failure restores the prior installation while preserving a launcher changed
+  concurrently and surfacing a rollback conflict;
 - the required `package:check` and `test:codex-config` release aliases are
   present and exercised; the generated Codex configuration probe builds its
   required standalone binary before use so it is reproducible from a clean
