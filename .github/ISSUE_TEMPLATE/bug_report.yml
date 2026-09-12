@@ -76,4 +76,3 @@ body:
           required: true
         - label: This is not a security vulnerability requiring private disclosure.
           required: true
-

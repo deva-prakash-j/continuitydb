@@ -1,5 +1,3 @@
-name: Ideas
-description: Explore a developer problem or integration before opening an issue
 title: "Idea: "
 body:
   - type: markdown

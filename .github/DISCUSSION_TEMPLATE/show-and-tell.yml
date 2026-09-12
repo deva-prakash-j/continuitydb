@@ -1,5 +1,3 @@
-name: Show and tell
-description: Share a ContinuityDB workflow, result, or early adopter experience
 title: "Show and tell: "
 body:
   - type: markdown

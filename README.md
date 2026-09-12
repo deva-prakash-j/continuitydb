@@ -6,13 +6,14 @@
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status)
 
 **Give every coding agent the same project context—across repositories,
-sessions, and tools—with Git-grounded citations.**
+sessions, and tools—with Git-grounded citations when context comes from a
+repository.**
 
 ContinuityDB is a local-first context service for Codex, Claude Code, Cursor,
 OpenCode, GitHub Copilot, and custom MCP clients. It keeps useful engineering
 context outside any one chat or model provider, then returns a small,
-scope-filtered context pack with the commit, path, symbol, and branch evidence
-needed to verify it.
+scope-filtered context pack. When Git provenance is supplied or ingested, the
+pack preserves commit, path, symbol, and branch evidence for verification.
 
 [Download a standalone build](https://github.com/deva-prakash-j/continuitydb/releases)
 · [Quick start](#60-second-quick-start)
@@ -59,9 +60,11 @@ continuitydb context "What is the release order?" \
   --allow-projects charge-api
 ```
 
-The result is a token-bounded context pack with provenance—not an unscoped
-transcript dump. See the [binary setup guide](docs/binary-distribution.md) for
-macOS, Windows, semantic search, and recovery details.
+The result is a token-bounded context pack with capture attribution—not an
+unscoped transcript dump. Git citations appear when a capture or repository
+ingestion includes Git provenance. See the
+[binary setup guide](docs/binary-distribution.md) for macOS, Windows, semantic
+search, and recovery details.
 
 ## Why ContinuityDB?
 
