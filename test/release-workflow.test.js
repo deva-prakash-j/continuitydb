@@ -244,6 +244,210 @@ test("stable v0.7.0 publication waits for every native and provenance gate", () 
   assert.throws(() => validateReleaseWorkflow(noStableTag), /stable v0\.7\.0 tag path/i);
 });
 
+test("stable publication requires exact package version, merged ancestry, and remote tag identity", () => {
+  assert.equal(validateReleaseWorkflow(workflow).valid, true);
+
+  const stableGate = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify stable tag release eligibility"));
+  assert.ok(stableGate, "stable eligibility gate is missing");
+
+  const mutations = [
+    ["version", /stable tag must exactly match package version/i,
+      (run) => run.replace('[[ "$GITHUB_REF_NAME" == "v${package_version}" ]]', "true")],
+    ["ancestry", /stable tag commit must be merged into origin\/main/i,
+      (run) => run.replace('git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main', "true")],
+    ["remote tag target", /remote stable tag must resolve to the exact workflow commit/i,
+      (run) => run.replace('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]', "true")],
+    ["local tag target", /local stable tag must resolve to the exact workflow commit/i,
+      (run) => run.replace('[[ "$local_tag_sha" == "$GITHUB_SHA" ]]', "true")],
+  ];
+  for (const [name, expected, mutate] of mutations) {
+    const invalid = structuredClone(workflow);
+    const step = invalid.jobs.publish.steps
+      .find((candidate) => String(candidate.name || "").includes("Verify stable tag release eligibility"));
+    step.run = mutate(step.run);
+    assert.throws(() => validateReleaseWorkflow(invalid), expected, name);
+  }
+
+  const shallowCheckout = structuredClone(workflow);
+  const checkout = shallowCheckout.jobs.publish.steps
+    .find((step) => String(step.uses || "").startsWith("actions/checkout@"));
+  checkout.with["fetch-depth"] = 1;
+  assert.throws(() => validateReleaseWorkflow(shallowCheckout), /complete history/i);
+
+  const credentialedCheckout = structuredClone(workflow);
+  credentialedCheckout.jobs.publish.steps
+    .find((step) => String(step.uses || "").startsWith("actions/checkout@"))
+    .with["persist-credentials"] = true;
+  assert.throws(() => validateReleaseWorkflow(credentialedCheckout), /credentials must remain disabled/i);
+
+  const skippedGate = structuredClone(workflow);
+  skippedGate.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify stable tag release eligibility"))
+    .if = "${{ false }}";
+  assert.throws(() => validateReleaseWorkflow(skippedGate), /stable release eligibility.*unconditional/i);
+
+  const ignoredGate = structuredClone(workflow);
+  ignoredGate.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify stable tag release eligibility"))
+    ["continue-on-error"] = "${{ true }}";
+  assert.throws(() => validateReleaseWorkflow(ignoredGate), /continue-on-error/i);
+
+  const wrongRefCondition = structuredClone(workflow);
+  const wrongRefStep = wrongRefCondition.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify stable tag release eligibility"));
+  wrongRefStep.run = wrongRefStep.run.replace(
+    'if [[ "$GITHUB_REF" != refs/tags/v* ]]; then',
+    'if [[ "$GITHUB_REF" != refs/heads/main ]]; then',
+  );
+  assert.throws(() => validateReleaseWorkflow(wrongRefCondition), /stable tag event condition/i);
+});
+
+test("stable release mutation and post-publication verification recheck exact remote tag target", () => {
+  const publish = workflow.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  const verify = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+
+  const noPremutationTarget = structuredClone(workflow);
+  noPremutationTarget.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    .run = publish.run.replace('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]', "true");
+  assert.throws(() => validateReleaseWorkflow(noPremutationTarget), /stable tag target.*before release mutation/i);
+
+  const ambiguousPremutationTarget = structuredClone(workflow);
+  ambiguousPremutationTarget.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    .run = publish.run.replace("resolve_remote_tag_commit", "gh release view");
+  assert.throws(() => validateReleaseWorkflow(ambiguousPremutationTarget), /stable tag target.*before release mutation/i);
+
+  const noPublishedTarget = structuredClone(workflow);
+  noPublishedTarget.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"))
+    .run = verify.run.replace('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]', "true");
+  assert.throws(() => validateReleaseWorkflow(noPublishedTarget), /stable tag target.*after publication/i);
+
+  const ignoredPublication = structuredClone(workflow);
+  ignoredPublication.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    ["continue-on-error"] = "${{ true }}";
+  assert.throws(() => validateReleaseWorkflow(ignoredPublication), /continue-on-error/i);
+
+  const wrongMutationCondition = structuredClone(workflow);
+  const wrongMutationStep = wrongMutationCondition.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"));
+  wrongMutationStep.run = wrongMutationStep.run.replace(
+    'if [[ "$RELEASE_PRERELEASE" == "false" ]]; then',
+    'if [[ "$RELEASE_PRERELEASE" == "true" ]]; then',
+  );
+  assert.throws(() => validateReleaseWorkflow(wrongMutationCondition), /stable tag target condition.*before release mutation/i);
+
+  const wrongPostCondition = structuredClone(workflow);
+  const wrongPostStep = wrongPostCondition.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+  wrongPostStep.run = wrongPostStep.run.replace(
+    'if [[ "$RELEASE_PRERELEASE" == "true" ]]; then',
+    'if [[ "$RELEASE_PRERELEASE" == "false" ]]; then',
+  );
+  assert.throws(() => validateReleaseWorkflow(wrongPostCondition), /stable tag target condition.*after publication/i);
+});
+
+function runStableShell({
+  refName = "v0.7.0",
+  sha,
+  mainAncestor = true,
+  remoteTagSha = sha,
+  mutationRemoteTagSha = remoteTagSha,
+  existing = false,
+}) {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-stable-release-"));
+  const bin = join(root, "bin");
+  const calls = join(root, "calls");
+  mkdirSync(bin);
+  mkdirSync(join(root, "release"));
+  writeFileSync(calls, "", "utf8");
+  writeFileSync(join(root, "package.json"), JSON.stringify({ version: "0.7.0" }), "utf8");
+  writeFileSync(join(root, "release", "continuitydb-linux-x64"), "fixture", "utf8");
+
+  const fakeGit = join(bin, "git");
+  writeFileSync(fakeGit, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'git %s\\n' "$*" >> "$CALL_LOG"\ncase "$1" in\n  fetch) exit 0 ;;\n  merge-base) [[ "$MAIN_ANCESTOR" == true ]] ;;\n  rev-parse) printf '%s\\n' "$REMOTE_TAG_SHA" ;;\n  *) exit 2 ;;\nesac\n`, "utf8");
+  chmodSync(fakeGit, 0o755);
+
+  const fakeGh = join(bin, "gh");
+  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else printf '%s\\n' "$REMOTE_TAG_SHA"; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  [[ "$RELEASE_EXISTS" == true ]] || exit 1\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'false\\n'; fi\n  exit 0\nfi\nexit 0\n`, "utf8");
+  chmodSync(fakeGh, 0o755);
+
+  const stableGate = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify stable tag release eligibility"));
+  const publish = workflow.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  const commonEnv = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH}`,
+    CALL_LOG: calls,
+    MAIN_ANCESTOR: String(mainAncestor),
+    REMOTE_TAG_SHA: remoteTagSha,
+    RELEASE_EXISTS: String(existing),
+    GITHUB_REF: `refs/tags/${refName}`,
+    GITHUB_REF_NAME: refName,
+    GITHUB_SHA: sha,
+    GH_REPO: "test/repo",
+    FAKE_GIT: fakeGit,
+    FAKE_GH: fakeGh,
+    RELEASE_TAG: refName,
+    RELEASE_TITLE: `ContinuityDB ${refName}`,
+    RELEASE_PRERELEASE: "false",
+  };
+  const fakeCommands = 'git() { "$FAKE_GIT" "$@"; }\ngh() { "$FAKE_GH" "$@"; }\n';
+  const eligibility = spawnSync("bash", ["-c", `${fakeCommands}${stableGate.run}`], {
+    cwd: root,
+    env: commonEnv,
+    encoding: "utf8",
+  });
+  let mutation = null;
+  if (eligibility.status === 0) {
+    mutation = spawnSync("bash", ["-c", `${fakeCommands}${publish.run}`], {
+      cwd: root,
+      env: { ...commonEnv, REMOTE_TAG_SHA: mutationRemoteTagSha },
+      encoding: "utf8",
+    });
+  }
+  return {
+    eligibility,
+    mutation,
+    calls: readFileSync(calls, "utf8"),
+  };
+}
+
+test("stable execution gate fails before release mutation and accepts only the exact valid path", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+
+  const versionMismatch = runStableShell({ refName: "v0.7.1", sha });
+  assert.notEqual(versionMismatch.eligibility.status, 0);
+  assert.doesNotMatch(versionMismatch.calls, /gh release (create|upload)/);
+
+  const unmerged = runStableShell({ sha, mainAncestor: false });
+  assert.notEqual(unmerged.eligibility.status, 0);
+  assert.doesNotMatch(unmerged.calls, /gh release (create|upload)/);
+
+  const wrongTag = runStableShell({ sha, remoteTagSha: "f".repeat(40) });
+  assert.notEqual(wrongTag.eligibility.status, 0);
+  assert.doesNotMatch(wrongTag.calls, /gh release (create|upload)/);
+
+  const movedBeforeMutation = runStableShell({ sha, mutationRemoteTagSha: "e".repeat(40) });
+  assert.equal(movedBeforeMutation.eligibility.status, 0, movedBeforeMutation.eligibility.stderr);
+  assert.notEqual(movedBeforeMutation.mutation.status, 0);
+  assert.doesNotMatch(movedBeforeMutation.calls, /gh release (create|upload)/);
+
+  const valid = runStableShell({ sha });
+  assert.equal(valid.eligibility.status, 0, `${valid.eligibility.stderr}\n${valid.calls}`);
+  assert.equal(valid.mutation.status, 0, valid.mutation.stderr);
+  assert.match(valid.calls, /gh release create v0\.7\.0/);
+
+  const existing = runStableShell({ sha, existing: true });
+  assert.equal(existing.eligibility.status, 0, existing.eligibility.stderr);
+  assert.equal(existing.mutation.status, 0, existing.mutation.stderr);
+  assert.match(existing.calls, /gh release upload v0\.7\.0/);
+});
+
 test("release check builds the standalone binary before the generated Codex config probe", () => {
   assert.equal(packageDocument.scripts["test:codex-config"], "npm run test:codex-generated-config");
   assert.equal(
