@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createEmbedderFromEnv } from "../src/embeddings.js";
 import {
@@ -17,7 +18,7 @@ import {
   WordPieceTokenizer,
 } from "../src/local-embeddings.js";
 
-const LOCK_WORKER = new URL("../test-support/file-lock-worker.mjs", import.meta.url);
+const LOCK_WORKER = fileURLToPath(new URL("../test-support/file-lock-worker.mjs", import.meta.url));
 
 function waitForLine(child, expected, timeoutMs = 5_000) {
   return new Promise((resolvePromise, reject) => {
@@ -201,7 +202,7 @@ test("setup-style outer cache lock serializes snapshot, install, and rollback", 
     });
     const written = snapshotLocalModelCache({ cacheDir: root, spec });
 
-    worker = spawn(process.execPath, [LOCK_WORKER.pathname, lockResource, "release"], {
+    worker = spawn(process.execPath, [LOCK_WORKER, lockResource, "release"], {
       stdio: ["ignore", "pipe", "pipe"],
     });
     let acquired = false;

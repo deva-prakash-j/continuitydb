@@ -5,6 +5,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -118,7 +119,7 @@ function assertProjectRegisteredOnce(home, project) {
 test("CLI version matches the package version", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
   try {
-    const cli = new URL("../src/cli.js", import.meta.url).pathname;
+    const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
     const result = spawnSync(process.execPath, [cli, "version"], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const value = JSON.parse(result.stdout);
@@ -136,7 +137,7 @@ test("CLI setup previews and applies all project agent connections idempotently"
   const project = join(root, "project");
   const home = join(root, "vault");
   mkdirSync(project);
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const common = [cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--owner", "owner-a"];
     const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
@@ -179,7 +180,7 @@ test("CLI setup and connect expose truthful complete and MCP-only integration co
   const project = join(root, "generic-repo");
   const home = join(root, "vault");
   const bin = join(root, "bin");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     mkdirSync(bin);
@@ -235,7 +236,7 @@ test("CLI agents connect refuses an unregistered project before writing", () => 
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-unregistered-agent-"));
   const project = join(root, "generic-repo");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     const result = spawnSync(process.execPath, [
@@ -253,7 +254,7 @@ test("CLI agents status reports per-asset drift without repairing it", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-status-drift-"));
   const project = join(root, "generic-repo");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     const applied = spawnSync(process.execPath, [
@@ -284,7 +285,7 @@ test("CLI setup reports a filesystem-detected OpenCode-only project connection",
   const bin = join(root, "bin");
   const userHome = join(root, "user-home");
   const executionMarker = join(root, "opencode-executed");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     mkdirSync(bin);
@@ -324,7 +325,7 @@ test("CLI reports an actionable limitation for every selected undetected executa
   const project = join(root, "generic-repo");
   const home = join(root, "vault");
   const emptyBin = join(root, "empty-bin");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     mkdirSync(emptyBin);
@@ -351,7 +352,7 @@ test("CLI setup derives one Git project identity and registers it on apply", () 
   const project = join(root, "git-project");
   const nested = join(project, "packages", "worker");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
     mkdirSync(nested, { recursive: true });
@@ -382,7 +383,7 @@ test("CLI setup authorizes the exact AgentForge Git identity without a default f
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-agentforge-"));
   const project = join(root, "AgentForge");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   let client;
   try {
     mkdirSync(join(project, ".git"), { recursive: true });
@@ -481,7 +482,7 @@ test("CLI setup outside Git refuses before mutating the vault or project", () =>
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-outside-git-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const result = spawnSync(process.execPath, [
@@ -500,7 +501,7 @@ test("CLI setup accepts and registers an explicit project outside Git", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-explicit-setup-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const result = spawnSync(process.execPath, [
@@ -520,7 +521,7 @@ test("CLI projects add previews, applies, lists, and repeats idempotently", () =
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-projects-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const common = [cli, "projects", "add", "--home", home, "--project-dir", project, "--project", "billing-api"];
@@ -554,7 +555,7 @@ test("CLI setup connector failure restores exact config bytes and registry state
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-registry-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
@@ -591,7 +592,7 @@ test("CLI setup --agents all fails before mutating any client when a later confi
   writeFileSync(claude, "{ malformed\n");
   const beforeCodex = readFileSync(codex, "utf8");
   const beforeClaude = readFileSync(claude, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
       cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
@@ -620,7 +621,7 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
   writeFileSync(blockingBackupParent, "pre-existing backup blocker\n");
   const beforeCodex = readFileSync(codex, "utf8");
   const beforeBlocker = readFileSync(blockingBackupParent, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
       cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
@@ -645,7 +646,7 @@ test("CLI connector failure preserves a partial vault when setup staging is dest
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-no-restore-source-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   const config = Buffer.from('{\n    "schema_version": 2,\n    "private_marker": "config-before"\n}\n');
   const recordsMarker = Buffer.from([0, 1, 2, 3, 254, 255]);
   const indexMarker = Buffer.from("index-before\n");
@@ -692,7 +693,7 @@ test("CLI failed setup never passes a pre-existing canonical path to recursive r
   const home = join(root, "vault");
   const removalLog = join(root, "recursive-removals.jsonl");
   const preload = join(root, "trace-removals.cjs");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(home, "records", "nested"), { recursive: true });
     mkdirSync(join(home, "index", "nested"), { recursive: true });
@@ -772,7 +773,7 @@ test("CLI existing-home promotion failures roll connectors back and retry withou
         const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-promotion-failure-"));
         const project = join(root, "project");
         const home = join(root, "vault");
-        const cli = new URL("../src/cli.js", import.meta.url).pathname;
+        const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
         const config = Buffer.from('{\n    "schema_version": 2,\n    "extension": { "preserve": true }\n}\n');
         const connector = Buffer.from('model = "gpt-5"\n');
         try {
@@ -820,7 +821,7 @@ test("CLI fresh-home promotion failures are atomic and retry idempotently", asyn
       const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-fresh-promotion-"));
       const project = join(root, "project");
       const home = join(root, "vault");
-      const cli = new URL("../src/cli.js", import.meta.url).pathname;
+      const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
       const connector = Buffer.from('model = "gpt-5"\n');
       try {
         mkdirSync(join(project, ".codex"), { recursive: true });
@@ -849,7 +850,7 @@ test("CLI failed setup restores a pre-existing empty index directory byte-for-by
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-empty-index-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(home, "index"), { recursive: true });
     mkdirSync(project);
@@ -872,7 +873,7 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-valid-db-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
@@ -895,7 +896,7 @@ test("CLI setup refuses to place a new database beside pre-existing WAL or SHM s
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-orphan-sidecars-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(home, "index"), { recursive: true });
     mkdirSync(join(project, ".codex"), { recursive: true });
@@ -918,7 +919,7 @@ test("CLI failed setup preserves live SQLite WAL and SHM state across restart", 
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-wal-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   let database;
   try {
     mkdirSync(project);
@@ -950,7 +951,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-concurrent-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   let reopened;
   let writer;
   try {
@@ -970,7 +971,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
     const snapshot = await waitForSetupSnapshot(child);
     assert.equal(existsSync(snapshot.directory), true);
 
-    const worker = new URL("../test-support/concurrent-first-commit.mjs", import.meta.url).pathname;
+    const worker = fileURLToPath(new URL("../test-support/concurrent-first-commit.mjs", import.meta.url));
     writer = fork(worker, [], { silent: true });
     await waitForChildMessage(writer, "ready");
     const starting = waitForChildMessage(writer, "starting");
@@ -1006,7 +1007,7 @@ test("CLI setup vault failure occurs before agent commit and removes new setup a
   writeFileSync(codex, 'model = "gpt-5"\n');
   writeFileSync(blocker, "pre-existing index blocker\n");
   const beforeCodex = readFileSync(codex, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
       cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
@@ -1037,7 +1038,7 @@ test("CLI agents connect all fails before mutating any client when a later names
   writeFileSync(claude, '{"keep":true}\n');
   writeFileSync(opencode, '{"mcp":"invalid"}\n');
   const before = new Map([codex, claude, opencode].map((path) => [path, readFileSync(path, "utf8")]));
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
       cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--project", "cli-test", "--apply",
@@ -1064,7 +1065,7 @@ test("CLI --home overrides environment home for local embedding cache resolution
   vault.commit(proposal.record.id);
   vault.close();
   try {
-    const cli = new URL("../src/cli.js", import.meta.url).pathname;
+    const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
     const result = spawnSync(process.execPath, [cli, "embeddings-index", "--home", cliHome], {
       encoding: "utf8",
       env: {
@@ -1102,7 +1103,7 @@ test("CLI handoff-save quarantines a checkpoint without latest-checkpoint lineag
     current_state: "API first",
     branch: "main",
   }));
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   const env = {
     ...process.env,
     CONTINUITYDB_ALLOWED_PROJECTS: "api",

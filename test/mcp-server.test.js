@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -32,7 +33,7 @@ function initializeRequest(name = "raw-client") {
 
 test("MCP exposes policy-controlled capture and feedback without admin tools", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-test-"));
-  const serverPath = new URL("../src/mcp-server.js", import.meta.url).pathname;
+  const serverPath = fileURLToPath(new URL("../src/mcp-server.js", import.meta.url));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
@@ -136,7 +137,7 @@ test("MCP exposes policy-controlled capture and feedback without admin tools", a
 
 test("stdio MCP read-only profile exposes only annotated retrieval tools", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-read-test-"));
-  const serverPath = new URL("../src/mcp-server.js", import.meta.url).pathname;
+  const serverPath = fileURLToPath(new URL("../src/mcp-server.js", import.meta.url));
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
@@ -280,7 +281,7 @@ test("stdio MCP can proxy two-agent continuity through one authoritative HTTP se
   let client;
   try {
     const address = await service.listen();
-    const serverPath = new URL("../src/mcp-server.js", import.meta.url).pathname;
+    const serverPath = fileURLToPath(new URL("../src/mcp-server.js", import.meta.url));
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [serverPath],

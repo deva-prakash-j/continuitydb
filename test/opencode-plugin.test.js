@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { renderOpenCodePlugin } from "../src/opencode-plugin-template.js";
 import { saveLifecycleCheckpoint } from "../src/lifecycle-context.js";
@@ -10,7 +10,7 @@ import { createContinuityServer } from "../src/http-server.js";
 import { registerProject } from "../src/project-registry.js";
 import { ContextVault } from "../src/store.js";
 
-const SOURCE_HOOK = new URL("../src/lifecycle-hook.js", import.meta.url).pathname;
+const SOURCE_HOOK = fileURLToPath(new URL("../src/lifecycle-hook.js", import.meta.url));
 
 async function importGenerated(root, options) {
   const path = join(root, "continuitydb.js");

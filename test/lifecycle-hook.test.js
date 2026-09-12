@@ -4,14 +4,29 @@ import { appendFileSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFi
 import { createServer as createNodeServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
 import { registerProject } from "../src/project-registry.js";
 import * as lifecycleHook from "../src/lifecycle-hook.js";
 
+function withoutNodeSqliteExperimentalWarning(stderr) {
+  return stderr.replace(
+    /^\(node:\d+\) ExperimentalWarning: SQLite is an experimental feature and might change at any time\r?\n(?:\(Use `node --trace-warnings \.\.\.` to show where the warning was created\)\r?\n)?/gm,
+    "",
+  );
+}
+
+test("lifecycle stderr filtering ignores only the Node SQLite experimental warning", () => {
+  const sqliteWarning = "(node:42) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n"
+    + "(Use `node --trace-warnings ...` to show where the warning was created)\n";
+  assert.equal(withoutNodeSqliteExperimentalWarning(sqliteWarning), "");
+  assert.equal(withoutNodeSqliteExperimentalWarning(`${sqliteWarning}real hook error\n`), "real hook error\n");
+});
+
 function runHook(args, env) {
-  const hook = new URL("../src/lifecycle-hook.js", import.meta.url).pathname;
+  const hook = fileURLToPath(new URL("../src/lifecycle-hook.js", import.meta.url));
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [hook, ...args], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -24,7 +39,7 @@ function runHook(args, env) {
 }
 
 function runHookResult(args, env) {
-  const hook = new URL("../src/lifecycle-hook.js", import.meta.url).pathname;
+  const hook = fileURLToPath(new URL("../src/lifecycle-hook.js", import.meta.url));
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [hook, ...args], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -243,7 +258,7 @@ test("local lifecycle reports quarantined checkpoints as not saved and leaves la
     }));
     const stale = await runHookResult(["checkpoint", "--file", path, "--verbose"], env);
     assert.equal(stale.code, 1);
-    assert.equal(stale.stderr, "");
+    assert.equal(withoutNodeSqliteExperimentalWarning(stale.stderr), "");
     const staleOutput = JSON.parse(stale.stdout);
     assert.equal(staleOutput.saved, false);
     assert.equal(staleOutput.duplicate, false);

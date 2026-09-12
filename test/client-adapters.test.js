@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { ContinuityDBPlugin } from "../examples/clients/opencode-continuitydb.js";
 import { createContinuityServer } from "../src/http-server.js";
 import { ContextVault } from "../src/store.js";
 
 test("versioned client configuration examples pass contract validation", () => {
-  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
   const result = spawnSync(process.execPath, [script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   const value = JSON.parse(result.stdout);
@@ -28,10 +29,29 @@ test("versioned client configuration examples pass contract validation", () => {
   assert.equal(value.standalone_tree_validator, true);
 });
 
+test("client validator canonicalizes its own temporary root across a platform symlink alias", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-validator-alias-"));
+  const physicalTmp = join(root, "physical-tmp");
+  const aliasedTmp = join(root, "aliased-tmp");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    mkdirSync(physicalTmp);
+    symlinkSync(physicalTmp, aliasedTmp, process.platform === "win32" ? "junction" : "dir");
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: aliasedTmp, TMP: aliasedTmp, TEMP: aliasedTmp },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("client validator rejects drift in every shipped generated hook example", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-client-example-drift-"));
   const examples = join(root, "examples");
-  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
   try {
     cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
     const path = join(examples, "clients", "claude-code.hooks.json");
@@ -49,7 +69,7 @@ test("client validator rejects drift in every shipped generated hook example", (
 test("client validator rejects a stale OpenCode plugin reference", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-example-drift-"));
   const examples = join(root, "examples");
-  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
   try {
     cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
     const path = join(examples, "clients", "opencode.json");
@@ -67,7 +87,7 @@ test("client validator rejects a stale OpenCode plugin reference", () => {
 test("client validator rejects a stale Codex stdio executable", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-codex-example-drift-"));
   const examples = join(root, "examples");
-  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
   try {
     cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
     const path = join(examples, "clients", "codex.stdio.config.toml");

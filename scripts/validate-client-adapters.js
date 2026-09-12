@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -316,7 +316,11 @@ function validateVersionedExamples() {
 }
 
 function validateRepositoryAdapters() {
-  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-validator-"));
+  // `os.tmpdir()` can be exposed through an OS-managed alias (notably
+  // `/var` -> `/private/var` on macOS). Canonicalize this validator-owned
+  // directory before applying the production project's strict no-symlink
+  // policy. User-supplied project paths are never canonicalized here.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "continuitydb-client-validator-")));
   const projectDir = join(root, "inventory-service");
   const home = join(root, "vault");
   const projectId = "inventory-service";
