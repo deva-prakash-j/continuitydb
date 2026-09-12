@@ -60,9 +60,9 @@ continuitydb context "What is the release order?" \
   --allow-projects charge-api
 ```
 
-The result is a token-bounded context pack with capture attribution—not an
-unscoped transcript dump. Git citations appear when a capture or repository
-ingestion includes Git provenance. See the
+The result is a token-bounded, project-scoped context pack—not an unscoped
+transcript dump. Git citations appear when a capture or repository ingestion
+includes Git provenance. See the
 [binary setup guide](docs/binary-distribution.md) for macOS, Windows, semantic
 search, and recovery details.
 
