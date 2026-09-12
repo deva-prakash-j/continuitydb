@@ -1,5 +1,16 @@
 import assert from "node:assert/strict";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -1571,6 +1582,181 @@ test("connector fails closed when a direct writer changes config before atomic r
   } finally {
     if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connector write fails closed when a created target parent is replaced after validation", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const parent = join(value.project, ".codex");
+  const displaced = join(value.project, ".codex-displaced");
+  const outside = join(value.root, "outside-write");
+  const outsideSentinel = join(outside, "sentinel.txt");
+  try {
+    process.env.NODE_ENV = "test";
+    mkdirSync(outside);
+    writeFileSync(outsideSentinel, "outside-owned\n");
+    assert.throws(() => connectAgent("codex", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => {
+        if (path !== join(parent, "config.toml")) return;
+        renameSync(parent, displaced);
+        const temporary = readdirSync(displaced).find((entry) => entry.endsWith(".tmp"));
+        assert.ok(temporary, "prepared connector temporary file was not found");
+        renameSync(join(displaced, temporary), join(outside, temporary));
+        symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+      },
+    }), /parent|ancestor|directory|rollback/i);
+    assert.equal(existsSync(join(outside, "config.toml")), false);
+    assert.equal(readFileSync(outsideSentinel, "utf8"), "outside-owned\n");
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connector removal fails closed when a pre-existing target parent is replaced after validation", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const parent = join(value.project, ".codex");
+  const displaced = join(value.project, ".codex-displaced");
+  const outside = join(value.root, "outside-remove");
+  const outsideTarget = join(outside, "config.toml");
+  try {
+    process.env.NODE_ENV = "test";
+    connectAgent("codex", options(value));
+    const managed = readFileSync(join(parent, "config.toml"), "utf8");
+    mkdirSync(outside);
+    assert.throws(() => disconnectAgent("codex", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => {
+        if (path !== join(parent, "config.toml")) return;
+        renameSync(parent, displaced);
+        writeFileSync(outsideTarget, managed, { mode: 0o600 });
+        symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+      },
+    }), /parent|ancestor|directory|rollback/i);
+    assert.equal(readFileSync(outsideTarget, "utf8"), managed);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connector rollback refuses a substituted parent and preserves the outside target", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const parent = join(value.project, ".codex");
+  const displaced = join(value.project, ".codex-displaced");
+  const outside = join(value.root, "outside-rollback");
+  const outsideTarget = join(outside, "config.toml");
+  let outsideExpected = null;
+  try {
+    process.env.NODE_ENV = "test";
+    mkdirSync(parent);
+    writeFileSync(join(parent, "config.toml"), 'model = "user-owned"\n');
+    mkdirSync(outside);
+    assert.throws(() => connectAgent("codex", {
+      ...options(value),
+      _testAfterCommit: ({ committed, plan }) => {
+        if (committed !== 1 || plan.path !== join(parent, "config.toml")) return;
+        const managed = readFileSync(plan.path, "utf8");
+        outsideExpected = managed;
+        renameSync(parent, displaced);
+        writeFileSync(outsideTarget, managed, { mode: 0o600 });
+        symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+        throw new Error("injected failure after parent substitution");
+      },
+    }), /parent|ancestor|directory|rollback/i);
+    assert.equal(readFileSync(outsideTarget, "utf8"), outsideExpected);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connection status never verifies managed assets through a substituted parent", () => {
+  const value = fixture();
+  const parent = join(value.project, ".codex");
+  const displaced = join(value.project, ".codex-displaced");
+  const outside = join(value.root, "outside-status");
+  try {
+    connectAgent("codex", options(value));
+    registerProject(value.home, { id: "service-a", root: value.project, source: "explicit" }, { apply: true });
+    const managed = readFileSync(join(parent, "config.toml"), "utf8");
+    renameSync(parent, displaced);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "config.toml"), managed, { mode: 0o600 });
+    symlinkSync(outside, parent, process.platform === "win32" ? "junction" : "dir");
+
+    const status = connectionStatus(options(value)).find((item) => item.client === "codex");
+    assert.equal(status.verified, false);
+    assert.equal(status.drifted, true);
+    assert.match(status.error || status.assets.find((asset) => asset.error)?.error || "", /parent|ancestor|directory|symlink/i);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("backup cleanup refuses a substituted parent and preserves outside bytes", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const target = join(value.project, ".codex", "config.toml");
+  const backupParent = join(value.home, "backups", "agent-config", "codex");
+  const displacedBackupParent = join(value.home, "backups", "agent-config", "codex-displaced");
+  const outside = join(value.root, "outside-backup");
+  try {
+    process.env.NODE_ENV = "test";
+    mkdirSync(join(target, ".."), { recursive: true });
+    writeFileSync(target, 'model = "original"\n');
+    mkdirSync(outside);
+    assert.throws(() => connectAgent("codex", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => {
+        if (path !== target) return;
+        const backupName = readdirSync(backupParent)[0];
+        const backupBytes = readFileSync(join(backupParent, backupName));
+        renameSync(backupParent, displacedBackupParent);
+        writeFileSync(join(outside, backupName), backupBytes, { mode: 0o600 });
+        symlinkSync(outside, backupParent, process.platform === "win32" ? "junction" : "dir");
+        writeFileSync(target, 'model = "concurrent"\n', { mode: 0o600 });
+      },
+    }), /parent|ancestor|directory|configuration changed|rollback/i);
+    const outsideFiles = readdirSync(outside);
+    assert.equal(outsideFiles.length, 1);
+    assert.equal(readFileSync(join(outside, outsideFiles[0]), "utf8"), 'model = "original"\n');
+    assert.equal(readFileSync(target, "utf8"), 'model = "concurrent"\n');
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connector rejects a pre-existing symlink at the immutable backup destination", () => {
+  const value = fixture();
+  const target = join(value.project, ".codex", "config.toml");
+  const original = 'model = "original"\n';
+  const outside = join(value.root, "outside-backup-file");
+  try {
+    mkdirSync(join(target, ".."), { recursive: true });
+    writeFileSync(target, original);
+    mkdirSync(outside);
+    const outsideFile = join(outside, "user-owned.bak");
+    writeFileSync(outsideFile, "outside-owned\n");
+    const digest = createHash("sha256").update(original).digest("hex").slice(0, 16);
+    const backupParent = join(value.home, "backups", "agent-config", "codex");
+    mkdirSync(backupParent, { recursive: true });
+    symlinkSync(outsideFile, join(backupParent, `config.toml.${digest}.bak`));
+
+    assert.throws(() => connectAgent("codex", options(value)), /backup|regular file|symlink/i);
+    assert.equal(readFileSync(outsideFile, "utf8"), "outside-owned\n");
+    assert.equal(readFileSync(target, "utf8"), original);
+  } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
 });

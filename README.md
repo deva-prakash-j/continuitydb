@@ -335,6 +335,19 @@ rerunning setup is idempotent. Static secrets are never written: remote configs
 store only a token environment variable reference. Disconnect removes only the
 ContinuityDB-owned entry:
 
+Managed-file operations bind the project root and every existing target-parent
+component to its canonical real path plus filesystem device/inode/type identity.
+That chain is revalidated after preparation hooks, immediately before and after
+replacement or removal, during rollback and backup cleanup, and while reporting
+status. A changed or symlinked ancestor fails closed instead of being reported
+as verified. Stock Node.js does not expose a portable descriptor-relative
+`renameat`/`unlinkat` equivalent (or a Windows handle-relative replacement), so
+a same-UID process that can mutate these directories can still swap an ancestor
+in the final interval between validation and the pathname syscall. Post-operation
+validation reports that race but cannot guarantee the substituted tree was never
+briefly affected; stronger isolation requires OS permissions or a sandbox that
+prevents untrusted writers from modifying the project configuration directories.
+
 ```bash
 continuitydb agents disconnect codex --project-dir "$PWD"
 continuitydb agents disconnect codex --project-dir "$PWD" --apply

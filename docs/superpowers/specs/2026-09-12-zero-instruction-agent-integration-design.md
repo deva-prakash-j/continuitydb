@@ -1,8 +1,8 @@
 # ContinuityDB Zero-Instruction Agent Integration Design
 
-**Date:** 2026-09-12  
-**Status:** Proposed for implementation  
-**Target:** ContinuityDB v0.7.0  
+**Date:** 2026-09-12
+**Status:** Proposed for implementation
+**Target:** ContinuityDB v0.7.0
 **Supported clients:** Codex, Claude Code, OpenCode, Cursor, VS Code Copilot
 
 ## 1. Goal
@@ -139,12 +139,22 @@ All client assets participate in the existing two-phase connector transaction:
 3. reject symlinked targets and unsafe parent paths;
 4. render all MCP, hook, plugin, rule, and instruction changes;
 5. use explicit ContinuityDB markers for shared Markdown/TOML files;
-6. write each prepared file atomically under canonical per-file locks;
+6. bind each prepared file to a validated root-to-parent filesystem identity,
+   revalidate that chain around each pathname operation, and write atomically
+   under canonical per-file locks;
 7. roll back the entire client batch if any write fails;
 8. preserve unknown keys, comments where the format permits, and unrelated user
    instructions;
 9. make reruns idempotent and upgrades replace only the managed section;
 10. disconnect removes only ContinuityDB-owned entries and files.
+
+The portable implementation rejects symlinked or replaced ancestors using
+canonical real paths and device/inode/type identity. Node.js does not provide a
+cross-platform descriptor-relative replacement/removal primitive, so this is a
+bounded fail-closed mitigation rather than an absolute guarantee against a
+same-UID adversary that can swap a directory in the final interval between the
+last validation and the pathname syscall. Deployments that require that stronger
+guarantee must prevent such writers with filesystem permissions or sandboxing.
 
 An unmanaged conflicting ContinuityDB entry fails closed with an actionable
 error. Setup never silently overwrites it.

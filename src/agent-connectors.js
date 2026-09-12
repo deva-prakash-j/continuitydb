@@ -8,6 +8,7 @@ import {
   lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   rmdirSync,
@@ -80,6 +81,98 @@ function ensureSafeParents(root, target, apply) {
   return created;
 }
 
+function directoryIdentity(path) {
+  const metadata = lstatSync(path, { bigint: true });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(`configuration parent must be a real directory: ${path}`);
+  }
+  return {
+    path: resolve(path),
+    realpath: realpathSync.native(path),
+    dev: String(metadata.dev),
+    ino: String(metadata.ino),
+    mode: String(metadata.mode),
+    birthtimeNs: String(metadata.birthtimeNs),
+  };
+}
+
+function captureParentChain(root, target) {
+  const resolvedRoot = resolve(root);
+  const resolvedTarget = resolve(target);
+  if (!contains(resolvedRoot, resolvedTarget)) {
+    throw new Error(`refusing to access outside configuration root: ${resolvedTarget}`);
+  }
+  const parent = dirname(resolvedTarget);
+  const relativeParent = relative(resolvedRoot, parent);
+  const paths = [resolvedRoot];
+  let current = resolvedRoot;
+  for (const part of relativeParent.split(sep).filter(Boolean)) {
+    current = join(current, part);
+    paths.push(current);
+  }
+  return { root: resolvedRoot, target: resolvedTarget, entries: paths.map(directoryIdentity) };
+}
+
+function sameDirectoryIdentity(left, right) {
+  return left.path === right.path
+    && left.realpath === right.realpath
+    && left.dev === right.dev
+    && left.ino === right.ino
+    && left.mode === right.mode
+    && left.birthtimeNs === right.birthtimeNs;
+}
+
+function assertParentChain(binding, label = "configuration") {
+  let current;
+  try {
+    current = captureParentChain(binding.root, binding.target);
+  } catch (error) {
+    throw new Error(`${label} parent chain is no longer valid: ${error.message}`);
+  }
+  if (current.entries.length !== binding.entries.length
+    || current.entries.some((entry, index) => !sameDirectoryIdentity(entry, binding.entries[index]))) {
+    throw new Error(`${label} parent chain changed before filesystem operation: ${binding.target}`);
+  }
+  return current;
+}
+
+function captureCreatedDirectoryBindings(root, directories) {
+  return directories.map((directory) => ({
+    directory,
+    binding: captureParentChain(root, join(directory, ".continuitydb-directory-identity")),
+  }));
+}
+
+function projectedRealpath(path) {
+  let current = resolve(path);
+  const missing = [];
+  while (!existsSync(current)) {
+    const parent = dirname(current);
+    if (parent === current) throw new Error(`cannot resolve filesystem path: ${path}`);
+    missing.unshift(basename(current));
+    current = parent;
+  }
+  return join(realpathSync.native(current), ...missing);
+}
+
+function relocatedParentBinding(binding, fromRoot, toRoot) {
+  const source = resolve(fromRoot);
+  const destination = resolve(toRoot);
+  const sourceRealpath = binding.entries[0].realpath;
+  const destinationRealpath = projectedRealpath(destination);
+  const relocate = (path) => join(destination, relative(source, path));
+  const relocateRealpath = (path) => join(destinationRealpath, relative(sourceRealpath, path));
+  return {
+    root: destination,
+    target: relocate(binding.target),
+    entries: binding.entries.map((entry) => ({
+      ...entry,
+      path: relocate(entry.path),
+      realpath: relocateRealpath(entry.realpath),
+    })),
+  };
+}
+
 function readText(path) {
   if (!existsSync(path)) return "";
   const metadata = lstatSync(path);
@@ -127,9 +220,11 @@ function managedCodexBlock(text) {
   return start === -1 ? null : { start, end };
 }
 
-function backupExisting(path, backupRoot, client) {
+function backupExisting(path, backupRoot, client, sourceBinding) {
   if (!existsSync(path)) return null;
+  assertParentChain(sourceBinding, "configuration source");
   const value = readText(path);
+  assertParentChain(sourceBinding, "configuration source");
   const digest = sha256(value);
   const directory = join(backupRoot, "agent-config", client);
   const createdDirectories = [];
@@ -145,18 +240,37 @@ function backupExisting(path, backupRoot, client) {
     }
   }
   const destination = join(directory, `${basename(path)}.${digest.slice(0, 16)}.bak`);
+  const backupBase = dirname(backupRoot);
+  const parentBinding = captureParentChain(backupBase, destination);
+  const createdDirectoryBindings = captureCreatedDirectoryBindings(backupBase, createdDirectories);
   let createdFile = false;
   try {
+    assertParentChain(sourceBinding, "configuration source");
+    assertParentChain(parentBinding, "backup destination");
     copyFileSync(path, destination, constants.COPYFILE_EXCL);
     createdFile = true;
     chmodSync(destination, 0o600);
+    assertParentChain(sourceBinding, "configuration source");
+    assertParentChain(parentBinding, "backup destination");
   } catch (error) {
     if (error?.code !== "EEXIST") {
-      cleanupBackupArtifacts({ path: destination, createdFile, createdDirectories });
+      cleanupBackupArtifacts({
+        path: destination, createdFile, createdDirectories, createdDirectoryBindings, parentBinding,
+      });
       throw error;
     }
+    assertParentChain(sourceBinding, "configuration source");
+    assertParentChain(parentBinding, "backup destination");
+    const existing = lstatSync(destination);
+    if (!existing.isFile() || existing.isSymbolicLink()) {
+      throw new Error(`immutable backup must be a regular file, not a symlink: ${destination}`);
+    }
+    if (sha256(readText(destination)) !== digest) {
+      throw new Error(`immutable backup content does not match its digest: ${destination}`);
+    }
+    assertParentChain(parentBinding, "backup destination");
   }
-  return { path: destination, createdFile, createdDirectories };
+  return { path: destination, createdFile, createdDirectories, createdDirectoryBindings, parentBinding };
 }
 
 function cleanupBackupArtifacts(artifacts) {
@@ -165,6 +279,8 @@ function cleanupBackupArtifacts(artifacts) {
     && artifacts.relocatedPath
     && existsSync(artifacts.relocatedPath);
   const artifactPath = existsSync(artifacts.path) ? artifacts.path : relocated ? artifacts.relocatedPath : null;
+  const parentBinding = relocated ? artifacts.relocatedParentBinding : artifacts.parentBinding;
+  if (artifactPath) assertParentChain(parentBinding, "backup cleanup");
   if (artifacts.createdFile && artifactPath) {
     const metadata = lstatSync(artifactPath);
     if (!metadata.isFile() || metadata.isSymbolicLink()) {
@@ -175,7 +291,12 @@ function cleanupBackupArtifacts(artifacts) {
   const createdDirectories = relocated
     ? artifacts.relocatedCreatedDirectories || artifacts.createdDirectories
     : artifacts.createdDirectories;
+  const directoryBindings = relocated
+    ? artifacts.relocatedCreatedDirectoryBindings || artifacts.createdDirectoryBindings
+    : artifacts.createdDirectoryBindings;
   for (const directory of [...createdDirectories].reverse()) {
+    const binding = directoryBindings?.find((entry) => entry.directory === directory)?.binding;
+    if (binding) assertParentChain(binding, "backup directory cleanup");
     if (existsSync(directory)) rmdirSync(directory);
   }
 }
@@ -186,13 +307,18 @@ function sameSnapshot(left, right) {
     && left.mode === right.mode;
 }
 
-function currentSnapshot(path) {
-  return snapshot(path);
+function currentSnapshot(path, parentBinding = null) {
+  if (parentBinding) assertParentChain(parentBinding);
+  const value = snapshot(path);
+  if (parentBinding) assertParentChain(parentBinding);
+  return value;
 }
 
 function cleanupCreatedDirectories(plan, result) {
   for (const directory of [...(result.createdDirectories || [])].reverse()) {
     if (contains(plan.options.projectDir, directory) && existsSync(directory)) {
+      const binding = result.createdDirectoryBindings?.find((entry) => entry.directory === directory)?.binding;
+      if (binding) assertParentChain(binding, "configuration directory cleanup");
       try { rmdirSync(directory); }
       catch (error) { if (error.code !== "ENOTEMPTY" && error.code !== "ENOENT") throw error; }
     }
@@ -205,49 +331,76 @@ function configurationLockPath(path) {
 
 function atomicWrite(path, content, { root, home, backupHome, client, apply, expected, beforeReplace }) {
   const createdDirectories = ensureSafeParents(root, path, apply);
+  const createdDirectoryBindings = captureCreatedDirectoryBindings(root, createdDirectories);
+  const parentBinding = apply || existsSync(dirname(path)) ? captureParentChain(root, path) : null;
   if (!apply) {
-    const beforeState = currentSnapshot(path);
+    const beforeState = currentSnapshot(path, parentBinding);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     return beforeState.content === content
-      ? { path, changed: false, applied: false, verified: true, backup: null, createdDirectories }
-      : { path, changed: true, applied: false, verified: false, backup: null, createdDirectories };
+      ? { path, changed: false, applied: false, verified: true, backup: null, createdDirectories, createdDirectoryBindings, parentBinding }
+      : { path, changed: true, applied: false, verified: false, backup: null, createdDirectories, createdDirectoryBindings, parentBinding };
   }
 
   const lockPath = configurationLockPath(path);
   const releaseLock = acquireFileLock(lockPath);
   try {
-    const beforeState = currentSnapshot(path);
+    assertParentChain(parentBinding);
+    const beforeState = currentSnapshot(path, parentBinding);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     const before = beforeState.content || "";
     if (before === content) {
-      return { path, changed: false, applied: true, verified: true, backup: null, createdDirectories };
+      return {
+        path, changed: false, applied: true, verified: true, backup: null,
+        createdDirectories, createdDirectoryBindings, parentBinding,
+      };
     }
-    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client);
+    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client, parentBinding);
     if (backupArtifacts && backupHome && resolve(backupHome) !== resolve(home)) {
       backupArtifacts.relocatedPath = join(home, relative(backupHome, backupArtifacts.path));
       backupArtifacts.relocatedCreatedDirectories = backupArtifacts.createdDirectories
         .map((directory) => join(home, relative(backupHome, directory)));
+      backupArtifacts.relocatedParentBinding = relocatedParentBinding(
+        backupArtifacts.parentBinding, backupHome, home,
+      );
+      backupArtifacts.relocatedCreatedDirectoryBindings = backupArtifacts.createdDirectoryBindings.map((entry) => ({
+        directory: join(home, relative(backupHome, entry.directory)),
+        binding: relocatedParentBinding(entry.binding, backupHome, home),
+      }));
       backupArtifacts.publicPath = backupArtifacts.relocatedPath;
     }
     const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
     try {
+      assertParentChain(parentBinding);
       writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
+      assertParentChain(parentBinding);
       if (beforeReplace) {
         if (process.env.NODE_ENV !== "test") throw new Error("connector replace test hook is available only in tests");
         beforeReplace({ path, lockPath });
       }
+      assertParentChain(parentBinding);
       // Detect direct writers that do not participate in ContinuityDB's lock
       // protocol. Participating connector processes serialize on lockPath.
-      if (!sameSnapshot(currentSnapshot(path), beforeState)) {
+      if (!sameSnapshot(currentSnapshot(path, parentBinding), beforeState)) {
         const error = new Error(`configuration changed before atomic replacement: ${path}`);
         error.continuitydbNoWrite = true;
         throw error;
       }
+      assertParentChain(parentBinding);
       renameSync(temporary, path);
+      assertParentChain(parentBinding);
       chmodSync(path, 0o600);
+      assertParentChain(parentBinding);
     } catch (error) {
-      if (existsSync(temporary)) rmSync(temporary);
-      cleanupBackupArtifacts(backupArtifacts);
+      const cleanupErrors = [];
+      try {
+        assertParentChain(parentBinding, "temporary file cleanup");
+        if (existsSync(temporary)) rmSync(temporary);
+      } catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      try { cleanupBackupArtifacts(backupArtifacts); }
+      catch (cleanupError) { cleanupErrors.push(cleanupError); }
+      if (cleanupErrors.length) {
+        throw new AggregateError([error, ...cleanupErrors], `${error.message}; connector cleanup was incomplete`);
+      }
       throw error;
     }
     return {
@@ -258,7 +411,9 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
       backup: backupArtifacts?.path || null,
       backupArtifacts,
       createdDirectories,
-      written: currentSnapshot(path),
+      createdDirectoryBindings,
+      parentBinding,
+      written: currentSnapshot(path, parentBinding),
     };
   } finally {
     releaseLock();
@@ -267,8 +422,10 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
 
 function atomicRemove(path, { root, home, backupHome, client, apply, expected, beforeReplace }) {
   const createdDirectories = ensureSafeParents(root, path, false);
+  const createdDirectoryBindings = captureCreatedDirectoryBindings(root, createdDirectories);
+  const parentBinding = apply || existsSync(dirname(path)) ? captureParentChain(root, path) : null;
   if (!apply) {
-    const beforeState = currentSnapshot(path);
+    const beforeState = currentSnapshot(path, parentBinding);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     return {
       path,
@@ -277,22 +434,35 @@ function atomicRemove(path, { root, home, backupHome, client, apply, expected, b
       verified: !beforeState.existed,
       backup: null,
       createdDirectories,
+      createdDirectoryBindings,
+      parentBinding,
     };
   }
 
   const lockPath = configurationLockPath(path);
   const releaseLock = acquireFileLock(lockPath);
   try {
-    const beforeState = currentSnapshot(path);
+    assertParentChain(parentBinding);
+    const beforeState = currentSnapshot(path, parentBinding);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     if (!beforeState.existed) {
-      return { path, changed: false, applied: true, verified: false, backup: null, createdDirectories };
+      return {
+        path, changed: false, applied: true, verified: false, backup: null,
+        createdDirectories, createdDirectoryBindings, parentBinding,
+      };
     }
-    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client);
+    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client, parentBinding);
     if (backupArtifacts && backupHome && resolve(backupHome) !== resolve(home)) {
       backupArtifacts.relocatedPath = join(home, relative(backupHome, backupArtifacts.path));
       backupArtifacts.relocatedCreatedDirectories = backupArtifacts.createdDirectories
         .map((directory) => join(home, relative(backupHome, directory)));
+      backupArtifacts.relocatedParentBinding = relocatedParentBinding(
+        backupArtifacts.parentBinding, backupHome, home,
+      );
+      backupArtifacts.relocatedCreatedDirectoryBindings = backupArtifacts.createdDirectoryBindings.map((entry) => ({
+        directory: join(home, relative(backupHome, entry.directory)),
+        binding: relocatedParentBinding(entry.binding, backupHome, home),
+      }));
       backupArtifacts.publicPath = backupArtifacts.relocatedPath;
     }
     try {
@@ -300,12 +470,15 @@ function atomicRemove(path, { root, home, backupHome, client, apply, expected, b
         if (process.env.NODE_ENV !== "test") throw new Error("connector replace test hook is available only in tests");
         beforeReplace({ path, lockPath });
       }
-      if (!sameSnapshot(currentSnapshot(path), beforeState)) {
+      assertParentChain(parentBinding);
+      if (!sameSnapshot(currentSnapshot(path, parentBinding), beforeState)) {
         const error = new Error(`configuration changed before atomic removal: ${path}`);
         error.continuitydbNoWrite = true;
         throw error;
       }
+      assertParentChain(parentBinding);
       rmSync(path);
+      assertParentChain(parentBinding);
     } catch (error) {
       cleanupBackupArtifacts(backupArtifacts);
       throw error;
@@ -318,6 +491,8 @@ function atomicRemove(path, { root, home, backupHome, client, apply, expected, b
       backup: backupArtifacts?.path || null,
       backupArtifacts,
       createdDirectories,
+      createdDirectoryBindings,
+      parentBinding,
       written: { existed: false, content: null, mode: null },
     };
   } finally {
@@ -339,7 +514,9 @@ function restoreSnapshot(plan, result) {
   if (result.changed === false) return;
   const releaseLock = acquireFileLock(configurationLockPath(path));
   try {
-    const current = currentSnapshot(path);
+    const parentBinding = result.parentBinding || captureParentChain(plan.options.projectDir, path);
+    assertParentChain(parentBinding, "rollback target");
+    const current = currentSnapshot(path, parentBinding);
     const expected = result.written || { existed: true, content: plan.content, mode: 0o600 };
     if (!sameSnapshot(current, expected)) {
       cleanupCreatedDirectories(plan, result);
@@ -347,17 +524,22 @@ function restoreSnapshot(plan, result) {
       throw new Error(`rollback conflict: configuration changed concurrently: ${path}`);
     }
     if (original.existed) {
-      ensureSafeParents(plan.options.projectDir, path, true);
+      assertParentChain(parentBinding, "rollback target");
       const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
       writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
+      assertParentChain(parentBinding, "rollback target");
       renameSync(temporary, path);
+      assertParentChain(parentBinding, "rollback target");
       chmodSync(path, original.mode || 0o600);
+      assertParentChain(parentBinding, "rollback target");
     } else if (existsSync(path)) {
+      assertParentChain(parentBinding, "rollback target");
       const metadata = lstatSync(path);
       if (!metadata.isFile() || metadata.isSymbolicLink()) {
         throw new Error(`refusing to roll back non-file configuration target: ${path}`);
       }
       rmSync(path);
+      assertParentChain(parentBinding, "rollback target");
     }
     cleanupCreatedDirectories(plan, result);
     cleanupBackupArtifacts(result.backupArtifacts);
@@ -367,7 +549,13 @@ function restoreSnapshot(plan, result) {
 }
 
 function publicResult(plan, result) {
-  const { createdDirectories: _createdDirectories, backupArtifacts: _backupArtifacts, ...value } = result;
+  const {
+    createdDirectories: _createdDirectories,
+    createdDirectoryBindings: _createdDirectoryBindings,
+    backupArtifacts: _backupArtifacts,
+    parentBinding: _parentBinding,
+    ...value
+  } = result;
   if (result.backupArtifacts?.publicPath && value.backup) value.backup = result.backupArtifacts.publicPath;
   return {
     client: plan.client,
@@ -381,7 +569,7 @@ function publicResult(plan, result) {
 function verifyCommittedAgentPlans(committed) {
   for (const { plan, result } of committed) {
     const expected = result.written || plan.original;
-    if (!sameSnapshot(currentSnapshot(plan.path), expected)) {
+    if (!sameSnapshot(currentSnapshot(plan.path, result.parentBinding), expected)) {
       throw new Error(`configuration changed after commit verification: ${plan.path}`);
     }
     result.verified = true;
@@ -1341,6 +1529,12 @@ function prepareOpenCodeChanges(rawOptions, action, identity) {
   }
 
   for (const path of [configPath, pluginPath]) ensureSafeParents(options.projectDir, path, false);
+  const cleanupDirectoryBindings = cleanupDirectories
+    .filter((directory) => existsSync(directory))
+    .map((directory) => ({
+      directory,
+      binding: captureParentChain(options.projectDir, join(directory, ".continuitydb-directory-identity")),
+    }));
   const unownedDisconnectNoop = action === "disconnect" && !metadata;
   return [{
     client, action, options, path: configPath, content: configContent, original: snapshot(configPath),
@@ -1349,7 +1543,7 @@ function prepareOpenCodeChanges(rawOptions, action, identity) {
   }, {
     client, action, options, path: pluginPath, content: pluginContent, original: snapshot(pluginPath),
     kind: "plugin", owner: "continuitydb-opencode-plugin", assetClients: [client], deleteTarget: deletePlugin,
-    noOp: unownedDisconnectNoop, cleanupDirectories,
+    noOp: unownedDisconnectNoop, cleanupDirectories, cleanupDirectoryBindings,
   }];
 }
 
@@ -1597,6 +1791,12 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
     : [];
 
   for (const path of [mcpPath, hooksPath, policyPath]) ensureSafeParents(options.projectDir, path, false);
+  const cleanupDirectoryBindings = cleanupDirectories
+    .filter((directory) => existsSync(directory))
+    .map((directory) => ({
+      directory,
+      binding: captureParentChain(options.projectDir, join(directory, ".continuitydb-directory-identity")),
+    }));
   return [{
     client, action, options, path: mcpPath, content: mcpContent, original: snapshot(mcpPath),
     kind: "mcp", owner: "continuitydb-mcp", assetClients: [client], deleteTarget: deleteMcp,
@@ -1608,7 +1808,9 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
   }, {
     client, action, options, path: policyPath, content: policyContent, original: snapshot(policyPath),
     kind: "policy", owner: policyDescriptor.owner, assetClients: [client], deleteTarget: deletePolicy,
-    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(policyPath)), cleanupDirectories,
+    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(policyPath)),
+    cleanupDirectories,
+    cleanupDirectoryBindings,
   }];
 }
 
@@ -1739,6 +1941,8 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
         continue;
       }
       const createdDirectories = ensureSafeParents(plan.options.projectDir, plan.path, true);
+      const createdDirectoryBindings = captureCreatedDirectoryBindings(plan.options.projectDir, createdDirectories);
+      const parentBinding = captureParentChain(plan.options.projectDir, plan.path);
       let result;
       try {
         const operationOptions = {
@@ -1750,15 +1954,19 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
           ? atomicRemove(plan.path, operationOptions)
           : atomicWrite(plan.path, plan.content, operationOptions);
         result.createdDirectories = createdDirectories;
+        result.createdDirectoryBindings = createdDirectoryBindings;
+        result.parentBinding = parentBinding;
       } catch (error) {
         try {
-          const current = currentSnapshot(plan.path);
+          const current = currentSnapshot(plan.path, parentBinding);
           if (error.continuitydbNoWrite || sameSnapshot(current, plan.original)) {
-            cleanupCreatedDirectories(plan, { createdDirectories });
+            cleanupCreatedDirectories(plan, { createdDirectories, createdDirectoryBindings });
           } else {
             restoreSnapshot(plan, {
               changed: true,
               createdDirectories,
+              createdDirectoryBindings,
+              parentBinding,
               written: { existed: true, content: plan.content, mode: 0o600 },
             });
           }
@@ -1783,7 +1991,13 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
     // an unexpected failure enters normal rollback, which recreates parents.
     for (const { plan } of committed) {
       for (const directory of plan.cleanupDirectories || []) {
-        try { rmdirSync(directory); }
+        try {
+          if (existsSync(directory)) {
+            const binding = plan.cleanupDirectoryBindings?.find((entry) => entry.directory === directory)?.binding;
+            if (binding) assertParentChain(binding, "managed directory cleanup");
+          }
+          rmdirSync(directory);
+        }
         catch (error) {
           if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") {
             throw error;
@@ -1921,14 +2135,18 @@ function connectorCapabilities(client, mcpOnly = false) {
   };
 }
 
-function statusAsset(path, kind, owner, verify, { expected = true } = {}) {
+function statusAsset(path, kind, owner, verify, { expected = true, root = null } = {}) {
   if (!expected) return null;
   if (!existsSync(path)) {
     return { path, kind, owner, exists: false, missing: true, changed: false, verified: false, drifted: true };
   }
   try {
+    const parentBinding = root ? captureParentChain(root, path) : null;
+    if (parentBinding) assertParentChain(parentBinding, "status read");
     const content = readText(path);
+    if (parentBinding) assertParentChain(parentBinding, "status read");
     const verified = Boolean(verify(content));
+    if (parentBinding) assertParentChain(parentBinding, "status verification");
     return {
       path, kind, owner, exists: true, missing: false, changed: !verified, verified, drifted: !verified,
     };
@@ -1993,19 +2211,19 @@ function lifecycleStatusAssets(client, options, paths) {
     return value.policy === sha256(core)
       && lifecycleManagedBlock(current) === expected
       && (!value.topology.policy.prefix || current.startsWith(lifecyclePolicyPrefix(client, descriptor.content)));
-  });
+  }, { root: options.projectDir });
   const mcp = statusAsset(paths.mcp, "mcp", "continuitydb-mcp", (current) => {
     if (!metadata || sha256(current) !== metadata.topology.mcp.generated) return false;
     const entry = jsonMcpEntry(client, paths.mcp);
     return Boolean(entry) && entryFingerprint(entry) === metadata.mcp && validScopedMcpEntry(client, paths.mcp);
-  });
+  }, { root: options.projectDir });
   const hooks = statusAsset(paths.hooks, "lifecycle", `continuitydb-${client}-hooks`, (current) => {
     if (!metadata || sha256(current) !== metadata.topology.hooks.generated) return false;
     const value = parseJson(paths.hooks);
     const names = lifecycleEventNames(client);
     return findOwnedHookIndex(value.hooks?.[names.start] || [], metadata.start) !== -1
       && findOwnedHookIndex(value.hooks?.[names.stop] || [], metadata.stop) !== -1;
-  });
+  }, { root: options.projectDir });
   return [mcp, hooks, policy];
 }
 
@@ -2141,7 +2359,7 @@ export function connectionStatus(rawOptions = {}) {
           const verified = entry && verifiedMcpOnlyMetadata(entry, current);
           return Boolean(verified) && (!mcpOnlyMetadata.projectId || verified.projectId === mcpOnlyMetadata.projectId)
             && validScopedMcpEntry(client, mcpPath);
-        })];
+        }, { root: options.projectDir })];
       } else if (client === "claude" || client === "cursor") {
         const policyPath = client === "claude"
           ? join(options.projectDir, "CLAUDE.md")
@@ -2168,9 +2386,13 @@ export function connectionStatus(rawOptions = {}) {
         assets = [
           statusAsset(mcpPath, "mcp", "continuitydb-mcp", (current) => (
             Boolean(metadata) && sha256(current) === metadata.config.generated && validScopedMcpEntry(client, mcpPath)
-          )),
-          statusAsset(pluginPath, "plugin", "continuitydb-opencode-plugin", (current) => Boolean(opencodePluginMetadata(current))),
-          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => expectedSharedPolicy(current, client, options.projectDir)),
+          ), { root: options.projectDir }),
+          statusAsset(pluginPath, "plugin", "continuitydb-opencode-plugin", (current) => (
+            Boolean(opencodePluginMetadata(current))
+          ), { root: options.projectDir }),
+          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => (
+            expectedSharedPolicy(current, client, options.projectDir)
+          ), { root: options.projectDir }),
         ];
       } else if (client === "copilot") {
         const policyPath = join(options.projectDir, ".github", "copilot-instructions.md");
@@ -2183,7 +2405,7 @@ export function connectionStatus(rawOptions = {}) {
             return Boolean(metadata && entry)
               && entryFingerprint(entry) === metadata.ownership.entrySha256
               && validScopedMcpEntry(client, mcpPath);
-          }),
+          }, { root: options.projectDir }),
           statusAsset(policyPath, "policy", "continuitydb-copilot-policy", (current) => {
             const value = dedicatedPolicyMetadata(current, client);
             if (!value) return false;
@@ -2191,7 +2413,7 @@ export function connectionStatus(rawOptions = {}) {
               projectDir: options.projectDir, projectId: value.projectId, consumers: [client],
             })[0];
             return managedBlockEquals(current, copilotPolicyContent(descriptor.content, value.ownership));
-          }),
+          }, { root: options.projectDir }),
         ];
       } else {
         const policyPath = join(options.projectDir, "AGENTS.md");
@@ -2204,8 +2426,10 @@ export function connectionStatus(rawOptions = {}) {
             const allowed = ownership?.entry?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
             return ownership?.metadata?.mode === "complete"
               && allowed !== "default" && allowed !== "*";
-          }),
-          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => expectedSharedPolicy(current, client, options.projectDir)),
+          }, { root: options.projectDir }),
+          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => (
+            expectedSharedPolicy(current, client, options.projectDir)
+          ), { root: options.projectDir }),
         ];
       }
       const projectMismatch = managedProjectId && statusIdentity && managedProjectId !== statusIdentity.id
