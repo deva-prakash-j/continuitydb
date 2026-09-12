@@ -57,25 +57,38 @@ function snapshotTree(directory) {
   return entries;
 }
 
-function assertFailedSetupRestoresVault(name, initialize) {
+function assertFailedSetupPreservesVaultAndRetries(name, initialize) {
   const caseRoot = join(root, `rollback-${name}`);
   const caseProject = join(caseRoot, "project");
   const caseHome = join(caseRoot, "vault");
+  const projectId = `binary-${name}`;
   mkdirSync(caseProject, { recursive: true });
   mkdirSync(caseHome, { recursive: true });
   let close = null;
   try {
-    close = initialize(caseHome);
+    const lifecycle = initialize(caseHome);
+    close = typeof lifecycle === "function" ? lifecycle : lifecycle?.close;
     mkdirSync(join(caseProject, ".codex"), { recursive: true });
     writeFileSync(join(caseProject, ".codex", "config.toml"), 'model = "gpt-5"\n');
     writeFileSync(join(caseHome, "backups"), "pre-existing backup blocker\n");
     const before = snapshotTree(caseHome);
-    const result = spawnSync(binary, [
-      "setup", "--home", caseHome, "--project-dir", caseProject, "--agents", "codex", "--apply",
-    ], { encoding: "utf8", timeout: 30_000 });
-    assert.notEqual(result.status, 0, `${name} rollback probe unexpectedly succeeded`);
+    const setupArgs = [
+      "setup", "--home", caseHome, "--project-dir", caseProject,
+      "--project", projectId, "--agents", "codex", "--apply",
+    ];
+    const result = spawnSync(binary, setupArgs, { encoding: "utf8", timeout: 30_000 });
+    assert.notEqual(result.status, 0, `${name} preservation probe unexpectedly succeeded`);
     assert.match(result.stderr, /backup parent must be a real directory/);
     assert.deepEqual(snapshotTree(caseHome), before, `${name} vault changed after failed setup`);
+
+    rmSync(join(caseHome, "backups"));
+    const retry = spawnSync(binary, setupArgs, { encoding: "utf8", timeout: 30_000 });
+    assert.equal(retry.status, 0, `${name} retry failed: ${retry.stderr}`);
+    const repeated = spawnSync(binary, setupArgs, { encoding: "utf8", timeout: 30_000 });
+    assert.equal(repeated.status, 0, `${name} repeated setup failed: ${repeated.stderr}`);
+    const config = JSON.parse(readFileSync(join(caseHome, "config.json"), "utf8"));
+    assert.equal(config.projects.filter((project) => project.id === projectId && project.root === caseProject).length, 1);
+    if (typeof lifecycle === "object") lifecycle.verify?.();
   } finally {
     close?.();
   }
@@ -121,9 +134,9 @@ async function proveHttpService(expectedVersion) {
 try {
   const version = run(["version"]);
   assert.equal(version.standalone, true);
-  const preview = run(["setup", "--home", home, "--project-dir", project, "--agents", "all"]);
+  const preview = run(["setup", "--home", home, "--project-dir", project, "--project", "binary-smoke", "--agents", "all"]);
   assert.equal(preview.applied, false);
-  const setup = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply"]);
+  const setup = run(["setup", "--home", home, "--project-dir", project, "--project", "binary-smoke", "--agents", "all", "--apply"]);
   assert.equal(setup.connections.length, 5);
   assert.equal(setup.connections.every((item) => item.applied), true);
   assert.equal(run(["doctor", "--home", home]).ok, true);
@@ -141,20 +154,37 @@ try {
   assert.equal(JSON.parse(installedResult.stdout).version, version.version);
   await proveHttpService(version.version);
 
-  assertFailedSetupRestoresVault("empty-index", (caseHome) => {
+  assertFailedSetupPreservesVaultAndRetries("partial-home", (caseHome) => {
+    mkdirSync(join(caseHome, "records", "nested"), { recursive: true });
+    mkdirSync(join(caseHome, "index", "nested"), { recursive: true });
+    writeFileSync(join(caseHome, "config.json"), '{\n    "schema_version": 2,\n    "binary_marker": "before"\n}\n');
+    writeFileSync(join(caseHome, "records", "nested", "marker.bin"), Buffer.from([0, 1, 254, 255]));
+    writeFileSync(join(caseHome, "index", "nested", "marker.txt"), "index-before\n");
+    return {
+      verify() {
+        assert.equal(readFileSync(join(caseHome, "records", "nested", "marker.bin")).equals(Buffer.from([0, 1, 254, 255])), true);
+        assert.equal(readFileSync(join(caseHome, "index", "nested", "marker.txt"), "utf8"), "index-before\n");
+        assert.equal(JSON.parse(readFileSync(join(caseHome, "config.json"), "utf8")).binary_marker, "before");
+      },
+    };
+  });
+  assertFailedSetupPreservesVaultAndRetries("empty-index", (caseHome) => {
     mkdirSync(join(caseHome, "index"), { recursive: true });
   });
-  assertFailedSetupRestoresVault("valid-db", (caseHome) => {
+  assertFailedSetupPreservesVaultAndRetries("valid-db", (caseHome) => {
     run(["init", "--home", caseHome]);
   });
   if (process.platform !== "win32") {
-    assertFailedSetupRestoresVault("wal-shm", (caseHome) => {
+    assertFailedSetupPreservesVaultAndRetries("wal-shm", (caseHome) => {
       run(["init", "--home", caseHome]);
       const database = new DatabaseSync(join(caseHome, "index", "context-vault.db"));
       database.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS rollback_probe(value TEXT); INSERT INTO rollback_probe VALUES ('before');");
       assert.equal(existsSync(join(caseHome, "index", "context-vault.db-wal")), true);
       assert.equal(existsSync(join(caseHome, "index", "context-vault.db-shm")), true);
-      return () => database.close();
+      return {
+        close: () => database.close(),
+        verify: () => assert.equal(database.prepare("SELECT value FROM rollback_probe").get().value, "before"),
+      };
     });
   }
 
@@ -196,7 +226,7 @@ try {
     version: version.version,
     platform: version.platform,
     arch: version.arch,
-    checks: ["self-install", "setup", "doctor", "five-agent-config", "http-service", "setup-rollback", "mcp-tools", "capture-search"],
+    checks: ["self-install", "setup", "doctor", "five-agent-config", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
   }, null, 2)}\n`);
 } finally {
   rmSync(root, { recursive: true, force: true });

@@ -136,14 +136,21 @@ function backupExisting(path, backupRoot, client) {
 
 function cleanupBackupArtifacts(artifacts) {
   if (!artifacts) return;
-  if (artifacts.createdFile && existsSync(artifacts.path)) {
-    const metadata = lstatSync(artifacts.path);
+  const relocated = !existsSync(artifacts.path)
+    && artifacts.relocatedPath
+    && existsSync(artifacts.relocatedPath);
+  const artifactPath = existsSync(artifacts.path) ? artifacts.path : relocated ? artifacts.relocatedPath : null;
+  if (artifacts.createdFile && artifactPath) {
+    const metadata = lstatSync(artifactPath);
     if (!metadata.isFile() || metadata.isSymbolicLink()) {
-      throw new Error(`refusing to remove unexpected backup artifact: ${artifacts.path}`);
+      throw new Error(`refusing to remove unexpected backup artifact: ${artifactPath}`);
     }
-    rmSync(artifacts.path);
+    rmSync(artifactPath);
   }
-  for (const directory of [...artifacts.createdDirectories].reverse()) {
+  const createdDirectories = relocated
+    ? artifacts.relocatedCreatedDirectories || artifacts.createdDirectories
+    : artifacts.createdDirectories;
+  for (const directory of [...createdDirectories].reverse()) {
     if (existsSync(directory)) rmdirSync(directory);
   }
 }
@@ -171,7 +178,7 @@ function configurationLockPath(path) {
   return join(dirname(path), `.${basename(path)}.continuitydb.lock`);
 }
 
-function atomicWrite(path, content, { root, home, client, apply, expected, beforeReplace }) {
+function atomicWrite(path, content, { root, home, backupHome, client, apply, expected, beforeReplace }) {
   const createdDirectories = ensureSafeParents(root, path, apply);
   if (!apply) {
     const beforeState = currentSnapshot(path);
@@ -188,7 +195,13 @@ function atomicWrite(path, content, { root, home, client, apply, expected, befor
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     const before = beforeState.content || "";
     if (before === content) return { path, changed: false, applied: true, backup: null, createdDirectories };
-    const backupArtifacts = backupExisting(path, join(home, "backups"), client);
+    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client);
+    if (backupArtifacts && backupHome && resolve(backupHome) !== resolve(home)) {
+      backupArtifacts.relocatedPath = join(home, relative(backupHome, backupArtifacts.path));
+      backupArtifacts.relocatedCreatedDirectories = backupArtifacts.createdDirectories
+        .map((directory) => join(home, relative(backupHome, directory)));
+      backupArtifacts.publicPath = backupArtifacts.relocatedPath;
+    }
     const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
     try {
       writeFileSync(temporary, content, { flag: "wx", mode: 0o600 });
@@ -266,6 +279,7 @@ function restoreSnapshot(plan, result) {
 
 function publicResult(plan, result) {
   const { createdDirectories: _createdDirectories, backupArtifacts: _backupArtifacts, ...value } = result;
+  if (result.backupArtifacts?.publicPath && value.backup) value.backup = result.backupArtifacts.publicPath;
   return { client: plan.client, project_dir: plan.options.projectDir, ...value };
 }
 
@@ -440,15 +454,18 @@ function prepareAgentChange(client, rawOptions, action, identity = null) {
   return { client, action, options, path, content, original: snapshot(path) };
 }
 
-function applyAgentPlans(plans) {
-  if (!plans.length) return [];
-  const apply = plans[0].options.apply;
+function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.apply ?? false } = {}) {
+  if (!plans.length) {
+    if (apply && finalize) finalize({ committed: [] });
+    return [];
+  }
   if (!plans.every((plan) => plan.options.apply === apply)) throw new Error("agent batch must use one apply mode");
   if (!apply) {
     return plans.map((plan) => plan.noOp
       ? publicResult(plan, { path: plan.path, changed: false, applied: false, backup: null, createdDirectories: [] })
       : publicResult(plan, atomicWrite(plan.path, plan.content, {
-        root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: false, expected: plan.original,
+        root: plan.options.projectDir, home: plan.options.home, backupHome: plan.options.backupHome,
+        client: plan.client, apply: false, expected: plan.original,
       })));
   }
 
@@ -464,7 +481,8 @@ function applyAgentPlans(plans) {
       let result;
       try {
         result = atomicWrite(plan.path, plan.content, {
-          root: plan.options.projectDir, home: plan.options.home, client: plan.client, apply: true, expected: plan.original,
+          root: plan.options.projectDir, home: plan.options.home, backupHome: plan.options.backupHome,
+          client: plan.client, apply: true, expected: plan.original,
           beforeReplace: plan.options._testBeforeReplace,
         });
         result.createdDirectories = createdDirectories;
@@ -492,6 +510,7 @@ function applyAgentPlans(plans) {
         plan.options._testAfterCommit({ plan, result, committed: committed.length });
       }
     }
+    if (finalize) finalize({ committed });
     return committed.map(({ plan, result }) => publicResult(plan, result));
   } catch (error) {
     const rollbackErrors = [];
@@ -510,13 +529,15 @@ function applyAgentPlans(plans) {
 
 function batch(clients, rawOptions, action) {
   const unique = [...new Set(clients)];
-  if (!unique.length) return [];
+  if (!unique.length) {
+    return applyAgentPlans([], { finalize: rawOptions._finalizeSetup, apply: Boolean(rawOptions.apply) });
+  }
   const projectDir = resolve(rawOptions.projectDir || process.cwd());
   const identity = action === "connect" ? connectorIdentity(projectDir, rawOptions) : null;
   // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
   // path and rendered output must validate before the first client file changes.
   const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action, identity));
-  return applyAgentPlans(plans);
+  return applyAgentPlans(plans, { finalize: rawOptions._finalizeSetup });
 }
 
 export function connectAgents(clients, rawOptions = {}) {

@@ -17,10 +17,12 @@ if (process.platform !== "win32") chmodSync(binary, 0o755);
 const root = mkdtempSync(join(tmpdir(), "continuitydb-codex-config-"));
 const project = join(root, "project");
 const home = join(root, "vault");
+const projectId = "codex-generated-probe";
 mkdirSync(project);
 try {
   const setup = spawnSync(binary, [
     "setup", "--home", home, "--project-dir", project,
+    "--project", projectId,
     "--agents", "codex", "--owner", "developer-1", "--apply",
   ], { encoding: "utf8", timeout: 30_000 });
   assert.equal(setup.status, 0, setup.stderr);
@@ -33,6 +35,8 @@ try {
   const config = JSON.parse(result.stdout);
   assert.equal(config.transport.type, "stdio");
   assert.equal(config.transport.command, binary);
+  assert.equal(config.transport.env.CONTINUITYDB_ALLOWED_PROJECTS, projectId);
+  assert.notEqual(config.transport.env.CONTINUITYDB_ALLOWED_PROJECTS, "default");
   assert.deepEqual(config.enabled_tools.sort(), [
     "handoff_checkpoint", "handoff_latest", "memory_capture", "memory_context_pack", "memory_feedback", "memory_search",
   ].sort());

@@ -92,6 +92,29 @@ function waitForChildMessage(child, type) {
   });
 }
 
+function setupArguments({ cli, home, project, agents = "codex" }) {
+  return [
+    cli, "setup", "--home", home, "--project-dir", project,
+    "--project", "cli-test", "--agents", agents, "--apply",
+  ];
+}
+
+function runSetupAtFailpoint({ cli, home, project, failpoint, agents }) {
+  return spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      CONTINUITYDB_TEST_SETUP_FAILPOINT: failpoint,
+    },
+  });
+}
+
+function assertProjectRegisteredOnce(home, project) {
+  const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+  assert.equal(config.projects.filter((item) => item.id === "cli-test" && item.root === project).length, 1);
+}
+
 test("CLI version matches the package version", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
   try {
@@ -488,6 +511,210 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
   }
 });
 
+test("CLI connector failure preserves a partial vault when setup staging is destroyed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-no-restore-source-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const config = Buffer.from('{\n    "schema_version": 2,\n    "private_marker": "config-before"\n}\n');
+  const recordsMarker = Buffer.from([0, 1, 2, 3, 254, 255]);
+  const indexMarker = Buffer.from("index-before\n");
+  const modelMarker = Buffer.from("model-before\n");
+  try {
+    mkdirSync(join(home, "records", "nested"), { recursive: true });
+    mkdirSync(join(home, "index", "nested"), { recursive: true });
+    mkdirSync(join(home, "models", "private-cache"), { recursive: true });
+    mkdirSync(project);
+    writeFileSync(join(home, "config.json"), config);
+    writeFileSync(join(home, "records", "nested", "marker.bin"), recordsMarker);
+    writeFileSync(join(home, "index", "nested", "marker.txt"), indexMarker);
+    writeFileSync(join(home, "models", "private-cache", "marker.txt"), modelMarker);
+    writeFileSync(join(home, "unrelated.bin"), Buffer.from([9, 8, 7, 6]));
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(home);
+
+    const child = fork(cli, setupArguments({ cli, home, project }).slice(1), {
+      env: { ...process.env, NODE_ENV: "test", CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC: "1" },
+      silent: true,
+    });
+    const exit = waitForChildExit(child);
+    const staging = await waitForSetupSnapshot(child);
+    rmSync(staging.directory, { recursive: true, force: true });
+    child.send("continuitydb:resume-setup");
+
+    const result = await exit;
+    assert.notEqual(result.code, 0, result.stderr);
+    assert.deepEqual(snapshotTree(home), before);
+    assert.equal(readFileSync(join(home, "config.json")).equals(config), true);
+    assert.equal(readFileSync(join(home, "records", "nested", "marker.bin")).equals(recordsMarker), true);
+    assert.equal(readFileSync(join(home, "index", "nested", "marker.txt")).equals(indexMarker), true);
+    assert.equal(readFileSync(join(home, "models", "private-cache", "marker.txt")).equals(modelMarker), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup never passes a pre-existing canonical path to recursive removal", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-removal-trace-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const removalLog = join(root, "recursive-removals.jsonl");
+  const preload = join(root, "trace-removals.cjs");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(home, "records", "nested"), { recursive: true });
+    mkdirSync(join(home, "index", "nested"), { recursive: true });
+    mkdirSync(join(home, "models", "private-cache"), { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(home, "config.json"), '{"schema_version":2,"marker":"before"}\n');
+    writeFileSync(join(home, "records", "nested", "marker.txt"), "records-before\n");
+    writeFileSync(join(home, "index", "nested", "marker.txt"), "index-before\n");
+    writeFileSync(join(home, "models", "private-cache", "marker.txt"), "model-before\n");
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(preload, [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      'const originalRmSync = fs.rmSync;',
+      'fs.rmSync = function continuitydbTracedRmSync(path, options) {',
+      '  if (options && options.recursive) fs.appendFileSync(process.env.CONTINUITYDB_TEST_RM_LOG, `${JSON.stringify(String(path))}\\n`);',
+      '  return originalRmSync(path, options);',
+      '};',
+      'syncBuiltinESMExports();',
+      '',
+    ].join("\n"));
+
+    const result = spawnSync(process.execPath, setupArguments({ cli, home, project }), {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CONTINUITYDB_TEST_RM_LOG: removalLog,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, "--require", preload].filter(Boolean).join(" "),
+      },
+    });
+    assert.notEqual(result.status, 0, result.stderr);
+    const recursivelyRemoved = existsSync(removalLog)
+      ? readFileSync(removalLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+      : [];
+    const protectedPaths = [
+      join(home, "config.json"),
+      join(home, "records"),
+      join(home, "index"),
+      join(home, "models"),
+    ];
+    assert.deepEqual(
+      recursivelyRemoved.filter((path) => protectedPaths.includes(path)),
+      [],
+      `pre-existing canonical setup paths were recursively removed: ${JSON.stringify(recursivelyRemoved)}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI existing-home promotion failures roll connectors back and retry without duplicate registration", async (t) => {
+  const scenarios = [
+    {
+      name: "missing records and index",
+      failpoints: ["before-records", "after-records", "before-index", "after-index", "before-config", "after-config"],
+      seed(home) {
+        mkdirSync(home, { recursive: true });
+      },
+    },
+    {
+      name: "missing database in an existing index",
+      failpoints: ["before-database", "after-database", "before-config", "after-config"],
+      seed(home) {
+        mkdirSync(join(home, "records", "nested"), { recursive: true });
+        mkdirSync(join(home, "index", "nested"), { recursive: true });
+        writeFileSync(join(home, "records", "nested", "marker.txt"), "records-before\n");
+        writeFileSync(join(home, "index", "nested", "marker.txt"), "index-before\n");
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    for (const failpoint of scenario.failpoints) {
+      await t.test(`${scenario.name}: ${failpoint}`, () => {
+        const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-promotion-failure-"));
+        const project = join(root, "project");
+        const home = join(root, "vault");
+        const cli = new URL("../src/cli.js", import.meta.url).pathname;
+        const config = Buffer.from('{\n    "schema_version": 2,\n    "extension": { "preserve": true }\n}\n');
+        const connector = Buffer.from('model = "gpt-5"\n');
+        try {
+          scenario.seed(home);
+          mkdirSync(join(project, ".codex"), { recursive: true });
+          writeFileSync(join(home, "config.json"), config);
+          writeFileSync(join(home, "unrelated.bin"), Buffer.from([5, 4, 3, 2, 1]));
+          writeFileSync(join(project, ".codex", "config.toml"), connector);
+
+          const agents = scenario.name === "missing records and index" && failpoint === "before-config" ? "all" : "codex";
+          const failed = runSetupAtFailpoint({ cli, home, project, failpoint, agents });
+          assert.notEqual(failed.status, 0, `${failpoint} unexpectedly succeeded`);
+          assert.match(failed.stderr, new RegExp(`injected setup failure at ${failpoint}`));
+          assert.equal(readFileSync(join(home, "config.json")).equals(config), true, "pre-existing config bytes changed");
+          assert.equal(readFileSync(join(home, "unrelated.bin")).equals(Buffer.from([5, 4, 3, 2, 1])), true);
+          assert.equal(readFileSync(join(project, ".codex", "config.toml")).equals(connector), true, "connector was not rolled back");
+          if (agents === "all") {
+            assert.equal(existsSync(join(project, ".mcp.json")), false);
+            assert.equal(existsSync(join(project, "opencode.json")), false);
+            assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+            assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+          }
+          if (scenario.name.includes("existing index")) {
+            assert.equal(readFileSync(join(home, "records", "nested", "marker.txt"), "utf8"), "records-before\n");
+            assert.equal(readFileSync(join(home, "index", "nested", "marker.txt"), "utf8"), "index-before\n");
+          }
+
+          const retry = spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), { encoding: "utf8" });
+          assert.equal(retry.status, 0, retry.stderr);
+          assertProjectRegisteredOnce(home, project);
+          const repeated = spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), { encoding: "utf8" });
+          assert.equal(repeated.status, 0, repeated.stderr);
+          assertProjectRegisteredOnce(home, project);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("CLI fresh-home promotion failures are atomic and retry idempotently", async (t) => {
+  for (const failpoint of ["before-home", "after-home"]) {
+    await t.test(failpoint, () => {
+      const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-fresh-promotion-"));
+      const project = join(root, "project");
+      const home = join(root, "vault");
+      const cli = new URL("../src/cli.js", import.meta.url).pathname;
+      const connector = Buffer.from('model = "gpt-5"\n');
+      try {
+        mkdirSync(join(project, ".codex"), { recursive: true });
+        writeFileSync(join(project, ".codex", "config.toml"), connector);
+
+        const failed = runSetupAtFailpoint({ cli, home, project, failpoint });
+        assert.notEqual(failed.status, 0, `${failpoint} unexpectedly succeeded`);
+        assert.match(failed.stderr, new RegExp(`injected setup failure at ${failpoint}`));
+        assert.equal(readFileSync(join(project, ".codex", "config.toml")).equals(connector), true);
+        if (failpoint === "before-home") assert.equal(existsSync(home), false);
+
+        const retry = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+        assert.equal(retry.status, 0, retry.stderr);
+        assertProjectRegisteredOnce(home, project);
+        const repeated = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+        assert.equal(repeated.status, 0, repeated.stderr);
+        assertProjectRegisteredOnce(home, project);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("CLI failed setup restores a pre-existing empty index directory byte-for-byte", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-empty-index-rollback-"));
   const project = join(root, "project");
@@ -534,7 +761,30 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
   }
 });
 
-test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { skip: process.platform === "win32" }, () => {
+test("CLI setup refuses to place a new database beside pre-existing WAL or SHM state", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-orphan-sidecars-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(home, "index"), { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(home, "index", "context-vault.db-wal"), Buffer.from([1, 3, 3, 7]));
+    writeFileSync(join(home, "index", "context-vault.db-shm"), Buffer.from([9, 2, 5, 6]));
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    const before = snapshotTree(home);
+
+    const result = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+    assert.notEqual(result.status, 0, result.stderr);
+    assert.match(result.stderr, /sidecar.*without.*database/i);
+    assert.deepEqual(snapshotTree(home), before);
+    assert.equal(readFileSync(join(project, ".codex", "config.toml"), "utf8"), 'model = "gpt-5"\n');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup preserves live SQLite WAL and SHM state across restart", { skip: process.platform === "win32" }, () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-wal-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
@@ -557,6 +807,9 @@ test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { sk
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.deepEqual(snapshotTree(home), before);
+    database.close();
+    database = new DatabaseSync(join(home, "index", "context-vault.db"));
+    assert.equal(database.prepare("SELECT value FROM rollback_probe").get().value, "before");
   } finally {
     database?.close();
     rmSync(root, { recursive: true, force: true });
