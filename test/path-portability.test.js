@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { filesystemPathsEqual, isDirectEntrypoint } from "../src/direct-entry.js";
 
@@ -33,8 +35,28 @@ test("direct-entry comparison follows Windows case-insensitive path semantics", 
     "d:/work/continuitydb/src/mcp-server.js", { platform: "win32" }), true);
   assert.equal(filesystemPathsEqual("/Work/ContinuityDB/src/mcp-server.js",
     "/work/continuitydb/src/mcp-server.js", { platform: "linux" }), false);
-  assert.equal(isDirectEntrypoint("file:///work/continuitydb/src/mcp-server.js",
-    "/work/continuitydb/src/../src/mcp-server.js", { platform: "linux" }), true);
+  const target = join(sourceRoot, "mcp-server.js");
+  assert.equal(isDirectEntrypoint(pathToFileURL(target).href, target, { platform: process.platform }), true);
+  assert.equal(isDirectEntrypoint("file:///definitely/missing/continuitydb.js",
+    "/definitely/missing/continuitydb.js", { platform: "linux" }), false);
+});
+
+test("advertised lifecycle executable runs through its real target and an npm-style symlink", {
+  skip: process.platform === "win32" ? "npm uses command shims rather than POSIX symlinks on Windows" : false,
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-symlink-"));
+  const target = join(sourceRoot, "lifecycle-hook.js");
+  const link = join(root, "continuitydb-hook");
+  try {
+    symlinkSync(target, link);
+    for (const entrypoint of [target, link]) {
+      const result = spawnSync(process.execPath, [entrypoint], { encoding: "utf8" });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.stdout, /^Usage:/, `${entrypoint} silently skipped its direct-entry action`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("binary smoke canonicalizes only its validator-owned temporary root", () => {

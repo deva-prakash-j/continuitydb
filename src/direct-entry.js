@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { posix, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,5 +15,11 @@ export function filesystemPathsEqual(left, right, { platform = process.platform 
 
 export function isDirectEntrypoint(moduleUrl, argvPath = process.argv[1], options = {}) {
   if (!argvPath) return false;
-  return filesystemPathsEqual(fileURLToPath(moduleUrl), argvPath, options);
+  try {
+    const modulePath = realpathSync.native(fileURLToPath(moduleUrl));
+    const executablePath = realpathSync.native(argvPath);
+    return filesystemPathsEqual(modulePath, executablePath, options);
+  } catch {
+    return false;
+  }
 }
