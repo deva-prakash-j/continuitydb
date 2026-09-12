@@ -409,6 +409,54 @@ test("Claude and Cursor ownership topology fails closed on post-connect file dri
   }
 });
 
+test("Cursor rule preserves preexisting emptiness and appended user content on disconnect", () => {
+  for (const preexisting of [false, true]) {
+    const value = fixture();
+    const rule = join(value.project, ".cursor", "rules", "continuitydb.mdc");
+    try {
+      if (preexisting) {
+        mkdirSync(join(rule, ".."), { recursive: true });
+        writeFileSync(rule, "");
+      }
+      connectAgent("cursor", options(value));
+      const appended = "\n# User-added Cursor rule\nPreserve this exactly.  \n";
+      writeFileSync(rule, `${readFileSync(rule, "utf8")}${appended}`);
+      disconnectAgent("cursor", options(value));
+      assert.equal(readFileSync(rule, "utf8"), appended);
+      if (!preexisting) assert.equal(existsSync(join(value.project, ".cursor")), true);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  for (const original of ["", "---\ndescription: User rule\nalwaysApply: true\n---\n# Existing rule\n"]) {
+    const value = fixture();
+    const rule = join(value.project, ".cursor", "rules", "continuitydb.mdc");
+    try {
+      mkdirSync(join(rule, ".."), { recursive: true });
+      writeFileSync(rule, original);
+      connectAgent("cursor", options(value));
+      disconnectAgent("cursor", options(value));
+      assert.equal(existsSync(rule), true);
+      assert.equal(readFileSync(rule, "utf8"), original);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  const value = fixture();
+  const rule = join(value.project, ".cursor", "rules", "continuitydb.mdc");
+  try {
+    connectAgent("cursor", options(value));
+    const drifted = readFileSync(rule, "utf8").replace("compact durable claim", "drifted durable claim");
+    writeFileSync(rule, drifted);
+    assert.throws(() => disconnectAgent("cursor", options(value)), /Cursor rule ownership fingerprint mismatch/);
+    assert.equal(readFileSync(rule, "utf8"), drifted);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("lifecycle connector identity and sensitivity inputs are validated before writes", () => {
   const value = fixture();
   try {
@@ -441,7 +489,7 @@ test("Claude and Cursor adapter preflight rejects malformed assets and rolls bac
 
   for (const [client, relativePath, malformed] of [
     ["claude", "CLAUDE.md", "<!-- >>> continuitydb managed policy >>>\nmissing end\n"],
-    ["cursor", join(".cursor", "rules", "continuitydb.mdc"), "user-owned rule\n"],
+    ["cursor", join(".cursor", "rules", "continuitydb.mdc"), "<!-- >>> continuitydb managed policy >>>\nmissing end\n"],
   ]) {
     const value = fixture();
     try {
@@ -914,6 +962,22 @@ test("remote connectors keep only an environment variable reference and require 
     }
   } finally {
     rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("remote connectors reject reserved token environment names before any write", () => {
+  for (const tokenEnv of ["PATH", "HOME", "SHELL", "USER", "LOGNAME", "PWD"]) {
+    for (const client of SUPPORTED_AGENTS) {
+      const value = fixture();
+      try {
+        assert.throws(() => connectAgent(client, {
+          ...options(value), transport: "http", url: "https://memory.example/mcp", tokenEnv,
+        }), /dedicated uppercase environment entry/);
+        assert.equal(existsSync(clientPaths(value.project)[client]), false);
+      } finally {
+        rmSync(value.root, { recursive: true, force: true });
+      }
+    }
   }
 });
 

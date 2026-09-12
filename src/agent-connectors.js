@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
+import { validateTokenEnvironmentName } from "./http-client.js";
 import { defaultDataHome } from "./paths.js";
 import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
 import { resolveProjectIdentity, validateProjectId } from "./project-identity.js";
@@ -559,6 +560,8 @@ function decodedLifecycleTopology(value, client) {
   const expectedDirectoryKeys = client === "claude" ? "claude" : "cursor,rules";
   if (!topology || !validFile(topology.mcp) || !validFile(topology.hooks)
     || !topology.policy || !["missing", "empty", "existing"].includes(topology.policy.state)
+    || typeof topology.policy.prefix !== "boolean"
+    || (client === "claude" && topology.policy.prefix)
     || directoryKeys !== expectedDirectoryKeys
     || Object.values(topology.directories).some((item) => typeof item !== "boolean")) {
     throw new Error(`invalid ContinuityDB managed ${client} lifecycle topology`);
@@ -566,37 +569,37 @@ function decodedLifecycleTopology(value, client) {
   return topology;
 }
 
-function lifecyclePolicyContent(client, body, ownership, topology) {
-  const metadata = `<!-- continuitydb managed lifecycle ownership: mcp_sha256=${ownership.mcp}; start_sha256=${ownership.start}; stop_sha256=${ownership.stop} -->`;
+function lifecyclePolicyContent(body, ownership, topology) {
+  const metadata = `<!-- continuitydb managed lifecycle ownership: mcp_sha256=${ownership.mcp}; start_sha256=${ownership.start}; stop_sha256=${ownership.stop}; policy_sha256=${ownership.policy} -->`;
   const topologyMetadata = `<!-- continuitydb managed lifecycle topology: ${encodedLifecycleTopology(topology)} -->`;
-  if (client === "cursor") {
-    const marker = body.indexOf(POLICY_START);
-    return `${body.slice(0, marker)}${metadata}\n${topologyMetadata}\n${body.slice(marker)}`;
-  }
   const firstLineEnd = body.indexOf("\n");
   return `${body.slice(0, firstLineEnd)}\n${metadata}\n${topologyMetadata}${body.slice(firstLineEnd)}`;
 }
 
+function lifecyclePolicyCore(client, content) {
+  return client === "cursor" ? content.slice(content.indexOf(POLICY_START)) : content;
+}
+
+function lifecyclePolicyPrefix(client, content) {
+  return client === "cursor" ? content.slice(0, content.indexOf(POLICY_START)) : "";
+}
+
+function lifecycleManagedBlock(current) {
+  const start = current.indexOf(POLICY_START);
+  if (start === -1) return null;
+  const end = current.indexOf(POLICY_END, start);
+  return current.slice(start, end + POLICY_END.length);
+}
+
 function lifecyclePolicyMetadata(current, client) {
   if (!current) return null;
-  if (client === "claude") {
-    removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
-    if (!current.includes(POLICY_START)) return null;
-  } else {
-    const starts = current.split(POLICY_START).length - 1;
-    const ends = current.split(POLICY_END).length - 1;
-    if (starts !== 1 || ends !== 1 || current.indexOf(POLICY_START) > current.indexOf(POLICY_END)) {
-      throw new Error("invalid ContinuityDB managed cursor rule");
-    }
-    if (!current.startsWith("---\n") || !/\nalwaysApply: true\n---\n/.test(current)) {
-      throw new Error("invalid ContinuityDB managed cursor rule frontmatter");
-    }
-  }
+  removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+  if (!current.includes(POLICY_START)) return null;
   const firstLine = current.slice(current.indexOf(POLICY_START), current.indexOf("\n", current.indexOf(POLICY_START)));
   if (firstLine !== `${POLICY_START} consumers: ${client}`) {
     throw new Error(`invalid ContinuityDB managed ${client} policy metadata`);
   }
-  const ownership = [...current.matchAll(/<!-- continuitydb managed lifecycle ownership: mcp_sha256=([a-f0-9]{64}); start_sha256=([a-f0-9]{64}); stop_sha256=([a-f0-9]{64}) -->/g)];
+  const ownership = [...current.matchAll(/<!-- continuitydb managed lifecycle ownership: mcp_sha256=([a-f0-9]{64}); start_sha256=([a-f0-9]{64}); stop_sha256=([a-f0-9]{64}); policy_sha256=([a-f0-9]{64}) -->/g)];
   if (ownership.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} lifecycle ownership metadata`);
   const topologies = [...current.matchAll(/<!-- continuitydb managed lifecycle topology: ([A-Za-z0-9_-]+) -->/g)];
   if (topologies.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} lifecycle topology metadata`);
@@ -607,6 +610,7 @@ function lifecyclePolicyMetadata(current, client) {
     mcp: ownership[0][1],
     start: ownership[0][2],
     stop: ownership[0][3],
+    policy: ownership[0][4],
     topology: decodedLifecycleTopology(topologies[0][1], client),
   };
 }
@@ -879,7 +883,7 @@ function normalizeOptions(options = {}, { identity = null } = {}) {
     : [...new Set((options.projects?.length ? options.projects : [basename(projectDir)]).map(String))];
   projects.forEach(validateProjectId);
   const tokenEnv = options.tokenEnv || "CONTINUITYDB_MCP_TOKEN";
-  if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(tokenEnv)) throw new Error("invalid token environment variable name");
+  validateTokenEnvironmentName(tokenEnv);
   const tenantId = requiredIdentifier(options.tenantId || "local", "tenant_id");
   const ownerId = requiredIdentifier(options.ownerId || "local-user", "owner_id");
   const sensitivities = options.sensitivities?.length ? [...new Set(options.sensitivities.map(String))] : ["public", "private"];
@@ -1065,6 +1069,21 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
     projectId: effectiveIdentity.id,
     consumers: [client],
   })[0];
+  const policyCore = lifecyclePolicyCore(client, policyDescriptor.content);
+  const policyPrefix = lifecyclePolicyPrefix(client, policyDescriptor.content);
+  if (metadata) {
+    const expectedManaged = lifecyclePolicyContent(policyCore, {
+      mcp: metadata.mcp,
+      start: metadata.start,
+      stop: metadata.stop,
+      policy: metadata.policy,
+    }, metadata.topology);
+    if (metadata.policy !== sha256(policyCore) || lifecycleManagedBlock(policyCurrent) !== expectedManaged
+      || (metadata.topology.policy.prefix && !policyCurrent.startsWith(policyPrefix))) {
+      const label = client === "cursor" ? "Cursor rule" : "Claude policy";
+      throw new Error(`${label} ownership fingerprint mismatch`);
+    }
+  }
 
   const mcpPath = jsonTarget(client, options.projectDir);
   const mcpCurrentText = readText(mcpPath);
@@ -1104,7 +1123,10 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
   const originalTopology = metadata?.topology || {
     mcp: originalFileTopology(mcpPath, mcpCurrentText),
     hooks: originalFileTopology(hooksPath, hooksCurrentText),
-    policy: { state: existsSync(policyPath) ? (policyCurrent === "" ? "empty" : "existing") : "missing" },
+    policy: {
+      state: existsSync(policyPath) ? (policyCurrent === "" ? "empty" : "existing") : "missing",
+      prefix: client === "cursor" && policyCurrent === "",
+    },
     directories,
   };
 
@@ -1125,14 +1147,15 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
       mcp: { ...originalTopology.mcp, generated: sha256(mcpContent) },
       hooks: { ...originalTopology.hooks, generated: sha256(hooksContent) },
     };
-    const body = lifecyclePolicyContent(client, policyDescriptor.content, {
+    const body = lifecyclePolicyContent(policyCore, {
       mcp: entryFingerprint(connectedMcp.mcpServers.continuitydb),
       start: entryFingerprint(entries[names.start]),
       stop: entryFingerprint(entries[names.stop]),
+      policy: sha256(policyCore),
     }, topology);
-    policyContent = client === "claude"
-      ? mergeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END, body })
-      : body;
+    policyContent = client === "cursor" && originalTopology.policy.prefix && !metadata
+      ? `${policyPrefix}${body}`
+      : mergeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END, body });
   } else {
     const restoredMcp = metadata
       ? restoredLifecycleContent(options, client, mcpPath, originalTopology.mcp)
@@ -1144,13 +1167,12 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
     hooksContent = restoredHooks.content;
     deleteMcp = restoredMcp.deleteTarget;
     deleteHooks = restoredHooks.deleteTarget;
-    if (client === "claude") {
-      policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
-      deletePolicy = originalTopology.policy.state === "missing";
-    } else {
-      policyContent = "";
-      deletePolicy = Boolean(metadata);
+    policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
+    if (client === "cursor" && originalTopology.policy.prefix) {
+      if (!policyContent.startsWith(policyPrefix)) throw new Error("Cursor rule ownership prefix mismatch");
+      policyContent = policyContent.slice(policyPrefix.length);
     }
+    deletePolicy = originalTopology.policy.state === "missing" && policyContent === "";
   }
 
   const cleanupDirectories = action === "disconnect" && metadata

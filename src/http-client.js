@@ -1,6 +1,15 @@
 import { isLoopback } from "./security.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
+const TOKEN_ENV_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
+const RESERVED_TOKEN_ENV = new Set(["HOME", "PATH", "SHELL", "USER", "LOGNAME", "PWD"]);
+
+export function validateTokenEnvironmentName(value, name = "token environment reference") {
+  if (typeof value !== "string" || !TOKEN_ENV_PATTERN.test(value) || RESERVED_TOKEN_ENV.has(value)) {
+    throw new Error(`${name} must name a dedicated uppercase environment entry`);
+  }
+  return value;
+}
 
 function serviceUrl(value) {
   const url = new URL(value);
@@ -106,10 +115,7 @@ export class ContinuityApiClient {
 export function createApiClientFromEnv(env = process.env) {
   if (!env.CONTINUITYDB_HTTP_URL) return null;
   const tokenEnv = env.CONTINUITYDB_HTTP_TOKEN_ENV || "CONTINUITYDB_HTTP_TOKEN";
-  if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(tokenEnv)
-    || ["HOME", "PATH", "SHELL", "USER", "LOGNAME", "PWD"].includes(tokenEnv)) {
-    throw new Error("CONTINUITYDB_HTTP_TOKEN_ENV must name a dedicated uppercase environment entry");
-  }
+  validateTokenEnvironmentName(tokenEnv, "CONTINUITYDB_HTTP_TOKEN_ENV");
   return new ContinuityApiClient({
     baseUrl: env.CONTINUITYDB_HTTP_URL,
     token: env[tokenEnv] || null,

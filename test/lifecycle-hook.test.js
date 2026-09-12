@@ -199,6 +199,104 @@ test("repeated identical checkpoint is an idempotent truthful duplicate", async 
   }
 });
 
+test("auto-linked successor checkpoint retries are idempotent locally and reject changed data", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-successor-local-test-"));
+  try {
+    const home = seedLocalMemory(root, "billing-api", "Successor fixture");
+    const firstPath = join(root, "first.json");
+    const secondPath = join(root, "second.json");
+    writeFileSync(firstPath, JSON.stringify({
+      project_id: "billing-api", task_id: "successor-task", goal: "Resume safely",
+      current_state: "First state", checkpoint_id: "successor-checkpoint-1",
+    }));
+    writeFileSync(secondPath, JSON.stringify({
+      project_id: "billing-api", task_id: "successor-task", goal: "Resume safely",
+      current_state: "Second state", checkpoint_id: "successor-checkpoint-2",
+    }));
+    const env = { CONTINUITYDB_HOME: home, CONTINUITYDB_PROJECT_ID: "billing-api", CONTINUITYDB_HTTP_URL: "" };
+    await runHook(["checkpoint", "--file", firstPath, "--client", "claude", "--verbose"], env);
+    const second = JSON.parse(await runHook(["checkpoint", "--file", secondPath, "--client", "claude", "--verbose"], env));
+    const retry = JSON.parse(await runHook(["checkpoint", "--file", secondPath, "--client", "claude", "--verbose"], env));
+    assert.equal(second.duplicate, false);
+    assert.equal(retry.duplicate, true);
+    assert.equal(retry.memory_id, second.memory_id);
+
+    writeFileSync(secondPath, JSON.stringify({
+      project_id: "billing-api", task_id: "successor-task", goal: "Resume safely",
+      current_state: "Changed retry must fail", checkpoint_id: "successor-checkpoint-2",
+    }));
+    await assert.rejects(
+      runHook(["checkpoint", "--file", secondPath, "--client", "claude", "--verbose"], env),
+      /(idempotency|checkpoint.*different|different.*checkpoint)/i,
+    );
+    const reopened = new ContextVault(home);
+    try {
+      assert.equal(reopened.latestHandoff({
+        tenant_id: "local", owner_id: "local-user", project_id: "billing-api",
+        task_id: "successor-task", allowed_sensitivities: ["private"],
+      }).handoff.current_state, "Second state");
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("auto-linked successor checkpoint retries are idempotent through remote lifecycle", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-successor-remote-test-"));
+  const vault = new ContextVault(join(root, "vault"));
+  const service = createContinuityServer({
+    vault,
+    host: "127.0.0.1",
+    port: 0,
+    localIdentity: {
+      tenant_id: "tenant-a", principal_id: "hook-agent", owner_id: "owner-a", agent_id: "claude",
+      scopes: ["memory:read", "memory:capture"], allowed_projects: ["billing-api"], allowed_sensitivities: ["private"],
+    },
+  });
+  try {
+    const address = await service.listen();
+    const env = {
+      CONTINUITYDB_HTTP_URL: `http://127.0.0.1:${address.port}`,
+      CONTINUITYDB_HTTP_TOKEN_ENV: "CONTINUITYDB_TEST_SUCCESSOR_TOKEN",
+      CONTINUITYDB_PROJECT_ID: "billing-api",
+    };
+    const firstPath = join(root, "first.json");
+    const secondPath = join(root, "second.json");
+    writeFileSync(firstPath, JSON.stringify({
+      project_id: "billing-api", task_id: "remote-successor", goal: "Remote resume",
+      current_state: "First remote state", checkpoint_id: "remote-successor-1",
+    }));
+    writeFileSync(secondPath, JSON.stringify({
+      project_id: "billing-api", task_id: "remote-successor", goal: "Remote resume",
+      current_state: "Second remote state", checkpoint_id: "remote-successor-2",
+    }));
+    await runHook(["checkpoint", "--file", firstPath, "--verbose"], env);
+    const second = JSON.parse(await runHook(["checkpoint", "--file", secondPath, "--verbose"], env));
+    const retry = JSON.parse(await runHook(["checkpoint", "--file", secondPath, "--verbose"], env));
+    assert.equal(second.duplicate, false);
+    assert.equal(retry.duplicate, true);
+    assert.equal(retry.memory_id, second.memory_id);
+
+    writeFileSync(secondPath, JSON.stringify({
+      project_id: "billing-api", task_id: "remote-successor", goal: "Remote resume",
+      current_state: "Changed remote retry must fail", checkpoint_id: "remote-successor-2",
+    }));
+    await assert.rejects(
+      runHook(["checkpoint", "--file", secondPath, "--verbose"], env),
+      /(internal server error|idempotency|checkpoint.*different|different.*checkpoint)/i,
+    );
+    assert.equal(vault.latestHandoff({
+      tenant_id: "tenant-a", owner_id: "owner-a", project_id: "billing-api",
+      task_id: "remote-successor", allowed_sensitivities: ["private"],
+    }).handoff.current_state, "Second remote state");
+  } finally {
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("secure checkpoint read bounds bytes and detects same-inode growth after open", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-read-race-test-"));
   const checkpoint = join(root, "handoff.json");

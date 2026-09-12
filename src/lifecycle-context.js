@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
-import { ContinuityApiClient } from "./http-client.js";
+import { ContinuityApiClient, validateTokenEnvironmentName } from "./http-client.js";
 import { validateProjectId } from "./project-identity.js";
 import { listRegisteredProjects } from "./project-registry.js";
 import { normalizeIdentity, requiredIdentifier } from "./security.js";
@@ -8,8 +8,6 @@ import { ContextVault } from "./store.js";
 
 const MIN_TOKEN_BUDGET = 64;
 const MAX_TOKEN_BUDGET = 32_000;
-const TOKEN_ENV_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
-const RESERVED_TOKEN_ENV = new Set(["HOME", "PATH", "SHELL", "USER", "LOGNAME", "PWD"]);
 const SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
 
 function optionalIdentifier(value, name) {
@@ -41,9 +39,7 @@ function assertRegisteredProject(home, projectId) {
 }
 
 function remoteClient({ remoteUrl, tokenEnv, env }) {
-  if (typeof tokenEnv !== "string" || !TOKEN_ENV_PATTERN.test(tokenEnv) || RESERVED_TOKEN_ENV.has(tokenEnv)) {
-    throw new Error("CONTINUITYDB_HTTP_TOKEN_ENV is required and must name a dedicated uppercase environment entry");
-  }
+  validateTokenEnvironmentName(tokenEnv, "CONTINUITYDB_HTTP_TOKEN_ENV is required and");
   return new ContinuityApiClient({ baseUrl: remoteUrl, token: env[tokenEnv] || null });
 }
 
@@ -164,6 +160,8 @@ export async function saveLifecycleCheckpoint({
         });
         if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
           value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+        } else if (latest.handoff.previous_checkpoint_id) {
+          value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
         }
       } catch (error) {
         if (error.statusCode !== 404) throw error;
@@ -195,6 +193,8 @@ export async function saveLifecycleCheckpoint({
       });
       if (latest && latest.handoff.checkpoint_id !== value.checkpoint_id) {
         value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      } else if (latest?.handoff.previous_checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
       }
     }
     const input = {
