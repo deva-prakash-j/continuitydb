@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, write
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { parse as parseToml } from "smol-toml";
 import {
   connectAgent,
   connectAgents,
@@ -1282,6 +1283,76 @@ test("Codex updates and disconnects only its current managed block", () => {
     assert.match(disconnected, /\[current_user_edit\]\nkeep = true/);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Codex disconnect preserves valid TOML boundaries for every surrounding newline shape", () => {
+  const cases = [
+    {
+      name: "no terminal LF with direct table",
+      original: 'model = "gpt-5"',
+      suffix: '[post_connect]\nkeep = "table"\n',
+      expected: 'model = "gpt-5"\n[post_connect]\nkeep = "table"\n',
+    },
+    {
+      name: "terminal LF with direct table",
+      original: 'model = "gpt-5"\n',
+      suffix: '[post_connect]\nkeep = "table"\n',
+      expected: 'model = "gpt-5"\n[post_connect]\nkeep = "table"\n',
+    },
+    { name: "no terminal LF and empty suffix", original: 'model = "gpt-5"', suffix: "", expected: 'model = "gpt-5"' },
+    { name: "terminal LF and empty suffix", original: 'model = "gpt-5"\n', suffix: "", expected: 'model = "gpt-5"\n' },
+    {
+      name: "direct comment and table",
+      original: 'model = "gpt-5"',
+      suffix: '# post-connect comment\n[post_connect]\nkeep = true\n',
+      expected: 'model = "gpt-5"\n# post-connect comment\n[post_connect]\nkeep = true\n',
+    },
+    {
+      name: "user-owned leading LF",
+      original: 'model = "gpt-5"',
+      suffix: '\n# preserved blank boundary\n[post_connect]\nkeep = true\n',
+      expected: 'model = "gpt-5"\n# preserved blank boundary\n[post_connect]\nkeep = true\n',
+    },
+    {
+      name: "direct key",
+      original: 'model = "gpt-5"',
+      suffix: 'post_connect_key = true\n',
+      expected: 'model = "gpt-5"\npost_connect_key = true\n',
+    },
+    {
+      name: "CRLF user document and suffix",
+      original: 'model = "gpt-5"\r\n',
+      suffix: '[post_connect]\r\nkeep = "crlf"\r\n',
+      expected: 'model = "gpt-5"\r\n[post_connect]\r\nkeep = "crlf"\r\n',
+    },
+    {
+      name: "empty original with direct table",
+      original: "",
+      suffix: '[post_connect]\nkeep = "only-user-content"\n',
+      expected: '[post_connect]\nkeep = "only-user-content"\n',
+    },
+  ];
+  for (const item of cases) {
+    const value = fixture();
+    const path = join(value.project, ".codex", "config.toml");
+    try {
+      mkdirSync(join(value.project, ".codex"));
+      writeFileSync(path, item.original);
+      connectAgent("codex", options(value));
+      writeFileSync(path, `${readFileSync(path, "utf8")}${item.suffix}`);
+      disconnectAgent("codex", options(value));
+      assert.equal(readFileSync(path, "utf8"), item.expected, item.name);
+      assert.doesNotThrow(() => parseToml(readFileSync(path, "utf8")), item.name);
+
+      connectAgent("codex", options(value));
+      connectAgent("codex", options(value));
+      disconnectAgent("codex", options(value));
+      disconnectAgent("codex", options(value));
+      assert.equal(readFileSync(path, "utf8"), item.expected, `${item.name} repeated cycle`);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
   }
 });
 

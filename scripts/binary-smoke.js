@@ -142,7 +142,10 @@ try {
   const version = run(["version"]);
   assert.equal(version.standalone, true);
   const userAgents = "# User-owned agent instructions\n\nPreserve this byte-for-byte.  \n";
+  const codexSeed = 'model = "binary-user-model"';
   writeFileSync(join(project, "AGENTS.md"), userAgents);
+  mkdirSync(join(project, ".codex"));
+  writeFileSync(join(project, ".codex", "config.toml"), codexSeed);
   const preview = run(["setup", "--home", home, "--project-dir", project, "--agents", "all"]);
   assert.equal(preview.applied, false);
   const setup = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply"]);
@@ -164,7 +167,7 @@ try {
   }
 
   const codexConfig = join(project, ".codex", "config.toml");
-  const postConnectToml = '\n[user_after_connect]\nkeep = "binary-user-byte"\n';
+  const postConnectToml = '[user_after_connect]\nkeep = "binary-user-byte"\n';
   writeFileSync(codexConfig, `${readFileSync(codexConfig, "utf8")}${postConnectToml}`);
   const updatedSetup = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply"]);
   assert.equal(updatedSetup.connections.find((item) => item.client === "codex").changed, false);
@@ -209,7 +212,7 @@ try {
   const disconnected = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
   assert.equal(disconnected.results.every((item) => item.applied && item.verified), true);
   assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
-  assert.equal(readFileSync(codexConfig, "utf8"), postConnectToml);
+  assert.equal(readFileSync(codexConfig, "utf8"), `${codexSeed}\n${postConnectToml}`);
   const disconnectRetry = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
   assert.equal(disconnectRetry.results.every((item) => !item.changed), true);
 

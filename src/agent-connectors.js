@@ -536,8 +536,18 @@ function removeCodexManagedBlock(text, ownership) {
   const { managed, metadata } = ownership;
   let prefix = text.slice(0, managed.start);
   let suffix = text.slice(managed.end + CODEX_END.length);
+  // The rendered block owns its one terminal LF. Any further LF/CRLF belongs
+  // to post-connect user content and must remain byte-exact.
   if (suffix.startsWith("\n")) suffix = suffix.slice(1);
-  if (metadata?.separator && prefix.endsWith("\n")) prefix = prefix.slice(0, -1);
+  if (metadata?.separator && prefix.endsWith("\n")) {
+    const withoutSeparator = prefix.slice(0, -1);
+    // A separator inserted for an original no-terminal-LF document can be
+    // removed only at EOF or when the user-owned suffix already begins on a
+    // new line. Otherwise retain it as the necessary TOML token boundary.
+    if (!withoutSeparator || !suffix || suffix.startsWith("\n") || suffix.startsWith("\r\n")) {
+      prefix = withoutSeparator;
+    }
+  }
   return `${prefix}${suffix}`;
 }
 
