@@ -39,6 +39,8 @@ import { installStandaloneBinary } from "./self-install.js";
 import { VERSION } from "./version.js";
 import { defaultDataHome, hasPrivateDirectoryPermissions } from "./paths.js";
 import { acquireVaultInitializationLock } from "./file-lock.js";
+import { resolveProjectIdentity } from "./project-identity.js";
+import { listRegisteredProjects, registerProject } from "./project-registry.js";
 
 function parse(argv) {
   const positional = [];
@@ -77,14 +79,16 @@ function usage() {
 Usage:
   continuitydb version
   continuitydb install [--prefix PATH] --apply
-  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--apply]
+  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--project ID] [--apply]
   continuitydb init [--home PATH]
   continuitydb doctor [--home PATH]
   continuitydb run [--home PATH] [--host HOST] [--port PORT] [--review-ui]
   continuitydb agents detect
   continuitydb agents status [--project-dir PATH]
-  continuitydb agents connect AGENT|all [--project-dir PATH] [--transport stdio|http] [--url URL] --apply
+  continuitydb agents connect AGENT|all [--project-dir PATH] [--project ID] [--transport stdio|http] [--url URL] --apply
   continuitydb agents disconnect AGENT|all [--project-dir PATH] --apply
+  continuitydb projects list [--home PATH]
+  continuitydb projects add --project-dir PATH [--project ID] [--home PATH] [--apply]
   continuitydb mcp [--home PATH]
   continuitydb hook session-start|checkpoint [HOOK OPTIONS]
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
@@ -143,7 +147,7 @@ function agentOptions() {
     binary: flags.binary || null,
     ownerId: flags.owner || cliOwnerId,
     tenantId: flags.tenant || cliTenantId,
-    projects: listFlag(flags.projects || flags.project),
+    projectId: flags.project,
     sensitivities: listFlag(flags.sensitivities || "public,private"),
     transport: flags.transport || "stdio",
     url: flags.url,
@@ -290,7 +294,7 @@ function rollbackInitializedSetup(initialized) {
   }
 }
 
-async function initializeSetupHome(home, flags) {
+async function initializeSetupHome(home, flags, identity) {
   assertSetupHome(home);
   const existed = existsSync(home);
   const configuredCache = flags.cache || process.env.CONTINUITYDB_MODEL_CACHE;
@@ -307,9 +311,7 @@ async function initializeSetupHome(home, flags) {
   if (existed) {
     existingStats = inspectExistingVault(home);
     const paths = existingStats
-      ? [
-        ...(!existsSync(join(home, "config.json")) ? ["config.json"] : []),
-      ]
+      ? ["config.json"]
       : SETUP_MUTATED_PATHS.filter((name) => name !== "models");
     vaultSnapshot = snapshotSetupHome(home, paths);
     await synchronizeSetupSnapshotForTest(vaultSnapshot);
@@ -322,7 +324,6 @@ async function initializeSetupHome(home, flags) {
 
   try {
     const configPath = join(target, "config.json");
-    let createdConfig = false;
     if (!existsSync(configPath)) {
       writeFileSync(configPath, `${JSON.stringify({
         schema_version: 2,
@@ -331,11 +332,8 @@ async function initializeSetupHome(home, flags) {
         owner_id: flags.owner || cliOwnerId,
         created_at: new Date().toISOString(),
       }, null, 2)}\n`, { mode: 0o600 });
-      createdConfig = true;
     }
-    if (vaultSnapshot && !createdConfig && existingStats) {
-      vaultSnapshot.paths = vaultSnapshot.paths.filter((name) => name !== "config.json");
-    }
+    const registration = registerProject(target, identity, { apply: true });
     let stats = existingStats;
     if (!stats) {
       const vault = new ContextVault(target);
@@ -356,7 +354,7 @@ async function initializeSetupHome(home, flags) {
       staging = null;
       if (flags.semantic && !configuredCache) embeddings = localModelStatus({ home });
     }
-    return { stats, embeddings, created: !existed, home, vaultSnapshot, expectedVaultSnapshot, modelCacheSnapshot, modelCacheWritten };
+    return { stats, embeddings, registration, created: !existed, home, vaultSnapshot, expectedVaultSnapshot, modelCacheSnapshot, modelCacheWritten };
   } catch (error) {
     if (staging && existsSync(staging)) rmSync(staging, { recursive: true, force: true });
     const rollbackErrors = [];
@@ -381,7 +379,10 @@ try {
     output(installStandaloneBinary({ prefix: flags.prefix, apply: Boolean(flags.apply), force: Boolean(flags.force) }));
   } else if (command === "setup") {
     const selected = agentSelection(flags.agents);
-    const connectionOptions = agentOptions();
+    const projectDir = resolve(flags.project_dir || process.cwd());
+    const identity = resolveProjectIdentity({ projectDir, explicitProject: flags.project });
+    const connectionOptions = { ...agentOptions(), projectId: identity.id };
+    const previewRegistration = registerProject(home, identity, { apply: false });
     // Setup must fail without touching the global vault when any client
     // configuration cannot be parsed or safely rendered.
     const previewConnections = connectAgents(selected, { ...connectionOptions, apply: false });
@@ -395,6 +396,7 @@ try {
         stats: null,
         detected_agents: detectAgents(),
         connections: previewConnections,
+        registration: previewRegistration,
         embeddings: flags.semantic ? { planned: true, provider: "local" } : null,
         applied: false,
         run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
@@ -409,7 +411,7 @@ try {
       releaseModelCacheLock = flags.semantic
         ? acquireLocalModelCacheLock({ home, cacheDir: configuredCache })
         : null;
-      const initialized = await initializeSetupHome(home, flags);
+      const initialized = await initializeSetupHome(home, flags, identity);
       let connections;
       try {
         // Hold the vault initialization lock until connector commit succeeds or
@@ -437,6 +439,7 @@ try {
         stats: initialized.stats,
         detected_agents: detectAgents(),
         connections,
+        registration: initialized.registration,
         embeddings: initialized.embeddings,
         applied: Boolean(flags.apply),
         run: { command: isStandaloneBinary() ? process.execPath : "continuitydb", args: ["run", "--home", home] },
@@ -445,6 +448,18 @@ try {
       try { if (releaseModelCacheLock) releaseModelCacheLock(); }
       finally { releaseInitializationLock(); }
     }
+  } else if (command === "projects") {
+    const action = positional.shift() || "list";
+    if (action === "list") {
+      output({ projects: listRegisteredProjects(home) });
+    } else if (action === "add") {
+      if (!flags.project_dir) throw new Error("projects add requires --project-dir PATH");
+      const identity = resolveProjectIdentity({
+        projectDir: resolve(flags.project_dir),
+        explicitProject: flags.project,
+      });
+      output({ project: identity, ...registerProject(home, identity, { apply: Boolean(flags.apply) }) });
+    } else throw new Error(`unknown projects action: ${action}`);
   } else if (command === "agents") {
     const action = positional.shift() || "status";
     if (action === "detect") output({ agents: detectAgents() });

@@ -42,7 +42,7 @@ function forceSetupConnectorFailure({ cli, home, project }) {
   writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
   writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
   return spawnSync(process.execPath, [
-    cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
   ], { encoding: "utf8" });
 }
 
@@ -112,7 +112,7 @@ test("CLI setup previews and applies all project agent connections idempotently"
   mkdirSync(project);
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
   try {
-    const common = [cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--owner", "owner-a"];
+    const common = [cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--owner", "owner-a"];
     const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
     assert.equal(preview.status, 0, preview.stderr);
     const previewValue = JSON.parse(preview.stdout);
@@ -134,6 +134,141 @@ test("CLI setup previews and applies all project agent connections idempotently"
   }
 });
 
+test("CLI setup derives one Git project identity and registers it on apply", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-git-setup-"));
+  const project = join(root, "git-project");
+  const nested = join(project, "packages", "worker");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(nested, { recursive: true });
+    const common = [cli, "setup", "--home", home, "--project-dir", nested, "--agents", "codex"];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.deepEqual(JSON.parse(preview.stdout).registration, {
+      changed: true,
+      applied: false,
+      projects: [{ id: "git-project", root: project, source: "git" }],
+    });
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(join(nested, ".codex", "config.toml")), false);
+
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).registration.applied, true);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "git-project", root: project, source: "git" },
+    ]);
+    assert.match(readFileSync(join(nested, ".codex", "config.toml"), "utf8"), /CONTINUITYDB_ALLOWED_PROJECTS = "git-project"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup outside Git refuses before mutating the vault or project", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-outside-git-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(project);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot infer a project identity.*--project <id>/i);
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup accepts and registers an explicit project outside Git", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-explicit-setup-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(project);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "billing-api", "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "billing-api", root: project, source: "explicit" },
+    ]);
+    assert.match(readFileSync(join(project, ".codex", "config.toml"), "utf8"), /CONTINUITYDB_ALLOWED_PROJECTS = "billing-api"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI projects add previews, applies, lists, and repeats idempotently", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-projects-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(project);
+    const common = [cli, "projects", "add", "--home", home, "--project-dir", project, "--project", "billing-api"];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.deepEqual(JSON.parse(preview.stdout), {
+      project: { id: "billing-api", root: project, source: "explicit", git_root: null },
+      changed: true,
+      applied: false,
+      projects: [{ id: "billing-api", root: project, source: "explicit" }],
+    });
+    assert.equal(existsSync(home), false);
+
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).changed, true);
+    const repeated = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(JSON.parse(repeated.stdout).changed, false);
+    const listed = spawnSync(process.execPath, [cli, "projects", "list", "--home", home], { encoding: "utf8" });
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.deepEqual(JSON.parse(listed.stdout), {
+      projects: [{ id: "billing-api", root: project, source: "explicit" }],
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup connector failure restores exact config bytes and registry state", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-registry-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(project);
+    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr);
+    const configPath = join(home, "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.projects = [{ id: "existing", root: join(root, "existing"), source: "explicit" }];
+    config.unknown_extension = { preserve: true };
+    const before = Buffer.from(`${JSON.stringify(config, null, 4)}\n`);
+    writeFileSync(configPath, before);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "new-project", "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.equal(readFileSync(configPath).equals(before), true, "rollback must restore the exact prior config bytes");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI setup --agents all fails before mutating any client when a later config is malformed", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-atomic-"));
   const project = join(root, "project");
@@ -148,7 +283,7 @@ test("CLI setup --agents all fails before mutating any client when a later confi
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.equal(readFileSync(codex, "utf8"), beforeCodex);
@@ -177,7 +312,7 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /backup parent must be a real directory/);
@@ -208,7 +343,7 @@ test("CLI failed setup restores a pre-existing empty index directory byte-for-by
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /backup parent must be a real directory/);
@@ -232,7 +367,7 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.deepEqual(snapshotTree(home), before);
@@ -260,7 +395,7 @@ test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { sk
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.deepEqual(snapshotTree(home), before);
@@ -285,7 +420,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
     writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
 
     const child = fork(cli, [
-      "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], {
       env: { ...process.env, NODE_ENV: "test", CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC: "1" },
       silent: true,
@@ -333,7 +468,7 @@ test("CLI setup vault failure occurs before agent commit and removes new setup a
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.equal(readFileSync(codex, "utf8"), beforeCodex);
@@ -364,7 +499,7 @@ test("CLI agents connect all fails before mutating any client when a later names
   const cli = new URL("../src/cli.js", import.meta.url).pathname;
   try {
     const result = spawnSync(process.execPath, [
-      cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--apply",
+      cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--project", "cli-test", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     for (const [path, content] of before) assert.equal(readFileSync(path, "utf8"), content);
