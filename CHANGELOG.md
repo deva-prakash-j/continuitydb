@@ -14,7 +14,8 @@ after the first stable release.
   plan/read-only bypasses, and require the truthful result `not saved` whenever
   capture is denied or unavailable.
 - Expanded client validation to generate and verify all 12 managed assets,
-  compare versioned hook/policy examples with actual adapter output, and reuse
+  compare all four generated hook/policy examples with actual adapter output,
+  reject any shipped client example without explicit validation, and reuse
   the same tree validator against the standalone binary's output.
 - Required Node 22/24, container, Linux binary, and all supported native release
   jobs to run blocking client-adapter validation before artifact publication.

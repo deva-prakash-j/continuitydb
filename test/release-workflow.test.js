@@ -161,6 +161,16 @@ test("release workflow validator rejects missing, skipped, or misordered semanti
   const independentPublish = structuredClone(workflow);
   independentPublish.jobs.publish.needs = [];
   assert.throws(() => validateReleaseWorkflow(independentPublish), /publish must depend/);
+
+  const expressionContinue = structuredClone(workflow);
+  expressionContinue.jobs.build.steps
+    .find((step) => step.run === "npm run smoke:binary:semantic")["continue-on-error"] = "${{ true }}";
+  assert.throws(() => validateReleaseWorkflow(expressionContinue), /continue-on-error/);
+
+  const expressionProvenance = structuredClone(workflow);
+  expressionProvenance.jobs.publish.steps
+    .find((step) => String(step.uses || "").startsWith("actions/attest-build-provenance@"))["continue-on-error"] = "${{ true }}";
+  assert.throws(() => validateReleaseWorkflow(expressionProvenance), /continue-on-error/);
 });
 
 test("release workflow rejects mutable action tags in privileged and build jobs", () => {

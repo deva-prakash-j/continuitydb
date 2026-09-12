@@ -16,11 +16,16 @@ function actionIndex(steps, prefix) {
   return steps.findIndex((step) => String(step.uses || "").startsWith(prefix));
 }
 
+function requireBlockingStep(step, message) {
+  invariant(step && !step.if, `${message}; the step must be unconditional`);
+  invariant(step["continue-on-error"] === undefined || step["continue-on-error"] === false,
+    `${message}; continue-on-error must be absent or the literal boolean false`);
+}
+
 function requireBlockingCommand(steps, command, message) {
   const index = runIndex(steps, command);
   invariant(index >= 0, message);
-  invariant(!steps[index].if && steps[index]["continue-on-error"] !== true,
-    `${message}; the command must be unconditional and blocking`);
+  requireBlockingStep(steps[index], message);
   return index;
 }
 
@@ -72,8 +77,8 @@ export function validateReleaseWorkflow(document) {
   invariant(checksumIndex > semanticIndex, "checksums must be created only after semantic verification");
   invariant(uploadIndex > checksumIndex, "only post-verification bytes may be uploaded");
   for (const index of [smokeIndex, semanticIndex, checksumIndex, uploadIndex]) {
-    invariant(!steps[index].if, "verification/checksum/upload gates must run for every native matrix target");
-    invariant(steps[index]["continue-on-error"] !== true, "native release gates must be blocking");
+    requireBlockingStep(steps[index],
+      "verification/checksum/upload gates must run for every native matrix target");
   }
 
   const needs = Array.isArray(publish.needs) ? publish.needs : [publish.needs];
@@ -92,9 +97,10 @@ export function validateReleaseWorkflow(document) {
   const publishedVerifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify published release assets"));
   invariant(downloadIndex >= 0 && verifyIndex > downloadIndex && attestIndex > verifyIndex && releaseIndex > attestIndex,
     "downloaded native artifacts must be checksum-verified and attested before release publication");
-  invariant(publishSteps[attestIndex]?.with?.["subject-path"] === "release/continuitydb-*"
-    && !publishSteps[attestIndex].if && publishSteps[attestIndex]["continue-on-error"] !== true,
-  "provenance for the complete supported native asset set must succeed before publication");
+  invariant(publishSteps[attestIndex]?.with?.["subject-path"] === "release/continuitydb-*",
+    "provenance must cover the complete supported native asset set");
+  requireBlockingStep(publishSteps[attestIndex],
+    "provenance for the complete supported native asset set must succeed before publication");
   invariant(publishedVerifyIndex > releaseIndex,
     "published release assets must be independently verified after publication");
   const verifyCommand = String(publishSteps[verifyIndex]?.run || "");
@@ -168,8 +174,7 @@ export function validateCiWorkflow(document) {
   invariant(checksumIndex > semanticIndex, "CI checksums must follow semantic verification");
   invariant(uploadIndex > checksumIndex, "CI may upload only post-verification bytes");
   for (const index of [functionalIndex, semanticIndex, checksumIndex, uploadIndex]) {
-    invariant(!steps[index].if, "CI binary verification/checksum/upload gates must be unconditional");
-    invariant(steps[index]["continue-on-error"] !== true, "CI binary release gates must be blocking");
+    requireBlockingStep(steps[index], "CI binary verification/checksum/upload gates must be blocking");
   }
   return { valid: true, binary_artifact_verified: true, client_adapters_verified: true };
 }

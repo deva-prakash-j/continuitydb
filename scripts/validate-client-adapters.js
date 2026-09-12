@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,8 +8,13 @@ import { parse as parseToml } from "smol-toml";
 import { connectAgents, connectionStatus, SUPPORTED_AGENTS } from "../src/agent-connectors.js";
 import { registerProject } from "../src/project-registry.js";
 
-const repositoryRoot = new URL("../", import.meta.url);
-const readRepositoryFile = (path) => readFileSync(new URL(path, repositoryRoot), "utf8");
+const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
+const defaultExamplesRoot = join(repositoryRoot, "examples");
+let examplesRoot = defaultExamplesRoot;
+const readRepositoryFile = (path) => {
+  invariant(path.startsWith("examples/"), `invalid example path: ${path}`);
+  return readFileSync(join(examplesRoot, path.slice("examples/".length)), "utf8");
+};
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 
 const EXPECTED_ASSETS = Object.freeze({
@@ -38,11 +43,31 @@ const POLICY_ASSETS = Object.freeze([
 const GENERATED_EXAMPLES = Object.freeze([
   "examples/claude-code-hooks.example.json",
   "examples/cursor-hooks.example.json",
+  "examples/clients/claude-code.hooks.json",
   "examples/clients/codex.AGENTS.md",
 ]);
 
 function invariant(condition, message) {
   if (!condition) throw new Error(`client adapter invariant failed: ${message}`);
+}
+
+function discoverClientExamples() {
+  const paths = [];
+  const walk = (directory, prefix) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const relativePath = `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) walk(path, relativePath);
+      else if (entry.isFile()) paths.push(relativePath);
+    }
+  };
+  walk(join(examplesRoot, "clients"), "examples/clients");
+  for (const name of readdirSync(examplesRoot)) {
+    if (/^(?:claude-code-hooks|cursor-hooks|mcp(?:\.remote)?\.vscode)\.example\.json$/.test(name)) {
+      paths.push(`examples/${name}`);
+    }
+  }
+  return paths.sort();
 }
 
 function portableRelative(root, path) {
@@ -146,14 +171,20 @@ function validateGeneratedExamples(projectDir, home) {
   const generatedCursor = normalizeGeneratedValue(
     readJson(join(projectDir, ".cursor", "hooks.json")), projectDir, home,
   );
-  assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[0])), generatedClaude);
+  assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[0])), generatedClaude,
+    `${GENERATED_EXAMPLES[0]} does not match the generated hook example`);
   assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[1])), generatedCursor);
-  assert.equal(readRepositoryFile(GENERATED_EXAMPLES[2]).trimEnd(),
+  assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[2])), generatedClaude,
+    `${GENERATED_EXAMPLES[2]} does not match the generated hook example`);
+  assert.equal(readRepositoryFile(GENERATED_EXAMPLES[3]).trimEnd(),
     readFileSync(join(projectDir, "AGENTS.md"), "utf8").trimEnd());
+  return [...GENERATED_EXAMPLES];
 }
 
 function validateVersionedRemoteExamples() {
+  const validated = [];
   const copilot = JSON.parse(readRepositoryFile("examples/clients/copilot.repository-mcp.json"));
+  validated.push("examples/clients/copilot.repository-mcp.json");
   const copilotServer = copilot.mcpServers.continuitydb;
   invariant(copilotServer.type === "http" && /\/mcp$/.test(copilotServer.url), "Copilot remote schema is invalid");
   assert.deepEqual([...copilotServer.tools].sort(), ["handoff_latest", "memory_context_pack", "memory_search"]);
@@ -161,11 +192,13 @@ function validateVersionedRemoteExamples() {
     "Copilot example must contain only a token placeholder");
 
   const claude = JSON.parse(readRepositoryFile("examples/clients/claude-code.mcp.json")).mcpServers.continuitydb;
+  validated.push("examples/clients/claude-code.mcp.json");
   invariant(claude.type === "http" && /\/mcp$/.test(claude.url), "Claude remote schema is invalid");
   invariant(claude.headers.Authorization === "Bearer ${CONTINUITYDB_MCP_TOKEN}",
     "Claude example must contain only a token placeholder");
 
   const opencode = JSON.parse(readRepositoryFile("examples/clients/opencode.json"));
+  validated.push("examples/clients/opencode.json");
   invariant(opencode.mcp.continuitydb.type === "remote" && /\/mcp$/.test(opencode.mcp.continuitydb.url),
     "OpenCode remote schema is invalid");
   invariant(opencode.mcp.continuitydb.oauth === false &&
@@ -174,11 +207,32 @@ function validateVersionedRemoteExamples() {
 
   for (const path of ["examples/clients/codex.remote.config.toml", "examples/clients/codex.stdio.config.toml"]) {
     const value = readRepositoryFile(path);
+    validated.push(path);
     invariant(/\[mcp_servers\.continuitydb\]/.test(value) && /required = true/.test(value), `${path} is incomplete`);
     invariant(/default_tools_approval_mode = "writes"/.test(value), `${path} omits write approval mode`);
   }
   invariant(/bearer_token_env_var = "CONTINUITYDB_MCP_TOKEN"/.test(
     readRepositoryFile("examples/clients/codex.remote.config.toml")), "Codex remote example omits token reference");
+
+  const opencodePlugin = readRepositoryFile("examples/clients/opencode-continuitydb.js");
+  validated.push("examples/clients/opencode-continuitydb.js");
+  invariant(opencodePlugin.includes("experimental.session.compacting") && opencodePlugin.includes("session.idle"),
+    "OpenCode shipped plugin example omits lifecycle handlers");
+  invariant(opencodePlugin.includes("CONTINUITYDB_PROJECT_ID") && opencodePlugin.includes("not saved"),
+    "OpenCode shipped plugin example omits project scope or truthful capture failure");
+  invariant(!/raw[_ -]?(?:prompt|transcript)|capture.*(?:prompt|transcript)/i.test(opencodePlugin),
+    "OpenCode shipped plugin example contains raw prompt/transcript capture");
+
+  const vscode = JSON.parse(readRepositoryFile("examples/mcp.vscode.example.json"));
+  validated.push("examples/mcp.vscode.example.json");
+  const vscodeServer = vscode.servers?.continuitydb;
+  invariant(vscodeServer?.type === "stdio" && vscodeServer.env?.CONTINUITYDB_ALLOWED_PROJECTS === "service-a,schema-a",
+    "VS Code stdio example schema or concrete project scope is invalid");
+  const remoteVscode = JSON.parse(readRepositoryFile("examples/mcp.remote.vscode.example.json"));
+  validated.push("examples/mcp.remote.vscode.example.json");
+  invariant(remoteVscode.servers?.continuitydb?.type === "stdio"
+    && remoteVscode.servers.continuitydb.env?.CONTINUITYDB_HTTP_URL === "http://127.0.0.1:7331",
+  "VS Code remote thin-stdio example schema is invalid");
   const exampleText = [
     JSON.stringify(copilot),
     JSON.stringify(claude),
@@ -191,6 +245,7 @@ function validateVersionedRemoteExamples() {
     "client examples must not contain a bearer-token value");
   invariant(!/(?:Project scope: `default`|ALLOWED_PROJECTS\s*[=:]\s*["'](?:default|\*)["'])/i.test(exampleText),
     "client examples must use concrete generic project IDs, not a default or wildcard scope");
+  return validated;
 }
 
 function validateRepositoryAdapters() {
@@ -210,11 +265,17 @@ function validateRepositoryAdapters() {
       apply: true,
     });
     const result = validateGeneratedAdapterTree(projectDir, { home, projectId });
-    validateGeneratedExamples(projectDir, home);
-    validateVersionedRemoteExamples();
+    const validatedExamples = [
+      ...validateGeneratedExamples(projectDir, home),
+      ...validateVersionedRemoteExamples(),
+    ].sort();
+    const shippedExamples = discoverClientExamples();
+    assert.deepEqual(validatedExamples, shippedExamples,
+      "every shipped client example must have an explicit validator");
     return {
       ...result,
       generated_examples: [...GENERATED_EXAMPLES],
+      shipped_examples: shippedExamples.length,
       standalone_tree_validator: true,
     };
   } finally {
@@ -222,6 +283,15 @@ function validateRepositoryAdapters() {
   }
 }
 
+function parseExamplesRoot(args) {
+  if (args.length === 0) return defaultExamplesRoot;
+  if (args.length !== 2 || args[0] !== "--examples-root" || !args[1]) {
+    throw new Error("usage: validate-client-adapters.js [--examples-root <path>]");
+  }
+  return resolve(args[1]);
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  examplesRoot = parseExamplesRoot(process.argv.slice(2));
   process.stdout.write(`${JSON.stringify(validateRepositoryAdapters())}\n`);
 }
