@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose a focused capability or integration
+title: "feat: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the developer problem and desired outcome. For open-ended
+        ideas or usage questions, use Discussions instead.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Developer problem
+      description: What context-continuity problem is currently hard or impossible?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior, not only an implementation.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Retrieval and ranking
+        - Git provenance and repository ingestion
+        - MCP or client integration
+        - Memory lifecycle and governance
+        - CLI and installation
+        - Storage and operations
+        - Documentation and examples
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Example or evidence
+      description: A secret-free workflow, sample query, or comparison is especially useful.
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Constraints and trade-offs
+      description: Note local-first, security, compatibility, or migration constraints.
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I may be able to help implement or test this.
+

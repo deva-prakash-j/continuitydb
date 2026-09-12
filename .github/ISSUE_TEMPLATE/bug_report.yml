@@ -1,0 +1,79 @@
+name: Bug report
+description: Report a reproducible ContinuityDB problem
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve ContinuityDB. Never include credentials,
+        private repository content, or sensitive memory records. Security
+        vulnerabilities belong in a private advisory, not a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: ContinuityDB version
+      description: Output from `continuitydb version` or the exact commit SHA.
+      placeholder: v0.7.0 or f1e78a6
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation
+      options:
+        - Linux x64 standalone binary
+        - macOS arm64 standalone binary
+        - Windows x64 standalone binary
+        - Source / npm link
+        - Container
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, Node version if applicable, and connected client.
+      placeholder: Ubuntu 24.04 x64, standalone binary, Codex CLI
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest secret-free sequence that reproduces the problem.
+      placeholder: |
+        1. Run ...
+        2. Configure ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant output after removing tokens, private paths, and private code.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, private code, and sensitive memory content.
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure.
+          required: true
+

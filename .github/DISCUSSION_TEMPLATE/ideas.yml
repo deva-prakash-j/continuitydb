@@ -1,0 +1,24 @@
+name: Ideas
+description: Explore a developer problem or integration before opening an issue
+title: "Idea: "
+body:
+  - type: markdown
+    attributes:
+      value: Share an early idea before it becomes a scoped feature request.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What developer problem are you trying to solve?
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What does your current workflow look like?
+      description: Keep examples secret-free and avoid private repository content.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: What would a useful outcome look like?
