@@ -191,8 +191,8 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
     const beforeState = currentSnapshot(path);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     return beforeState.content === content
-      ? { path, changed: false, applied: false, backup: null, createdDirectories }
-      : { path, changed: true, applied: false, backup: null, createdDirectories };
+      ? { path, changed: false, applied: false, verified: true, backup: null, createdDirectories }
+      : { path, changed: true, applied: false, verified: false, backup: null, createdDirectories };
   }
 
   const lockPath = configurationLockPath(path);
@@ -201,7 +201,9 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
     const beforeState = currentSnapshot(path);
     if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
     const before = beforeState.content || "";
-    if (before === content) return { path, changed: false, applied: true, backup: null, createdDirectories };
+    if (before === content) {
+      return { path, changed: false, applied: true, verified: true, backup: null, createdDirectories };
+    }
     const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client);
     if (backupArtifacts && backupHome && resolve(backupHome) !== resolve(home)) {
       backupArtifacts.relocatedPath = join(home, relative(backupHome, backupArtifacts.path));
@@ -234,6 +236,7 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
       path,
       changed: true,
       applied: true,
+      verified: true,
       backup: backupArtifacts?.path || null,
       backupArtifacts,
       createdDirectories,
@@ -287,7 +290,13 @@ function restoreSnapshot(plan, result) {
 function publicResult(plan, result) {
   const { createdDirectories: _createdDirectories, backupArtifacts: _backupArtifacts, ...value } = result;
   if (result.backupArtifacts?.publicPath && value.backup) value.backup = result.backupArtifacts.publicPath;
-  return { client: plan.client, project_dir: plan.options.projectDir, ...value };
+  return {
+    client: plan.client,
+    project_dir: plan.options.projectDir,
+    kind: plan.kind,
+    owner: plan.owner,
+    ...value,
+  };
 }
 
 function envFor(client, options) {
@@ -387,7 +396,12 @@ function connectedJson(client, current, options) {
     value.$schema ||= "https://opencode.ai/config.json";
     managedJsonNamespace(value, "mcp", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   } else if (client === "copilot") {
-    managedJsonNamespace(value, "servers", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
+    const path = jsonTarget(client, options.projectDir);
+    const servers = managedJsonNamespace(value, "servers", path);
+    if (Object.hasOwn(servers, "continuitydb") && !isManagedCopilotServer(servers.continuitydb)) {
+      throw new Error("an unmanaged Copilot continuitydb server already exists; remove or rename it before connecting");
+    }
+    servers.continuitydb = connection(client, options);
   } else {
     managedJsonNamespace(value, "mcpServers", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   }
@@ -397,8 +411,36 @@ function connectedJson(client, current, options) {
 function disconnectedJson(client, current, path) {
   const value = structuredClone(current);
   const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
-  if (value[key] !== undefined) delete managedJsonNamespace(value, key, path).continuitydb;
+  if (value[key] !== undefined) {
+    const namespace = managedJsonNamespace(value, key, path);
+    if (client === "copilot" && Object.hasOwn(namespace, "continuitydb")
+      && !isManagedCopilotServer(namespace.continuitydb)) {
+      throw new Error("an unmanaged Copilot continuitydb server already exists; refusing to disconnect it");
+    }
+    delete namespace.continuitydb;
+  }
   return value;
+}
+
+function isManagedCopilotServer(value) {
+  if (!isPlainObject(value)) return false;
+  if (value.type === "stdio") {
+    return typeof value.command === "string"
+      && Array.isArray(value.args)
+      && value.args.length === 3
+      && value.args[0] === "mcp"
+      && value.args[1] === "--home"
+      && typeof value.args[2] === "string"
+      && isPlainObject(value.env)
+      && value.env.CONTINUITYDB_AGENT_ID === "copilot"
+      && typeof value.env.CONTINUITYDB_ALLOWED_PROJECTS === "string"
+      && value.env.CONTINUITYDB_ALLOWED_PROJECTS !== "default";
+  }
+  return value.type === "http"
+    && typeof value.url === "string"
+    && isPlainObject(value.headers)
+    && typeof value.headers.Authorization === "string"
+    && /^Bearer \$\{env:[A-Z][A-Z0-9_]{0,127}\}$/.test(value.headers.Authorization);
 }
 
 function connectorIdentity(projectDir, options) {
@@ -431,7 +473,7 @@ function normalizeOptions(options = {}, { identity = null } = {}) {
   };
 }
 
-function prepareAgentChange(client, rawOptions, action, identity = null) {
+function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
   if (!SUPPORTED_AGENTS.includes(client)) throw new Error(`unsupported agent: ${client}`);
   const options = normalizeOptions(rawOptions, { identity });
   let path;
@@ -451,14 +493,86 @@ function prepareAgentChange(client, rawOptions, action, identity = null) {
     path = jsonTarget(client, options.projectDir);
     if (action === "disconnect" && !existsSync(path)) {
       ensureSafeParents(options.projectDir, path, false);
-      return { client, action, options, path, content: "", original: snapshot(path), noOp: true };
+      return {
+        client, action, options, path, content: "", original: snapshot(path), noOp: true,
+        kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
+      };
     }
     const current = parseJson(path);
     const value = action === "connect" ? connectedJson(client, current, options) : disconnectedJson(client, current, path);
     content = `${JSON.stringify(value, null, 2)}\n`;
   }
   ensureSafeParents(options.projectDir, path, false);
-  return { client, action, options, path, content, original: snapshot(path) };
+  return {
+    client, action, options, path, content, original: snapshot(path),
+    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
+  };
+}
+
+function prepareDedicatedPolicyChange(client, rawOptions, action, identity) {
+  if (client !== "copilot") return null;
+  const options = normalizeOptions(rawOptions, { identity });
+  const path = join(options.projectDir, ".github", "copilot-instructions.md");
+  const current = readText(path);
+  const metadata = dedicatedPolicyMetadata(current, client);
+  if (action === "connect" && metadata && metadata.projectId !== identity.id) {
+    throw new Error(`ContinuityDB managed Copilot policy belongs to project ${metadata.projectId}, not ${identity.id}`);
+  }
+  let content;
+  let owner = "continuitydb-copilot-policy";
+  if (action === "connect") {
+    const descriptor = policyAssetDescriptors(client, {
+      projectDir: options.projectDir,
+      projectId: identity.id,
+      consumers: [client],
+    })[0];
+    owner = descriptor.owner;
+    content = mergeManagedText(current, {
+      startMarker: POLICY_START,
+      endMarker: POLICY_END,
+      body: descriptor.content,
+    });
+  } else {
+    content = removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+  }
+  ensureSafeParents(options.projectDir, path, false);
+  return {
+    client,
+    action,
+    options,
+    path,
+    content,
+    original: snapshot(path),
+    kind: "policy",
+    owner,
+    assetClients: [client],
+    noOp: action === "disconnect" && !existsSync(path),
+  };
+}
+
+function dedicatedPolicyMetadata(current, client) {
+  removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+  const start = current.indexOf(POLICY_START);
+  if (start === -1) return null;
+  const end = current.indexOf(POLICY_END, start) + POLICY_END.length;
+  const block = current.slice(start, end);
+  const firstLineEnd = block.indexOf("\n");
+  const firstLine = firstLineEnd === -1 ? block : block.slice(0, firstLineEnd);
+  if (firstLine !== `${POLICY_START} consumers: ${client}`) {
+    throw new Error(`invalid ContinuityDB managed ${client} policy metadata`);
+  }
+  const projectMatches = [...block.matchAll(/Project scope: `([^`]+)`\./g)];
+  if (projectMatches.length !== 1) {
+    throw new Error(`invalid ContinuityDB managed ${client} policy project scope`);
+  }
+  return { projectId: validateProjectId(projectMatches[0][1]) };
+}
+
+function prepareAgentChanges(client, rawOptions, action, identity = null) {
+  const plans = [prepareMcpAgentChange(client, rawOptions, action, identity)];
+  const policy = prepareDedicatedPolicyChange(client, rawOptions, action, identity);
+  if (policy) plans.push(policy);
+  return plans;
 }
 
 function sharedPolicyMetadata(current) {
@@ -491,8 +605,6 @@ function prepareSharedPolicyChange(clients, rawOptions, action, identity) {
   const path = join(options.projectDir, "AGENTS.md");
   const current = readText(path);
   const metadata = sharedPolicyMetadata(current);
-  if (action === "disconnect" && metadata === null) return null;
-
   if (action === "connect" && metadata && metadata.projectId !== identity.id) {
     throw new Error(`ContinuityDB managed policy belongs to project ${metadata.projectId}, not ${identity.id}`);
   }
@@ -521,13 +633,16 @@ function prepareSharedPolicyChange(clients, rawOptions, action, identity) {
   }
   ensureSafeParents(options.projectDir, path, false);
   return {
-    client: descriptor?.owner || "continuitydb-policy",
+    client: selected[0],
     action,
     options,
     path,
     content,
     original: snapshot(path),
-    internalPolicyAsset: true,
+    kind: "policy",
+    owner: descriptor?.owner || "continuitydb-policy",
+    assetClients: selected,
+    noOp: action === "disconnect" && metadata === null,
   };
 }
 
@@ -539,7 +654,9 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
   if (!plans.every((plan) => plan.options.apply === apply)) throw new Error("agent batch must use one apply mode");
   if (!apply) {
     return plans.map((plan) => plan.noOp
-      ? publicResult(plan, { path: plan.path, changed: false, applied: false, backup: null, createdDirectories: [] })
+      ? publicResult(plan, {
+        path: plan.path, changed: false, applied: false, verified: true, backup: null, createdDirectories: [],
+      })
       : publicResult(plan, atomicWrite(plan.path, plan.content, {
         root: plan.options.projectDir, home: plan.options.home, backupHome: plan.options.backupHome,
         client: plan.client, apply: false, expected: plan.original,
@@ -551,7 +668,12 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
   try {
     for (const plan of plans) {
       if (plan.noOp) {
-        committed.push({ plan, result: { path: plan.path, changed: false, applied: true, backup: null, createdDirectories: [] } });
+        committed.push({
+          plan,
+          result: {
+            path: plan.path, changed: false, applied: true, verified: true, backup: null, createdDirectories: [],
+          },
+        });
         continue;
       }
       const createdDirectories = ensureSafeParents(plan.options.projectDir, plan.path, true);
@@ -613,11 +735,39 @@ function batch(clients, rawOptions, action) {
   const identity = action === "connect" ? connectorIdentity(projectDir, rawOptions) : null;
   // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
   // path and rendered output must validate before the first client file changes.
-  const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action, identity));
+  const plans = unique.flatMap((client) => prepareAgentChanges(client, rawOptions, action, identity));
   const policyPlan = prepareSharedPolicyChange(unique, rawOptions, action, identity);
   if (policyPlan) plans.push(policyPlan);
   const results = applyAgentPlans(plans, { finalize: rawOptions._finalizeSetup });
-  return results.filter((_result, index) => !plans[index].internalPolicyAsset);
+  return unique.map((client) => {
+    const indexedAssets = plans
+      .map((plan, index) => ({ plan, result: results[index] }))
+      .filter(({ plan }) => plan.assetClients.includes(client));
+    const primary = indexedAssets.find(({ plan }) => plan.kind === "mcp")?.result;
+    const assets = indexedAssets.map(({ result }) => ({
+      path: result.path,
+      kind: result.kind,
+      owner: result.owner,
+      changed: result.changed,
+      applied: result.applied,
+      verified: result.verified,
+      backup: result.backup,
+    }));
+    const capabilities = client === "codex" || client === "copilot"
+      ? { recall_mode: "policy-led", capture_mode: "explicit-governed" }
+      : {};
+    return {
+      client,
+      project_dir: primary.project_dir,
+      path: primary.path,
+      changed: assets.some((asset) => asset.changed),
+      applied: assets.every((asset) => asset.applied),
+      verified: assets.every((asset) => asset.verified),
+      backup: primary.backup,
+      assets,
+      ...capabilities,
+    };
+  });
 }
 
 export function connectAgents(clients, rawOptions = {}) {

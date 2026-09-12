@@ -6,6 +6,13 @@ export const POLICY_END = "<!-- <<< continuitydb managed policy <<< -->";
 
 const POLICY_CLIENTS = new Set(["codex", "claude", "opencode", "cursor", "copilot"]);
 const SHARED_POLICY_MODES = Object.freeze({ codex: "policy-led", opencode: "plugin+policy" });
+const CLIENT_POLICY_ASSETS = Object.freeze({
+  copilot: {
+    relativePath: [".github", "copilot-instructions.md"],
+    recallMode: "policy-led",
+    owner: "continuitydb-copilot-policy",
+  },
+});
 
 function normalizedConsumers(consumers) {
   if (!Array.isArray(consumers) || consumers.length === 0) {
@@ -91,10 +98,24 @@ export function removeManagedText(current, { startMarker, endMarker }) {
 
 export function policyAssetDescriptors(client, options) {
   assertPolicyClient(client);
-  if (!(client in SHARED_POLICY_MODES)) return [];
+  const clientAsset = CLIENT_POLICY_ASSETS[client];
+  if (!clientAsset && !(client in SHARED_POLICY_MODES)) return [];
   const projectDir = resolve(options.projectDir);
   const projectId = validateProjectId(options.projectId);
   const consumers = normalizedConsumers(options.consumers || [client]);
+  if (clientAsset) {
+    return [{
+      path: join(projectDir, ...clientAsset.relativePath),
+      kind: "managed-text",
+      owner: clientAsset.owner,
+      content: renderContinuityPolicy({
+        client,
+        projectId,
+        recallMode: clientAsset.recallMode,
+        consumers,
+      }),
+    }];
+  }
   return [{
     path: join(projectDir, "AGENTS.md"),
     kind: "managed-text",

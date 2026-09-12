@@ -91,7 +91,7 @@ test("managed text parser rejects missing, duplicate, nested, and reversed marke
   }
 });
 
-test("policy descriptors target the shared AGENTS file only for Codex and OpenCode", () => {
+test("policy descriptors target shared and client-specific instruction files", () => {
   const projectDir = "/repo";
   const options = { projectDir, projectId: "billing-api", consumers: ["opencode", "codex"] };
   for (const [client, recallMode] of [["codex", "policy-led"], ["opencode", "plugin+policy"]]) {
@@ -102,7 +102,22 @@ test("policy descriptors target the shared AGENTS file only for Codex and OpenCo
       content: renderContinuityPolicy({ client, projectId: "billing-api", recallMode, consumers: ["opencode", "codex"] }),
     }]);
   }
-  for (const client of ["claude", "cursor", "copilot"]) {
+  assert.deepEqual(policyAssetDescriptors("copilot", {
+    projectDir,
+    projectId: "billing-api",
+    consumers: ["copilot"],
+  }), [{
+    path: join(projectDir, ".github", "copilot-instructions.md"),
+    kind: "managed-text",
+    owner: "continuitydb-copilot-policy",
+    content: renderContinuityPolicy({
+      client: "copilot",
+      projectId: "billing-api",
+      recallMode: "policy-led",
+      consumers: ["copilot"],
+    }),
+  }]);
+  for (const client of ["claude", "cursor"]) {
     assert.deepEqual(policyAssetDescriptors(client, options), []);
   }
 });

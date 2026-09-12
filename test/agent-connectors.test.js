@@ -199,6 +199,175 @@ test("Codex and OpenCode share reference-aware AGENTS policy ownership", () => {
   }
 });
 
+test("Codex and Copilot install complete policy-led adapters with truthful asset results", () => {
+  const value = fixture();
+  const agents = join(value.project, "AGENTS.md");
+  const copilotInstructions = join(value.project, ".github", "copilot-instructions.md");
+  const userAgents = "# Repository agent rules\n\nKeep this byte-for-byte.  \n";
+  const userCopilot = "# Existing Copilot rules\n\nKeep this too.  \n";
+  try {
+    writeFileSync(agents, userAgents);
+    mkdirSync(join(value.project, ".github"));
+    writeFileSync(copilotInstructions, userCopilot);
+
+    const preview = connectAgents(["codex", "copilot"], options(value, false));
+    assert.deepEqual(preview.map((item) => item.client), ["codex", "copilot"]);
+    for (const result of preview) {
+      assert.equal(result.recall_mode, "policy-led");
+      assert.equal(result.capture_mode, "explicit-governed");
+      assert.equal(result.applied, false);
+      assert.equal(result.verified, false);
+      assert.equal(result.assets.length, 2);
+      assert.equal(result.assets.every((asset) => asset.applied === false), true);
+    }
+    assert.equal(readFileSync(agents, "utf8"), userAgents);
+    assert.equal(readFileSync(copilotInstructions, "utf8"), userCopilot);
+
+    const applied = connectAgents(["codex", "copilot"], options(value));
+    for (const result of applied) {
+      assert.equal(result.applied, true);
+      assert.equal(result.verified, true);
+      assert.equal(result.assets.length, 2);
+      assert.equal(result.assets.every((asset) => asset.applied && asset.verified), true);
+    }
+    assert.deepEqual(applied[0].assets.map((asset) => asset.path), [
+      join(value.project, ".codex", "config.toml"),
+      agents,
+    ]);
+    assert.deepEqual(applied[1].assets.map((asset) => asset.path), [
+      join(value.project, ".vscode", "mcp.json"),
+      copilotInstructions,
+    ]);
+    assert.match(readFileSync(agents, "utf8"), /memory_context_pack/);
+    assert.match(readFileSync(copilotInstructions, "utf8"), /explicitly asks/i);
+    assert.equal(readFileSync(agents, "utf8").startsWith(userAgents), true);
+    assert.equal(readFileSync(copilotInstructions, "utf8").startsWith(userCopilot), true);
+
+    const beforeRepeat = {
+      agents: readFileSync(agents, "utf8"),
+      copilot: readFileSync(copilotInstructions, "utf8"),
+    };
+    const repeated = connectAgents(["codex", "copilot"], options(value));
+    assert.equal(repeated.every((item) => item.changed === false && item.verified), true);
+    assert.equal(readFileSync(agents, "utf8"), beforeRepeat.agents);
+    assert.equal(readFileSync(copilotInstructions, "utf8"), beforeRepeat.copilot);
+
+    const disconnected = [
+      disconnectAgent("codex", options(value)),
+      disconnectAgent("copilot", options(value)),
+    ];
+    assert.equal(disconnected.every((item) => item.applied && item.verified), true);
+    assert.equal(readFileSync(agents, "utf8"), userAgents);
+    assert.equal(readFileSync(copilotInstructions, "utf8"), userCopilot);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Copilot policy markers and unmanaged MCP conflicts fail closed before any adapter write", () => {
+  const malformedPolicies = [
+    ["<!-- >>> continuitydb managed policy >>>\nmissing end\n", /invalid ContinuityDB managed text block/],
+    ["<!-- <<< continuitydb managed policy <<< -->\n", /invalid ContinuityDB managed text block/],
+    [
+      "<!-- >>> continuitydb managed policy >>>\n<!-- >>> continuitydb managed policy >>>\n<!-- <<< continuitydb managed policy <<< -->",
+      /invalid ContinuityDB managed text block/,
+    ],
+    [
+      "<!-- >>> continuitydb managed policy >>> consumers: codex\nProject scope: `service-a`.\n<!-- <<< continuitydb managed policy <<< -->",
+      /invalid ContinuityDB managed copilot policy metadata/,
+    ],
+  ];
+  for (const [original, expected] of malformedPolicies) {
+    const value = fixture();
+    const instructions = join(value.project, ".github", "copilot-instructions.md");
+    try {
+      mkdirSync(join(value.project, ".github"));
+      writeFileSync(instructions, original);
+      assert.throws(() => connectAgent("copilot", options(value)), expected);
+      assert.equal(readFileSync(instructions, "utf8"), original);
+      assert.equal(existsSync(join(value.project, ".vscode", "mcp.json")), false);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  const value = fixture();
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  try {
+    mkdirSync(join(value.project, ".vscode"));
+    const original = '{"servers":{"continuitydb":{"command":"user-owned"}},"keep":true}\n';
+    writeFileSync(mcp, original);
+    assert.throws(() => connectAgent("copilot", options(value)), /unmanaged Copilot continuitydb server/);
+    assert.equal(readFileSync(mcp, "utf8"), original);
+    assert.equal(existsSync(join(value.project, ".github", "copilot-instructions.md")), false);
+    assert.throws(() => disconnectAgent("copilot", options(value)), /unmanaged Copilot continuitydb server/);
+    assert.equal(readFileSync(mcp, "utf8"), original);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Copilot adapter rejects cross-project policy replacement and rolls back MCP on policy races", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  const instructions = join(value.project, ".github", "copilot-instructions.md");
+  try {
+    connectAgent("copilot", options(value));
+    const originalMcp = readFileSync(mcp, "utf8");
+    const originalInstructions = readFileSync(instructions, "utf8");
+    assert.throws(
+      () => connectAgent("copilot", { ...options(value), projectId: "other-service" }),
+      /managed Copilot policy belongs to project service-a, not other-service/,
+    );
+    assert.equal(readFileSync(mcp, "utf8"), originalMcp);
+    assert.equal(readFileSync(instructions, "utf8"), originalInstructions);
+
+    process.env.NODE_ENV = "test";
+    const external = "# Concurrent Copilot edit\n";
+    writeFileSync(
+      instructions,
+      originalInstructions.replace("compact durable claim", "drifted compact durable claim"),
+    );
+    assert.throws(() => connectAgent("copilot", {
+      ...options(value),
+      binary: "/opt/continuitydb/bin/continuitydb-v2",
+      _testBeforeReplace: ({ path }) => {
+        if (path === instructions) writeFileSync(instructions, external, { mode: 0o600 });
+      },
+    }), /configuration changed before atomic replacement/);
+    assert.equal(readFileSync(mcp, "utf8"), originalMcp);
+    assert.equal(readFileSync(instructions, "utf8"), external);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Copilot policy target and parent symlinks fail closed", () => {
+  for (const symlinkParent of [false, true]) {
+    const value = fixture();
+    const outside = join(value.root, "outside");
+    const instructions = join(value.project, ".github", "copilot-instructions.md");
+    try {
+      mkdirSync(outside);
+      if (symlinkParent) {
+        symlinkSync(outside, join(value.project, ".github"));
+      } else {
+        mkdirSync(join(value.project, ".github"));
+        const outsideFile = join(outside, "instructions.md");
+        writeFileSync(outsideFile, "outside\n");
+        symlinkSync(outsideFile, instructions);
+      }
+      assert.throws(() => connectAgent("copilot", options(value)), /(regular file, not a symlink|real directory)/);
+      assert.equal(existsSync(join(value.project, ".vscode", "mcp.json")), false);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("shared policy preview is write-free and malformed markers fail before MCP mutation", () => {
   const value = fixture();
   const agents = join(value.project, "AGENTS.md");
