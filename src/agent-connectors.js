@@ -743,7 +743,10 @@ function prepareCopilotChanges(rawOptions, action, identity) {
   }
 
   let mcpContent;
-  let ownership = metadata?.ownership || null;
+  // Policy metadata describes ownership of the entry that existed when it was
+  // written. If that entry is now absent, the current document may have been
+  // deleted and recreated by the user, so its topology must be derived anew.
+  let ownership = existingServer ? metadata?.ownership || null : null;
   let deleteTarget = false;
   let policyContent;
   if (action === "connect") {

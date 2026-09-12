@@ -380,6 +380,52 @@ test("Copilot JSON connect and disconnect are byte-reversible and remove connect
   }
 });
 
+test("Copilot reconnect recomputes stale ownership when the managed server is absent", () => {
+  const cases = [
+    {
+      name: "recreated user document",
+      current: "{  }\r\n",
+      ownership: /document=existing; namespace=created/,
+    },
+    {
+      name: "still missing document",
+      current: null,
+      ownership: /document=missing; namespace=created/,
+    },
+    {
+      name: "user-created namespace",
+      current: '{\r\n  "servers": {\r\n    "other": { "command": "user" }\r\n  }\r\n}\r\n',
+      ownership: /document=existing; namespace=existing/,
+    },
+    {
+      name: "pre-existing empty namespace",
+      current: '{\r\n  "servers" : {  }\r\n}\r\n',
+      ownership: /document=existing; namespace=existing/,
+    },
+  ];
+  for (const item of cases) {
+    const value = fixture();
+    const mcp = join(value.project, ".vscode", "mcp.json");
+    const policy = join(value.project, ".github", "copilot-instructions.md");
+    try {
+      connectAgent("copilot", options(value));
+      rmSync(mcp);
+      if (item.current !== null) writeFileSync(mcp, item.current);
+
+      connectAgent("copilot", options(value));
+      assert.match(readFileSync(policy, "utf8"), item.ownership, item.name);
+      disconnectAgent("copilot", options(value));
+      if (item.current === null) {
+        assert.equal(existsSync(mcp), false, item.name);
+      } else {
+        assert.equal(readFileSync(mcp, "utf8"), item.current, item.name);
+      }
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Copilot adapter rejects cross-project policy replacement and rolls back MCP on policy races", () => {
   const value = fixture();
   const previousNodeEnv = process.env.NODE_ENV;
