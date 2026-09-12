@@ -9,6 +9,7 @@ import {
   connectionStatus,
   detectAgents,
   disconnectAgent,
+  disconnectAgents,
   setupAgentSummary,
   SUPPORTED_AGENTS,
 } from "../src/agent-connectors.js";
@@ -1147,6 +1148,92 @@ test("agent setup summary separates selected preview plans from applied connecti
     assert.deepEqual(applied.selected, ["opencode"]);
     assert.deepEqual(applied.planned, []);
     assert.deepEqual(applied.connected, ["opencode"]);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("MCP-only mode installs, verifies, and removes only transport assets", () => {
+  const value = fixture();
+  try {
+    const originals = seedClientFiles(value.project);
+    const before = contents(originals);
+    const applied = connectAgents(SUPPORTED_AGENTS, { ...options(value), mcpOnly: true });
+    assert.equal(applied.every((item) => item.recall_mode === "mcp-only"), true);
+    assert.equal(applied.every((item) => item.capture_mode === "explicit-governed"), true);
+    assert.equal(applied.every((item) => item.assets.length === 1 && item.assets[0].kind === "mcp"), true);
+    assert.equal(applied.every((item) => item.verified), true);
+    assert.equal(existsSync(join(value.project, "AGENTS.md")), false);
+    assert.equal(existsSync(join(value.project, "CLAUDE.md")), false);
+    assert.equal(existsSync(join(value.project, ".claude", "settings.json")), false);
+    assert.equal(existsSync(join(value.project, ".opencode", "plugins", "continuitydb.js")), false);
+    assert.equal(existsSync(join(value.project, ".cursor", "hooks.json")), false);
+    assert.equal(existsSync(join(value.project, ".cursor", "rules", "continuitydb.mdc")), false);
+    assert.equal(existsSync(join(value.project, ".github", "copilot-instructions.md")), false);
+
+    const status = connectionStatus(options(value));
+    assert.equal(status.every((item) => item.connected && item.verified && !item.drifted), true);
+    assert.equal(status.every((item) => item.recall_mode === "mcp-only"), true);
+    assert.equal(status.every((item) => item.assets.length === 1 && item.assets[0].verified), true);
+
+    const claudeMcpOnly = originals.claude;
+    const healthyClaudeMcpOnly = readFileSync(claudeMcpOnly, "utf8");
+    writeFileSync(claudeMcpOnly, `${healthyClaudeMcpOnly} `);
+    const drifted = connectionStatus(options(value)).find((item) => item.client === "claude");
+    assert.equal(drifted.connected, true);
+    assert.equal(drifted.drifted, true);
+    assert.equal(drifted.assets[0].changed, true);
+    assert.throws(() => disconnectAgents(SUPPORTED_AGENTS, options(value)), /document ownership fingerprint mismatch/);
+    assert.equal(readFileSync(claudeMcpOnly, "utf8"), `${healthyClaudeMcpOnly} `);
+    writeFileSync(claudeMcpOnly, healthyClaudeMcpOnly);
+
+    const disconnected = disconnectAgents(SUPPORTED_AGENTS, options(value));
+    assert.equal(disconnected.every((item) => item.applied && item.verified), true);
+    assert.deepEqual(contents(originals), before);
+    const repeated = disconnectAgents(SUPPORTED_AGENTS, options(value));
+    assert.equal(repeated.every((item) => !item.changed), true);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connection status independently verifies every complete adapter asset without writing", () => {
+  const value = fixture();
+  try {
+    connectAgents(SUPPORTED_AGENTS, options(value));
+    const before = contents(clientPaths(value.project));
+    const healthy = connectionStatus(options(value));
+    assert.equal(healthy.every((item) => item.connected && item.verified && !item.drifted), true);
+    assert.equal(healthy.every((item) => item.assets.length >= 2 && item.assets.every((asset) => asset.verified)), true);
+    assert.deepEqual(contents(clientPaths(value.project)), before, "status must be read-only");
+
+    const claudeMcp = join(value.project, ".mcp.json");
+    const healthyClaudeMcp = readFileSync(claudeMcp, "utf8");
+    rmSync(claudeMcp);
+    const missingMcp = connectionStatus(options(value)).find((item) => item.client === "claude");
+    assert.equal(missingMcp.connected, false);
+    assert.equal(missingMcp.drifted, true);
+    assert.equal(missingMcp.assets.find((asset) => asset.path === claudeMcp).missing, true);
+    assert.equal(existsSync(claudeMcp), false, "status must not recreate a missing transport");
+    writeFileSync(claudeMcp, healthyClaudeMcp, { mode: 0o600 });
+
+    const claudePolicy = join(value.project, "CLAUDE.md");
+    writeFileSync(claudePolicy, readFileSync(claudePolicy, "utf8")
+      .replace("compact durable claim", "drifted durable claim"));
+    const plugin = join(value.project, ".opencode", "plugins", "continuitydb.js");
+    rmSync(plugin);
+    const drifted = connectionStatus(options(value));
+    const claude = drifted.find((item) => item.client === "claude");
+    const opencode = drifted.find((item) => item.client === "opencode");
+    assert.equal(claude.connected, true);
+    assert.equal(claude.verified, false);
+    assert.equal(claude.drifted, true);
+    assert.equal(claude.assets.find((asset) => asset.path === claudePolicy).changed, true);
+    assert.equal(opencode.connected, true);
+    assert.equal(opencode.verified, false);
+    assert.equal(opencode.drifted, true);
+    assert.equal(opencode.assets.find((asset) => asset.path === plugin).missing, true);
+    assert.equal(existsSync(plugin), false, "status must not repair missing assets");
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }

@@ -14,10 +14,10 @@ const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
   || join("dist", `continuitydb-${process.platform}-${process.arch}${extension}`));
 if (process.platform !== "win32") chmodSync(binary, 0o755);
 const root = mkdtempSync(join(tmpdir(), "continuitydb-binary-smoke-"));
-const project = join(root, "project");
+const project = join(root, "generic-repo");
 const home = join(root, "vault");
 const prefix = join(root, "prefix");
-mkdirSync(project);
+mkdirSync(join(project, ".git"), { recursive: true });
 
 function run(args) {
   const result = spawnSync(binary, args, { encoding: "utf8", timeout: 30_000 });
@@ -134,13 +134,54 @@ async function proveHttpService(expectedVersion) {
 try {
   const version = run(["version"]);
   assert.equal(version.standalone, true);
-  const preview = run(["setup", "--home", home, "--project-dir", project, "--project", "binary-smoke", "--agents", "all"]);
+  const userAgents = "# User-owned agent instructions\n\nPreserve this byte-for-byte.  \n";
+  writeFileSync(join(project, "AGENTS.md"), userAgents);
+  const preview = run(["setup", "--home", home, "--project-dir", project, "--agents", "all"]);
   assert.equal(preview.applied, false);
-  const setup = run(["setup", "--home", home, "--project-dir", project, "--project", "binary-smoke", "--agents", "all", "--apply"]);
+  const setup = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply"]);
   assert.equal(setup.connections.length, 5);
   assert.equal(setup.connections.every((item) => item.applied), true);
+  assert.equal(setup.connections.every((item) => item.verified && item.assets.length >= 2), true);
+  const expectedAssets = [
+    ".codex/config.toml", "AGENTS.md", ".mcp.json", ".claude/settings.json", "CLAUDE.md",
+    "opencode.json", ".opencode/plugins/continuitydb.js", ".cursor/mcp.json", ".cursor/hooks.json",
+    ".cursor/rules/continuitydb.mdc", ".vscode/mcp.json", ".github/copilot-instructions.md",
+  ];
+  for (const path of expectedAssets) {
+    const absolute = join(project, path);
+    assert.equal(existsSync(absolute), true, `missing complete adapter asset: ${path}`);
+    assert.doesNotMatch(readFileSync(absolute, "utf8"), /(?:project scope: `default`|ALLOWED_PROJECTS\s*[=:]\s*["']default)/i);
+  }
   assert.equal(run(["doctor", "--home", home]).ok, true);
-  assert.equal(run(["agents", "status", "--home", home, "--project-dir", project]).agents.filter((item) => item.connected).length, 5);
+  const healthyStatus = run(["agents", "status", "--home", home, "--project-dir", project]);
+  assert.equal(healthyStatus.agents.filter((item) => item.connected && item.verified && !item.drifted).length, 5);
+
+  const claudePolicy = join(project, "CLAUDE.md");
+  const healthyClaudePolicy = readFileSync(claudePolicy, "utf8");
+  writeFileSync(claudePolicy, healthyClaudePolicy.replace("compact durable claim", "drifted durable claim"));
+  const driftStatus = run(["agents", "status", "--home", home, "--project-dir", project]);
+  const driftedClaude = driftStatus.agents.find((item) => item.client === "claude");
+  assert.equal(driftedClaude.connected, true);
+  assert.equal(driftedClaude.drifted, true);
+  assert.equal(driftedClaude.assets.find((item) => item.path === claudePolicy).changed, true);
+  writeFileSync(claudePolicy, healthyClaudePolicy);
+
+  const disconnected = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
+  assert.equal(disconnected.results.every((item) => item.applied && item.verified), true);
+  assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
+  const disconnectRetry = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
+  assert.equal(disconnectRetry.results.every((item) => !item.changed), true);
+
+  const mcpOnly = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--mcp-only", "--apply"]);
+  assert.equal(mcpOnly.connections.every((item) => item.recall_mode === "mcp-only" && item.assets.length === 1), true);
+  assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
+  const mcpOnlyStatus = run(["agents", "status", "--home", home, "--project-dir", project]);
+  assert.equal(mcpOnlyStatus.agents.filter((item) => item.connected && item.verified && item.recall_mode === "mcp-only").length, 5);
+  const mcpOnlyDisconnected = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--mcp-only", "--apply"]);
+  assert.equal(mcpOnlyDisconnected.results.every((item) => item.applied && item.verified), true);
+  const mcpOnlyRetry = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--mcp-only", "--apply"]);
+  assert.equal(mcpOnlyRetry.results.every((item) => !item.changed), true);
+  assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
   const installation = run(["install", "--prefix", prefix, "--apply"]);
   assert.equal(installation.installed, true);
   const installedResult = spawnSync(installation.launcher, ["version"], { encoding: "utf8", timeout: 30_000 });
@@ -197,7 +238,7 @@ try {
       CONTINUITYDB_PRINCIPAL_ID: "binary-smoke-agent",
       CONTINUITYDB_OWNER_ID: "binary-smoke-owner",
       CONTINUITYDB_AGENT_ID: "binary-smoke",
-      CONTINUITYDB_ALLOWED_PROJECTS: "project",
+      CONTINUITYDB_ALLOWED_PROJECTS: "generic-repo",
       CONTINUITYDB_ALLOWED_SENSITIVITIES: "public,private",
     },
   });
@@ -209,12 +250,12 @@ try {
     assert.equal(tools.tools.length, 6);
     const capture = await client.callTool({
       name: "memory_capture",
-      arguments: { project_id: "project", memory_kind: "working", body: "StandaloneBinaryMarker is active." },
+      arguments: { project_id: "generic-repo", memory_kind: "working", body: "StandaloneBinaryMarker is active." },
     });
     assert.equal(capture.structuredContent.disposition, "active");
     const search = await client.callTool({
       name: "memory_search",
-      arguments: { project_id: "project", query: "StandaloneBinaryMarker" },
+      arguments: { project_id: "generic-repo", query: "StandaloneBinaryMarker" },
     });
     assert.equal(search.structuredContent.results.length, 1);
   } finally {
@@ -226,7 +267,7 @@ try {
     version: version.version,
     platform: version.platform,
     arch: version.arch,
-    checks: ["self-install", "setup", "doctor", "five-agent-config", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
+    checks: ["self-install", "setup", "five-complete-adapters", "status-drift", "mcp-only", "disconnect-retry", "doctor", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
   }, null, 2)}\n`);
 } finally {
   rmSync(root, { recursive: true, force: true });

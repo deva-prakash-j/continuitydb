@@ -174,6 +174,109 @@ test("CLI setup previews and applies all project agent connections idempotently"
   }
 });
 
+test("CLI setup and connect expose truthful complete and MCP-only integration controls", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-agent-controls-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const bin = join(root, "bin");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(bin);
+    writeFileSync(join(bin, "claude"), "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+    const environment = { ...process.env, PATH: bin };
+    const preview = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project,
+      "--agents", "detected", "--mcp-only",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(preview.status, 0, preview.stderr);
+    const previewValue = JSON.parse(preview.stdout);
+    assert.equal(previewValue.agent_setup.capture_mode, "explicit-governed");
+    assert.equal(previewValue.agent_setup.mcp_only, true);
+    assert.equal(previewValue.connections.length, 1);
+    assert.equal(previewValue.connections[0].client, "claude");
+    assert.equal(previewValue.connections[0].selected, true);
+    assert.equal(previewValue.connections[0].planned, true);
+    assert.equal(previewValue.connections[0].applied, false);
+    assert.equal(previewValue.connections[0].verified, false);
+    assert.equal(previewValue.connections[0].detected, true);
+    assert.equal(previewValue.connections[0].detected_executable, join(bin, "claude"));
+    assert.equal(previewValue.connections[0].recall_mode, "mcp-only");
+    assert.equal(previewValue.connections[0].assets.length, 1);
+    assert.equal(existsSync(join(project, ".mcp.json")), false);
+
+    const registration = spawnSync(process.execPath, [
+      cli, "projects", "add", "--home", home, "--project-dir", project,
+      "--project", "generic-repo", "--apply",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(registration.status, 0, registration.stderr);
+
+    const applied = spawnSync(process.execPath, [
+      cli, "agents", "connect", "claude", "--home", home, "--project-dir", project,
+      "--project", "generic-repo", "--mcp-only", "--apply",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(applied.status, 0, applied.stderr);
+    const result = JSON.parse(applied.stdout).results[0];
+    assert.equal(result.selected, true);
+    assert.equal(result.planned, false);
+    assert.equal(result.applied, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.detected, true);
+    assert.equal(result.recall_mode, "mcp-only");
+    assert.match(result.limitations.join("\n"), /does not install automatic recall/i);
+    assert.equal(existsSync(join(project, "CLAUDE.md")), false);
+    assert.equal(existsSync(join(project, ".claude", "settings.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI agents connect refuses an unregistered project before writing", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-unregistered-agent-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const result = spawnSync(process.execPath, [
+      cli, "agents", "connect", "codex", "--home", home, "--project-dir", project, "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /project generic-repo is not registered/i);
+    assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI agents status reports per-asset drift without repairing it", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-status-drift-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const applied = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    const claudePolicy = join(project, "CLAUDE.md");
+    writeFileSync(claudePolicy, "drifted\n");
+    const status = spawnSync(process.execPath, [
+      cli, "agents", "status", "--home", home, "--project-dir", project,
+    ], { encoding: "utf8" });
+    assert.equal(status.status, 0, status.stderr);
+    const claude = JSON.parse(status.stdout).agents.find((item) => item.client === "claude");
+    assert.equal(claude.connected, true);
+    assert.equal(claude.verified, false);
+    assert.equal(claude.drifted, true);
+    assert.equal(claude.assets.find((asset) => asset.path === claudePolicy).changed, true);
+    assert.equal(readFileSync(claudePolicy, "utf8"), "drifted\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI setup reports a filesystem-detected OpenCode-only project connection", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-detected-summary-"));
   const project = join(root, "billing-api");

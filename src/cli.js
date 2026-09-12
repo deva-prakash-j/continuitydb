@@ -78,14 +78,14 @@ function usage() {
 Usage:
   continuitydb version
   continuitydb install [--prefix PATH] --apply
-  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--project ID] [--apply]
+  continuitydb setup [--agents detected|all|A,B] [--project-dir PATH] [--project ID] [--mcp-only] [--apply]
   continuitydb init [--home PATH]
   continuitydb doctor [--home PATH]
   continuitydb run [--home PATH] [--host HOST] [--port PORT] [--review-ui]
   continuitydb agents detect
   continuitydb agents status [--project-dir PATH]
-  continuitydb agents connect AGENT|all [--project-dir PATH] [--project ID] [--transport stdio|http] [--url URL] --apply
-  continuitydb agents disconnect AGENT|all [--project-dir PATH] --apply
+  continuitydb agents connect AGENT|all [--project-dir PATH] [--project ID] [--transport stdio|http] [--url URL] [--mcp-only] --apply
+  continuitydb agents disconnect AGENT|all [--project-dir PATH] [--mcp-only] --apply
   continuitydb projects list [--home PATH]
   continuitydb projects add --project-dir PATH [--project ID] [--home PATH] [--apply]
   continuitydb mcp [--home PATH]
@@ -154,7 +154,22 @@ function agentOptions() {
     url: flags.url,
     tokenEnv: flags.token_env,
     apply: Boolean(flags.apply),
+    mcpOnly: Boolean(flags.mcp_only),
   };
+}
+
+function withDetection(connections, detectedAgents) {
+  const detection = new Map(detectedAgents.map((item) => [item.client, item]));
+  return connections.map((item) => {
+    const found = detection.get(item.client);
+    return {
+      ...item,
+      selected: true,
+      planned: item.applied !== true,
+      detected: Boolean(found?.installed),
+      detected_executable: found?.executable || null,
+    };
+  });
 }
 
 function assertSetupHome(path) {
@@ -514,7 +529,10 @@ try {
     const previewRegistration = registerProject(home, identity, { apply: false });
     // Setup must fail without touching the global vault when any client
     // configuration cannot be parsed or safely rendered.
-    const previewConnections = connectAgents(selected, { ...connectionOptions, apply: false });
+    const previewConnections = withDetection(
+      connectAgents(selected, { ...connectionOptions, apply: false }),
+      detectedAgents,
+    );
     const configPath = join(home, "config.json");
     if (!connectionOptions.apply) {
       output({
@@ -528,6 +546,7 @@ try {
         configuration_scope: "project",
         detected_agents: detectedAgents,
         connections: previewConnections,
+        agent_setup: { capture_mode: "explicit-governed", mcp_only: connectionOptions.mcpOnly },
         registration: previewRegistration,
         embeddings: flags.semantic ? { planned: true, provider: "local" } : null,
         applied: false,
@@ -550,11 +569,11 @@ try {
       // write. The finalizer executes while all connector locks remain held;
       // any vault promotion error therefore enters the connector batch's
       // existing reverse rollback path.
-      const connections = connectAgents(selected, {
+      const connections = withDetection(connectAgents(selected, {
         ...connectionOptions,
         backupHome: prepared.existed ? home : prepared.staging,
         _finalizeSetup: () => promotePreparedSetup(prepared),
-      });
+      }), detectedAgents);
       output({
         setup: true,
         home,
@@ -565,6 +584,7 @@ try {
         configuration_scope: "project",
         detected_agents: detectedAgents,
         connections,
+        agent_setup: { capture_mode: "explicit-governed", mcp_only: connectionOptions.mcpOnly },
         registration: prepared.registration,
         embeddings: prepared.embeddings,
         applied: Boolean(flags.apply),
@@ -592,11 +612,31 @@ try {
   } else if (command === "agents") {
     const action = positional.shift() || "status";
     if (action === "detect") output({ agents: detectAgents() });
-    else if (action === "status") output({ agents: connectionStatus(agentOptions()) });
+    else if (action === "status") {
+      const detectedAgents = detectAgents();
+      output({ agents: connectionStatus(agentOptions()).map((item) => {
+        const found = detectedAgents.find((candidate) => candidate.client === item.client);
+        return { ...item, detected: Boolean(found?.installed), detected_executable: found?.executable || null };
+      }) });
+    }
     else if (action === "connect" || action === "disconnect") {
       const selected = agentSelection(positional.shift() || flags.agents || "detected");
       const operation = action === "connect" ? connectAgents : disconnectAgents;
-      output({ action, applied: Boolean(flags.apply), results: operation(selected, agentOptions()) });
+      const detectedAgents = detectAgents();
+      if (action === "connect") {
+        const projectDir = resolve(flags.project_dir || process.cwd());
+        const identity = resolveProjectIdentity({ projectDir, explicitProject: flags.project });
+        const registered = listRegisteredProjects(home).find((project) => project.id === identity.id);
+        if (!registered) throw new Error(`project ${identity.id} is not registered; run continuitydb projects add first`);
+        if (resolve(registered.root) !== resolve(identity.root)) {
+          throw new Error(`project ${identity.id} is registered at ${registered.root}, not ${identity.root}`);
+        }
+      }
+      output({
+        action,
+        applied: Boolean(flags.apply),
+        results: withDetection(operation(selected, agentOptions()), detectedAgents),
+      });
     } else throw new Error(`unknown agents action: ${action}`);
   } else if (command === "hook") {
     const { runLifecycleHook } = await import("./lifecycle-hook.js");

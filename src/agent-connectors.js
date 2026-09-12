@@ -38,6 +38,9 @@ const CODEX_START = "# >>> continuitydb managed configuration >>>";
 const CODEX_END = "# <<< continuitydb managed configuration <<<";
 const OPENCODE_PLUGIN_REFERENCE = "./.opencode/plugins/continuitydb.js";
 const OPENCODE_OWNERSHIP_PREFIX = "// continuitydb managed opencode ownership: ";
+const MCP_ONLY_OWNERSHIP_ENV = "CONTINUITYDB_MCP_ONLY_OWNERSHIP";
+const MCP_ONLY_OWNERSHIP_HEADER = "X-ContinuityDB-MCP-Only-Ownership";
+const MCP_ONLY_OWNERSHIP_PLACEHOLDER = "__CONTINUITYDB_MCP_ONLY_OWNERSHIP__";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -433,9 +436,26 @@ function connection(client, options) {
   return { command, args, env };
 }
 
-function codexBlock(options) {
+function codexBlock(options, topology) {
   const value = connection("codex", options);
-  const lines = [CODEX_START, "[mcp_servers.continuitydb]"];
+  const ownedEntry = {
+    ...(options.transport === "http"
+      ? { url: value.url, bearer_token_env_var: value.bearer_token_env_var }
+      : { command: value.command, args: value.args }),
+    required: true,
+    enabled_tools: ["memory_search", "memory_context_pack", "memory_capture", "memory_feedback", "handoff_checkpoint", "handoff_latest"],
+    default_tools_approval_mode: "writes",
+    startup_timeout_sec: 10,
+    tool_timeout_sec: 30,
+    ...(options.transport === "stdio" ? { env: value.env } : {}),
+  };
+  const lines = [
+    CODEX_START,
+    `# continuitydb managed original: ${encodeMcpOnlyOwnership(topology)}`,
+    `# continuitydb managed entry sha256: ${entryFingerprint(ownedEntry)}`,
+  ];
+  if (options.mcpOnly) lines.push("# continuitydb adapter mode: mcp-only");
+  lines.push("[mcp_servers.continuitydb]");
   if (options.transport === "http") {
     lines.push(`url = ${JSON.stringify(value.url)}`);
     lines.push(`bearer_token_env_var = ${JSON.stringify(value.bearer_token_env_var)}`);
@@ -463,7 +483,7 @@ function replaceManagedToml(text, block, path) {
   if (/^\s*\[mcp_servers\.continuitydb(?:\]|\.)/m.test(unmanaged)) {
     throw new Error("an unmanaged Codex continuitydb server already exists; remove or rename it before connecting");
   }
-  const output = `${unmanaged.trimEnd()}${unmanaged.trim() ? "\n\n" : ""}${block}`;
+  const output = `${unmanaged}${unmanaged && !unmanaged.endsWith("\n") ? "\n" : ""}${block}`;
   validateToml(output, path);
   return output;
 }
@@ -905,6 +925,167 @@ function normalizeOptions(options = {}, { identity = null } = {}) {
     transport: options.transport || "stdio",
     tokenEnv,
     apply: Boolean(options.apply),
+    mcpOnly: Boolean(options.mcpOnly),
+  };
+}
+
+function encodeMcpOnlyOwnership(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function decodeCodexTopology(value) {
+  let topology;
+  try { topology = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
+  catch { throw new Error("invalid ContinuityDB managed Codex original metadata"); }
+  if (!topology || !["missing", "empty", "existing"].includes(topology.state)
+    || (topology.state === "missing" ? topology.sha256 !== null : !/^[a-f0-9]{64}$/.test(topology.sha256))) {
+    throw new Error("invalid ContinuityDB managed Codex original metadata");
+  }
+  return topology;
+}
+
+function decodeMcpOnlyOwnership(value) {
+  let metadata;
+  try { metadata = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
+  catch { throw new Error("invalid ContinuityDB MCP-only ownership metadata"); }
+  if (metadata?.version !== 1 || metadata.mode !== "mcp-only"
+    || validateProjectId(metadata.projectId) !== metadata.projectId
+    || !metadata.original || !["missing", "empty", "existing"].includes(metadata.original.state)
+    || (metadata.original.state === "missing"
+      ? metadata.original.sha256 !== null
+      : !/^[a-f0-9]{64}$/.test(metadata.original.sha256))
+    || !/^[a-f0-9]{64}$/.test(metadata.entrySha256)
+    || !/^[a-f0-9]{64}$/.test(metadata.generatedSha256)) {
+    throw new Error("invalid ContinuityDB MCP-only ownership metadata");
+  }
+  return metadata;
+}
+
+function mcpOnlyOwnershipValue(server) {
+  return server?.env?.[MCP_ONLY_OWNERSHIP_ENV]
+    || server?.environment?.[MCP_ONLY_OWNERSHIP_ENV]
+    || server?.headers?.[MCP_ONLY_OWNERSHIP_HEADER]
+    || null;
+}
+
+function withoutMcpOnlyOwnership(server) {
+  const value = structuredClone(server);
+  for (const [container, key] of [
+    [value.env, MCP_ONLY_OWNERSHIP_ENV],
+    [value.environment, MCP_ONLY_OWNERSHIP_ENV],
+    [value.headers, MCP_ONLY_OWNERSHIP_HEADER],
+  ]) {
+    if (!container) continue;
+    delete container[key];
+    if (Object.keys(container).length === 0) {
+      if (container === value.env) delete value.env;
+      else if (container === value.environment) delete value.environment;
+      else delete value.headers;
+    }
+  }
+  return value;
+}
+
+function attachMcpOnlyOwnership(server, metadata) {
+  const value = structuredClone(server);
+  const encoded = typeof metadata === "string" ? metadata : encodeMcpOnlyOwnership(metadata);
+  if (value.env) value.env[MCP_ONLY_OWNERSHIP_ENV] = encoded;
+  else if (value.environment) value.environment[MCP_ONLY_OWNERSHIP_ENV] = encoded;
+  else {
+    value.headers ||= {};
+    value.headers[MCP_ONLY_OWNERSHIP_HEADER] = encoded;
+  }
+  return value;
+}
+
+function verifiedMcpOnlyMetadata(server, currentText) {
+  const encoded = mcpOnlyOwnershipValue(server);
+  if (!encoded) return null;
+  const metadata = decodeMcpOnlyOwnership(encoded);
+  if (entryFingerprint(withoutMcpOnlyOwnership(server)) !== metadata.entrySha256) {
+    throw new Error("ContinuityDB MCP-only entry ownership fingerprint mismatch");
+  }
+  const needle = JSON.stringify(encoded);
+  const first = currentText.indexOf(needle);
+  if (first === -1 || currentText.indexOf(needle, first + needle.length) !== -1) {
+    throw new Error("ContinuityDB MCP-only document ownership metadata is missing or duplicated");
+  }
+  const normalized = `${currentText.slice(0, first)}${JSON.stringify(MCP_ONLY_OWNERSHIP_PLACEHOLDER)}${currentText.slice(first + needle.length)}`;
+  if (sha256(normalized) !== metadata.generatedSha256) {
+    throw new Error("ContinuityDB MCP-only document ownership fingerprint mismatch");
+  }
+  return metadata;
+}
+
+function prepareMcpOnlyChange(client, rawOptions, action, identity) {
+  if (client === "codex") {
+    const projectDir = resolve(rawOptions.projectDir || process.cwd());
+    const path = join(projectDir, ".codex", "config.toml");
+    if (action === "connect" && existsSync(path)) {
+      const current = readText(path);
+      if (managedCodexBlock(current) && !/# continuitydb adapter mode: mcp-only/.test(current)) {
+        throw new Error("Codex has a complete ContinuityDB adapter; disconnect it before switching to MCP-only mode");
+      }
+    }
+    return {
+      ...prepareMcpAgentChange(client, { ...rawOptions, mcpOnly: true }, action, identity),
+      owner: "continuitydb-mcp-only",
+    };
+  }
+  const baseOptions = normalizeOptions(rawOptions, { identity });
+  const path = jsonTarget(client, baseOptions.projectDir);
+  const currentText = readText(path);
+  const current = parseJson(path);
+  const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
+  const namespace = current[key] === undefined ? null : managedJsonNamespace(current, key, path);
+  const existing = namespace?.continuitydb;
+  const metadata = existing ? verifiedMcpOnlyMetadata(existing, currentText) : null;
+  if (existing && !metadata) {
+    throw new Error(`an unmanaged ${client} continuitydb server already exists; refusing to ${action}`);
+  }
+  if (metadata && action === "connect" && metadata.projectId !== identity.id) {
+    throw new Error(`ContinuityDB managed ${client} MCP-only server belongs to project ${metadata.projectId}, not ${identity.id}`);
+  }
+
+  let content = currentText;
+  let deleteTarget = false;
+  let noOp = false;
+  if (action === "connect") {
+    const topology = metadata?.original || originalFileTopology(path, currentText);
+    const restored = metadata
+      ? restoredLifecycleContent(baseOptions, client, path, topology)
+      : { content: currentText, deleteTarget: false };
+    const original = restored.content.trim() ? JSON.parse(restored.content) : {};
+    if (!isPlainObject(original)) throw new Error(`configuration root must be a JSON object: ${path}`);
+    const value = structuredClone(original);
+    const target = managedJsonNamespace(value, key, path);
+    if (Object.prototype.hasOwnProperty.call(target, "continuitydb")) {
+      throw new Error(`an unmanaged ${client} continuitydb server already exists; refusing to connect`);
+    }
+    if (client === "opencode") value.$schema ||= "https://opencode.ai/config.json";
+    const server = connection(client, baseOptions);
+    target.continuitydb = attachMcpOnlyOwnership(server, MCP_ONLY_OWNERSHIP_PLACEHOLDER);
+    const placeholderContent = `${JSON.stringify(value, null, 2)}\n`;
+    target.continuitydb = attachMcpOnlyOwnership(server, {
+      version: 1,
+      mode: "mcp-only",
+      projectId: baseOptions.identity.id,
+      original: topology,
+      entrySha256: entryFingerprint(server),
+      generatedSha256: sha256(placeholderContent),
+    });
+    content = `${JSON.stringify(value, null, 2)}\n`;
+  } else if (metadata) {
+    const restored = restoredLifecycleContent(baseOptions, client, path, metadata.original);
+    content = restored.content;
+    deleteTarget = restored.deleteTarget;
+  } else {
+    noOp = true;
+  }
+  ensureSafeParents(baseOptions.projectDir, path, false);
+  return {
+    client, action, options: baseOptions, path, content, original: snapshot(path),
+    kind: "mcp", owner: "continuitydb-mcp-only", assetClients: [client], deleteTarget, noOp,
   };
 }
 
@@ -917,11 +1098,41 @@ function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
     path = join(options.projectDir, ".codex", "config.toml");
     const current = readText(path);
     validateToml(current, path);
-    if (action === "connect") content = replaceManagedToml(current, codexBlock(options), path);
-    else {
-      const managed = managedCodexBlock(current);
+    const managed = managedCodexBlock(current);
+    let topology = null;
+    if (managed) {
+      const block = current.slice(managed.start, managed.end + CODEX_END.length);
+      const match = block.match(/^# continuitydb managed original: ([A-Za-z0-9_-]+)$/m);
+      const fingerprint = block.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m);
+      if (match) {
+        topology = decodeCodexTopology(match[1]);
+      }
+      if (match || fingerprint) {
+        if (!match || !fingerprint) throw new Error("invalid ContinuityDB managed Codex ownership metadata");
+        const entry = parseToml(current).mcp_servers?.continuitydb;
+        if (!entry || entryFingerprint(entry) !== fingerprint[1]) {
+          throw new Error("Codex MCP ownership fingerprint mismatch");
+        }
+        const managedProject = entry.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+        if (action === "connect" && managedProject && managedProject !== identity.id) {
+          throw new Error(`ContinuityDB managed Codex server belongs to project ${managedProject}, not ${identity.id}`);
+        }
+      }
+    }
+    if (action === "connect") {
+      const base = topology ? restoredLifecycleContent(options, client, path, topology).content : current;
+      const original = topology || originalFileTopology(path, current);
+      content = replaceManagedToml(base, codexBlock(options, original), path);
+    } else if (topology) {
+      const restored = restoredLifecycleContent(options, client, path, topology);
+      content = restored.content;
+      return {
+        client, action, options, path, content, original: snapshot(path), deleteTarget: restored.deleteTarget,
+        kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
+      };
+    } else {
       content = managed === null ? current
-        : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length)}`.trimStart();
+        : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length + 1)}`;
       validateToml(content, path);
     }
   } else {
@@ -1332,7 +1543,7 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
     deleteMcp = restoredMcp.deleteTarget;
     deleteHooks = restoredHooks.deleteTarget;
     policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
-    if (client === "cursor" && originalTopology.policy.prefix) {
+    if (client === "cursor" && originalTopology.policy.prefix && metadata) {
       if (!policyContent.startsWith(policyPrefix)) throw new Error("Cursor rule ownership prefix mismatch");
       policyContent = policyContent.slice(policyPrefix.length);
     }
@@ -1364,7 +1575,16 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
   }];
 }
 
-function prepareAgentChanges(client, rawOptions, action, identity = null) {
+function hasManagedMcpOnlyTransport(client, projectDir) {
+  const path = client === "codex" ? join(projectDir, ".codex", "config.toml") : jsonTarget(client, projectDir);
+  if (!existsSync(path)) return false;
+  if (client === "codex") return /# continuitydb adapter mode: mcp-only/.test(readText(path));
+  const entry = jsonMcpEntry(client, path);
+  return Boolean(entry && mcpOnlyOwnershipValue(entry));
+}
+
+function prepareAgentChanges(client, rawOptions, action, identity = null, mcpOnly = Boolean(rawOptions.mcpOnly)) {
+  if (mcpOnly) return [prepareMcpOnlyChange(client, rawOptions, action, identity)];
   if (client === "copilot") return prepareCopilotChanges(rawOptions, action, identity);
   if (client === "opencode") return prepareOpenCodeChanges(rawOptions, action, identity);
   if (client === "claude" || client === "cursor") {
@@ -1559,8 +1779,16 @@ function batch(clients, rawOptions, action) {
   const identity = action === "connect" ? connectorIdentity(projectDir, rawOptions) : null;
   // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
   // path and rendered output must validate before the first client file changes.
-  const plans = unique.flatMap((client) => prepareAgentChanges(client, rawOptions, action, identity));
-  const policyPlan = prepareSharedPolicyChange(unique, rawOptions, action, identity);
+  const mcpOnlyClients = new Set(unique.filter((client) => (
+    rawOptions.mcpOnly || (action === "disconnect" && hasManagedMcpOnlyTransport(client, projectDir))
+  )));
+  const plans = unique.flatMap((client) => (
+    prepareAgentChanges(client, rawOptions, action, identity, mcpOnlyClients.has(client))
+  ));
+  const completeClients = unique.filter((client) => !mcpOnlyClients.has(client));
+  const policyPlan = completeClients.length
+    ? prepareSharedPolicyChange(completeClients, rawOptions, action, identity)
+    : null;
   if (policyPlan) plans.push(policyPlan);
   const results = applyAgentPlans(plans, { finalize: rawOptions._finalizeSetup });
   return unique.map((client) => {
@@ -1577,7 +1805,13 @@ function batch(clients, rawOptions, action) {
       verified: result.verified,
       backup: result.backup,
     }));
-    const capabilities = client === "codex" || client === "copilot"
+    const capabilities = mcpOnlyClients.has(client)
+      ? {
+        recall_mode: "mcp-only",
+        capture_mode: "explicit-governed",
+        limitations: ["MCP-only mode exposes ContinuityDB tools but does not install automatic recall lifecycle or policy assets."],
+      }
+      : client === "codex" || client === "copilot"
       ? { recall_mode: "policy-led", capture_mode: "explicit-governed", limitations: [] }
       : client === "claude"
         ? { recall_mode: "hook-enforced", capture_mode: "explicit-governed", limitations: [] }
@@ -1596,6 +1830,8 @@ function batch(clients, rawOptions, action) {
             : {};
     return {
       client,
+      selected: true,
+      planned: assets.some((asset) => asset.applied !== true),
       project_dir: primary.project_dir,
       path: primary.path,
       changed: assets.some((asset) => asset.changed),
@@ -1624,23 +1860,283 @@ export function disconnectAgent(client, rawOptions = {}) {
   return disconnectAgents([client], rawOptions)[0];
 }
 
+function connectorCapabilities(client, mcpOnly = false) {
+  if (mcpOnly) return {
+    recall_mode: "mcp-only",
+    capture_mode: "explicit-governed",
+    limitations: ["MCP-only mode exposes ContinuityDB tools but does not install automatic recall lifecycle or policy assets."],
+  };
+  if (client === "codex" || client === "copilot") {
+    return { recall_mode: "policy-led", capture_mode: "explicit-governed", limitations: [] };
+  }
+  if (client === "claude") {
+    return { recall_mode: "hook-enforced", capture_mode: "explicit-governed", limitations: [] };
+  }
+  if (client === "cursor") return {
+    recall_mode: "hook+policy",
+    capture_mode: "explicit-governed",
+    limitations: ["Cursor read-only cloud sessions use the always-loaded policy fallback until lifecycle hooks are available."],
+  };
+  return {
+    recall_mode: "plugin+policy",
+    capture_mode: "explicit-governed",
+    limitations: ["OpenCode first-task recall is policy-led; the plugin enforces compaction recall and explicit structured idle handoff only."],
+  };
+}
+
+function statusAsset(path, kind, owner, verify, { expected = true } = {}) {
+  if (!expected) return null;
+  if (!existsSync(path)) {
+    return { path, kind, owner, exists: false, missing: true, changed: false, verified: false, drifted: true };
+  }
+  try {
+    const content = readText(path);
+    const verified = Boolean(verify(content));
+    return {
+      path, kind, owner, exists: true, missing: false, changed: !verified, verified, drifted: !verified,
+    };
+  } catch (error) {
+    return {
+      path, kind, owner, exists: true, missing: false, changed: true, verified: false, drifted: true,
+      error: error.message,
+    };
+  }
+}
+
+function managedBlockEquals(current, expected) {
+  const start = current.indexOf(POLICY_START);
+  const end = current.indexOf(POLICY_END, start);
+  return start !== -1 && end !== -1
+    && current.slice(start, end + POLICY_END.length) === expected.trimEnd();
+}
+
+function jsonMcpEntry(client, path) {
+  const value = parseJson(path);
+  const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
+  if (value[key] === undefined) return null;
+  return managedJsonNamespace(value, key, path).continuitydb || null;
+}
+
+function validScopedMcpEntry(client, path) {
+  const entry = jsonMcpEntry(client, path);
+  if (!entry || !isPlainObject(entry)) return false;
+  const allowed = entry.env?.CONTINUITYDB_ALLOWED_PROJECTS
+    || entry.environment?.CONTINUITYDB_ALLOWED_PROJECTS;
+  if (allowed !== undefined) {
+    validateProjectId(allowed);
+    if (allowed === "default" || allowed.includes("*")) return false;
+  }
+  return true;
+}
+
+function expectedSharedPolicy(current, client, projectDir) {
+  const metadata = sharedPolicyMetadata(current);
+  if (!metadata?.consumers.includes(client)) return false;
+  const rendererClient = metadata.consumers.includes("codex") ? "codex" : "opencode";
+  const descriptor = policyAssetDescriptors(rendererClient, {
+    projectDir, projectId: metadata.projectId, consumers: metadata.consumers,
+  })[0];
+  return managedBlockEquals(current, descriptor.content);
+}
+
+function lifecycleStatusAssets(client, options, paths) {
+  let metadata = null;
+  try { metadata = lifecyclePolicyMetadata(readText(paths.policy), client); }
+  catch { /* The policy asset reports the specific parsing failure below. */ }
+  const policy = statusAsset(paths.policy, "policy", `continuitydb-${client}-policy`, (current) => {
+    const value = lifecyclePolicyMetadata(current, client);
+    if (!value) return false;
+    const descriptor = policyAssetDescriptors(client, {
+      projectDir: options.projectDir, projectId: value.projectId, consumers: [client],
+    })[0];
+    const core = lifecyclePolicyCore(client, descriptor.content);
+    const expected = lifecyclePolicyContent(core, {
+      mcp: value.mcp, start: value.start, stop: value.stop, policy: value.policy,
+    }, value.topology);
+    return value.policy === sha256(core)
+      && lifecycleManagedBlock(current) === expected
+      && (!value.topology.policy.prefix || current.startsWith(lifecyclePolicyPrefix(client, descriptor.content)));
+  });
+  const mcp = statusAsset(paths.mcp, "mcp", "continuitydb-mcp", (current) => {
+    if (!metadata || sha256(current) !== metadata.topology.mcp.generated) return false;
+    const entry = jsonMcpEntry(client, paths.mcp);
+    return Boolean(entry) && entryFingerprint(entry) === metadata.mcp && validScopedMcpEntry(client, paths.mcp);
+  });
+  const hooks = statusAsset(paths.hooks, "lifecycle", `continuitydb-${client}-hooks`, (current) => {
+    if (!metadata || sha256(current) !== metadata.topology.hooks.generated) return false;
+    const value = parseJson(paths.hooks);
+    const names = lifecycleEventNames(client);
+    return findOwnedHookIndex(value.hooks?.[names.start] || [], metadata.start) !== -1
+      && findOwnedHookIndex(value.hooks?.[names.stop] || [], metadata.stop) !== -1;
+  });
+  return [mcp, hooks, policy];
+}
+
 export function connectionStatus(rawOptions = {}) {
   const options = normalizeOptions(rawOptions);
   return SUPPORTED_AGENTS.map((client) => {
-    const path = client === "codex" ? join(options.projectDir, ".codex", "config.toml") : jsonTarget(client, options.projectDir);
+    const mcpPath = client === "codex" ? join(options.projectDir, ".codex", "config.toml") : jsonTarget(client, options.projectDir);
     try {
-      if (!existsSync(path)) return { client, connected: false, path };
+      let connected = false;
+      let mcpOnly = false;
+      let mcpOnlyMetadata = null;
       if (client === "codex") {
-        const text = readText(path);
-        validateToml(text, path);
-        return { client, connected: managedCodexBlock(text) !== null, path };
+        if (existsSync(mcpPath)) {
+          const text = readText(mcpPath);
+          validateToml(text, mcpPath);
+          connected = managedCodexBlock(text) !== null;
+          mcpOnly = connected && /# continuitydb adapter mode: mcp-only/.test(text);
+        }
+      } else if (existsSync(mcpPath)) {
+        const entry = jsonMcpEntry(client, mcpPath);
+        connected = Boolean(entry);
+        if (entry) {
+          const encoded = mcpOnlyOwnershipValue(entry);
+          mcpOnly = Boolean(encoded);
+          if (encoded) {
+            try { mcpOnlyMetadata = verifiedMcpOnlyMetadata(entry, readText(mcpPath)); }
+            catch { mcpOnlyMetadata = { projectId: null }; }
+          }
+        }
       }
-      const value = parseJson(path);
-      const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
-      const connected = value[key] === undefined ? false : Boolean(managedJsonNamespace(value, key, path).continuitydb);
-      return { client, connected, path };
+      let completeOwnership = false;
+      if (!connected) {
+        try {
+          if (client === "codex") {
+            completeOwnership = expectedSharedPolicy(readText(join(options.projectDir, "AGENTS.md")), client, options.projectDir);
+          } else if (client === "claude" || client === "cursor") {
+            const policyPath = client === "claude"
+              ? join(options.projectDir, "CLAUDE.md")
+              : join(options.projectDir, ".cursor", "rules", "continuitydb.mdc");
+            const hooksPath = client === "claude"
+              ? join(options.projectDir, ".claude", "settings.json")
+              : join(options.projectDir, ".cursor", "hooks.json");
+            completeOwnership = Boolean(lifecyclePolicyMetadata(readText(policyPath), client))
+              || (existsSync(hooksPath) && looksLikeContinuityHook(parseJson(hooksPath)));
+          } else if (client === "opencode") {
+            completeOwnership = Boolean(opencodePluginMetadata(readText(join(
+              options.projectDir, ".opencode", "plugins", "continuitydb.js",
+            )))) || expectedSharedPolicy(readText(join(options.projectDir, "AGENTS.md")), client, options.projectDir);
+          } else {
+            completeOwnership = Boolean(dedicatedPolicyMetadata(readText(
+              join(options.projectDir, ".github", "copilot-instructions.md"),
+            ), client));
+          }
+        } catch {
+          // Malformed remaining managed assets are still evidence of drift when
+          // their ContinuityDB markers or lifecycle commands are present.
+          const candidates = client === "codex" || client === "opencode"
+            ? [join(options.projectDir, "AGENTS.md")]
+            : client === "claude"
+              ? [join(options.projectDir, "CLAUDE.md"), join(options.projectDir, ".claude", "settings.json")]
+              : client === "cursor"
+                ? [join(options.projectDir, ".cursor", "rules", "continuitydb.mdc"), join(options.projectDir, ".cursor", "hooks.json")]
+                : [join(options.projectDir, ".github", "copilot-instructions.md")];
+          completeOwnership = candidates.some((path) => {
+            try { return existsSync(path) && /continuitydb/i.test(readText(path)); } catch { return true; }
+          });
+        }
+      }
+      if (!connected && !completeOwnership) {
+        return {
+          client, connected: false, path: mcpPath, verified: false, drifted: false, assets: [],
+          ...connectorCapabilities(client, false),
+        };
+      }
+
+      let assets;
+      if (mcpOnly) {
+        assets = [statusAsset(mcpPath, "mcp", "continuitydb-mcp-only", (current) => {
+          if (client === "codex") {
+            validateToml(current, mcpPath);
+            const block = managedCodexBlock(current);
+            if (!block || !/# continuitydb adapter mode: mcp-only/.test(current)) return false;
+            const server = parseToml(current).mcp_servers?.continuitydb;
+            const allowed = server?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+            const managedText = current.slice(block.start, block.end + CODEX_END.length);
+            const fingerprint = managedText.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m)?.[1];
+            return Boolean(server && fingerprint) && entryFingerprint(server) === fingerprint
+              && allowed !== "default" && allowed !== "*";
+          }
+          const entry = jsonMcpEntry(client, mcpPath);
+          const verified = entry && verifiedMcpOnlyMetadata(entry, current);
+          return Boolean(verified) && (!mcpOnlyMetadata.projectId || verified.projectId === mcpOnlyMetadata.projectId)
+            && validScopedMcpEntry(client, mcpPath);
+        })];
+      } else if (client === "claude" || client === "cursor") {
+        assets = lifecycleStatusAssets(client, options, {
+          mcp: mcpPath,
+          hooks: client === "claude"
+            ? join(options.projectDir, ".claude", "settings.json")
+            : join(options.projectDir, ".cursor", "hooks.json"),
+          policy: client === "claude"
+            ? join(options.projectDir, "CLAUDE.md")
+            : join(options.projectDir, ".cursor", "rules", "continuitydb.mdc"),
+        });
+      } else if (client === "opencode") {
+        const pluginPath = join(options.projectDir, ".opencode", "plugins", "continuitydb.js");
+        const policyPath = join(options.projectDir, "AGENTS.md");
+        let metadata = null;
+        try { metadata = opencodePluginMetadata(readText(pluginPath)); } catch { /* reported by asset */ }
+        assets = [
+          statusAsset(mcpPath, "mcp", "continuitydb-mcp", (current) => (
+            Boolean(metadata) && sha256(current) === metadata.config.generated && validScopedMcpEntry(client, mcpPath)
+          )),
+          statusAsset(pluginPath, "plugin", "continuitydb-opencode-plugin", (current) => Boolean(opencodePluginMetadata(current))),
+          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => expectedSharedPolicy(current, client, options.projectDir)),
+        ];
+      } else if (client === "copilot") {
+        const policyPath = join(options.projectDir, ".github", "copilot-instructions.md");
+        let metadata = null;
+        try { metadata = dedicatedPolicyMetadata(readText(policyPath), client); } catch { /* reported by asset */ }
+        assets = [
+          statusAsset(mcpPath, "mcp", "continuitydb-mcp", () => {
+            const entry = jsonMcpEntry(client, mcpPath);
+            return Boolean(metadata && entry)
+              && entryFingerprint(entry) === metadata.ownership.entrySha256
+              && validScopedMcpEntry(client, mcpPath);
+          }),
+          statusAsset(policyPath, "policy", "continuitydb-copilot-policy", (current) => {
+            const value = dedicatedPolicyMetadata(current, client);
+            if (!value) return false;
+            const descriptor = policyAssetDescriptors(client, {
+              projectDir: options.projectDir, projectId: value.projectId, consumers: [client],
+            })[0];
+            return managedBlockEquals(current, copilotPolicyContent(descriptor.content, value.ownership));
+          }),
+        ];
+      } else {
+        const policyPath = join(options.projectDir, "AGENTS.md");
+        assets = [
+          statusAsset(mcpPath, "mcp", "continuitydb-mcp", (current) => {
+            validateToml(current, mcpPath);
+            const server = parseToml(current).mcp_servers?.continuitydb;
+            const allowed = server?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+            const managed = managedCodexBlock(current);
+            const block = managed && current.slice(managed.start, managed.end + CODEX_END.length);
+            const fingerprint = block?.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m)?.[1];
+            return Boolean(managedCodexBlock(current) && server)
+              && Boolean(fingerprint) && entryFingerprint(server) === fingerprint
+              && allowed !== "default" && allowed !== "*";
+          }),
+          statusAsset(policyPath, "policy", "continuitydb-policy", (current) => expectedSharedPolicy(current, client, options.projectDir)),
+        ];
+      }
+      const verified = assets.every((asset) => asset.verified);
+      return {
+        client,
+        connected,
+        path: mcpPath,
+        verified,
+        drifted: !verified,
+        assets,
+        ...connectorCapabilities(client, mcpOnly),
+      };
     } catch (error) {
-      return { client, connected: false, path, error: error.message };
+      return {
+        client, connected: false, path: mcpPath, verified: false, drifted: true, assets: [], error: error.message,
+        ...connectorCapabilities(client, false),
+      };
     }
   });
 }
