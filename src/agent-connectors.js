@@ -38,6 +38,16 @@ function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort().map((key) => (
+      `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+    )).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
 function contains(root, target) {
   const value = relative(root, target);
   return value === "" || (!value.startsWith(`..${sep}`) && value !== ".." && !isAbsolute(value));
@@ -588,7 +598,7 @@ function copilotEntryFingerprint(text, path) {
     throw new Error(`configuration namespace servers must be a JSON object: ${path}`);
   }
   const continuitydb = propertyNamed(servers?.value, "continuitydb");
-  return continuitydb ? sha256(text.slice(continuitydb.value.start, continuitydb.value.end)) : null;
+  return continuitydb ? sha256(canonicalJson(layout.value.servers.continuitydb)) : null;
 }
 
 function connectCopilotJson(current, path, server, owned) {
@@ -752,7 +762,7 @@ function prepareCopilotChanges(rawOptions, action, identity) {
     throw new Error(`an unmanaged Copilot continuitydb server already exists; ${suffix}`);
   }
   if (existingServer) {
-    const currentFingerprint = sha256(mcpCurrent.slice(existingServer.value.start, existingServer.value.end));
+    const currentFingerprint = sha256(canonicalJson(mcpLayout.value.servers.continuitydb));
     if (metadata.ownership.entrySha256 !== currentFingerprint) {
       throw new Error("Copilot MCP ownership fingerprint mismatch; refusing to replace or remove the current server");
     }

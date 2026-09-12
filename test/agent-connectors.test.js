@@ -502,6 +502,43 @@ test("Copilot ownership fingerprint rejects stale or changed MCP entries", () =>
   }
 });
 
+test("Copilot ownership fingerprint accepts semantic JSON reformatting and preserves unrelated bytes", () => {
+  const value = fixture();
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  const beforeManagedProperty = '{\r\n  "unrelated" : { "spacing" : true },\r\n  "servers" : {\r\n    "other" : { "command" : "user" }';
+  const managedPropertyPrefix = ',\r\n    "continuitydb" : ';
+  const afterManagedProperty = '\r\n  },\r\n  "tail" : "keep exactly"  \r\n}\r\n';
+  const reorderRecursively = (item) => {
+    if (Array.isArray(item)) return item.map(reorderRecursively);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item).reverse()
+      .map(([key, entry]) => [key, reorderRecursively(entry)]));
+  };
+  try {
+    mkdirSync(join(value.project, ".vscode"));
+    writeFileSync(mcp, `${beforeManagedProperty}${afterManagedProperty}`);
+    connectAgent("copilot", options(value));
+    const generatedServer = JSON.parse(readFileSync(mcp, "utf8")).servers.continuitydb;
+    const reformattedServer = JSON.stringify(reorderRecursively(generatedServer), null, 4);
+    const reformatted = `${beforeManagedProperty}${managedPropertyPrefix}${reformattedServer}${afterManagedProperty}`;
+    writeFileSync(mcp, reformatted);
+
+    const reconnected = connectAgent("copilot", options(value));
+    assert.equal(reconnected.applied && reconnected.verified, true);
+    assert.equal(
+      readFileSync(mcp, "utf8"),
+      `${beforeManagedProperty}${managedPropertyPrefix}${JSON.stringify(generatedServer)}${afterManagedProperty}`,
+    );
+
+    writeFileSync(mcp, reformatted);
+    const disconnected = disconnectAgent("copilot", options(value));
+    assert.equal(disconnected.applied && disconnected.verified, true);
+    assert.equal(readFileSync(mcp, "utf8"), `${beforeManagedProperty}${afterManagedProperty}`);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("Copilot adapter rejects cross-project policy replacement and rolls back MCP on policy races", () => {
   const value = fixture();
   const previousNodeEnv = process.env.NODE_ENV;
