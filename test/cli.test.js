@@ -319,6 +319,33 @@ test("CLI setup reports a filesystem-detected OpenCode-only project connection",
   }
 });
 
+test("CLI reports an actionable limitation for every selected undetected executable", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-undetected-limitations-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const emptyBin = join(root, "empty-bin");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(emptyBin);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all",
+    ], { encoding: "utf8", env: { ...process.env, PATH: emptyBin } });
+    assert.equal(result.status, 0, result.stderr);
+    const connections = JSON.parse(result.stdout).connections;
+    assert.equal(connections.length, 5);
+    for (const connection of connections) {
+      assert.equal(connection.detected, false);
+      assert.equal(connection.detected_executable, null);
+      assert.match(connection.limitations.join("\n"), /executable.*not detected.*PATH/i);
+    }
+    assert.match(connections.find((item) => item.client === "cursor").limitations.join("\n"), /read-only cloud/i);
+    assert.match(connections.find((item) => item.client === "opencode").limitations.join("\n"), /first-task recall is policy-led/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI setup derives one Git project identity and registers it on apply", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-git-setup-"));
   const project = join(root, "git-project");

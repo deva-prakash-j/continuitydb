@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -13,6 +13,7 @@ import {
   setupAgentSummary,
   SUPPORTED_AGENTS,
 } from "../src/agent-connectors.js";
+import { registerProject } from "../src/project-registry.js";
 
 const CODEX_START_FOR_TEST = "# >>> continuitydb managed configuration >>>";
 const CODEX_END_FOR_TEST = "# <<< continuitydb managed configuration <<<";
@@ -126,6 +127,7 @@ test("agent connectors preview without writing, then apply all clients idempoten
       const repeated = connectAgent(client, options(value));
       assert.equal(repeated.changed, false);
     }
+    registerProject(value.home, { id: "service-a", root: value.project, source: "explicit" }, { apply: true });
     assert.deepEqual(connectionStatus(options(value)).map(({ client, connected }) => ({ client, connected })),
       SUPPORTED_AGENTS.map((client) => ({ client, connected: true })));
     const files = [
@@ -1171,6 +1173,7 @@ test("MCP-only mode installs, verifies, and removes only transport assets", () =
     assert.equal(existsSync(join(value.project, ".cursor", "rules", "continuitydb.mdc")), false);
     assert.equal(existsSync(join(value.project, ".github", "copilot-instructions.md")), false);
 
+    registerProject(value.home, { id: "service-a", root: value.project, source: "explicit" }, { apply: true });
     const status = connectionStatus(options(value));
     assert.equal(status.every((item) => item.connected && item.verified && !item.drifted), true);
     assert.equal(status.every((item) => item.recall_mode === "mcp-only"), true);
@@ -1201,6 +1204,7 @@ test("connection status independently verifies every complete adapter asset with
   const value = fixture();
   try {
     connectAgents(SUPPORTED_AGENTS, options(value));
+    registerProject(value.home, { id: "service-a", root: value.project, source: "explicit" }, { apply: true });
     const before = contents(clientPaths(value.project));
     const healthy = connectionStatus(options(value));
     assert.equal(healthy.every((item) => item.connected && item.verified && !item.drifted), true);
@@ -1234,6 +1238,102 @@ test("connection status independently verifies every complete adapter asset with
     assert.equal(opencode.drifted, true);
     assert.equal(opencode.assets.find((asset) => asset.path === plugin).missing, true);
     assert.equal(existsSync(plugin), false, "status must not repair missing assets");
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Codex updates and disconnects only its current managed block", () => {
+  const value = fixture();
+  const path = join(value.project, ".codex", "config.toml");
+  try {
+    mkdirSync(join(value.project, ".codex"));
+    const original = 'model = "gpt-5"\n';
+    writeFileSync(path, original);
+    connectAgent("codex", options(value));
+    const connected = readFileSync(path, "utf8");
+    const prefix = '# user edit after connect\n';
+    const suffix = '\n[user_settings]\nkeep = "current"\n';
+    writeFileSync(path, `${prefix}${connected}${suffix}`);
+    const updated = connectAgent("codex", options(value));
+    assert.equal(updated.changed, false);
+    assert.equal(readFileSync(path, "utf8"), `${prefix}${connected}${suffix}`);
+    disconnectAgent("codex", options(value));
+    assert.equal(readFileSync(path, "utf8"), `${prefix}${original}${suffix}`);
+
+    const legacy = [
+      'theme = "user"',
+      CODEX_START_FOR_TEST,
+      "[mcp_servers.continuitydb]",
+      'command = "legacy-continuitydb"',
+      CODEX_END_FOR_TEST,
+      "",
+      "[current_user_edit]",
+      "keep = true",
+      "",
+    ].join("\n");
+    writeFileSync(path, legacy);
+    connectAgent("codex", options(value));
+    assert.doesNotMatch(readFileSync(path, "utf8"), /legacy-continuitydb/);
+    disconnectAgent("codex", options(value));
+    const disconnected = readFileSync(path, "utf8");
+    assert.doesNotMatch(disconnected, /continuitydb|mcp_servers/i);
+    assert.match(disconnected, /theme = "user"/);
+    assert.match(disconnected, /\[current_user_edit\]\nkeep = true/);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Codex mode metadata is authoritative and mode transitions fail closed", () => {
+  for (const initialMcpOnly of [false, true]) {
+    const value = fixture();
+    const path = join(value.project, ".codex", "config.toml");
+    try {
+      connectAgent("codex", { ...options(value), mcpOnly: initialMcpOnly });
+      registerProject(value.home, { id: "service-a", root: value.project, source: "explicit" }, { apply: true });
+      const healthy = readFileSync(path, "utf8");
+      if (!initialMcpOnly) {
+        writeFileSync(path, `# continuitydb adapter mode: mcp-only\n${healthy}`);
+        const status = connectionStatus(options(value)).find((item) => item.client === "codex");
+        assert.equal(status.recall_mode, "policy-led");
+        assert.equal(status.verified, true);
+        writeFileSync(path, healthy);
+        assert.throws(
+          () => disconnectAgent("codex", { ...options(value), mcpOnly: true }),
+          /complete.*disconnect|mode/i,
+        );
+        assert.equal(readFileSync(path, "utf8"), healthy);
+      }
+      assert.throws(
+        () => connectAgent("codex", { ...options(value), mcpOnly: !initialMcpOnly }),
+        /disconnect.*switch|mode/i,
+      );
+      assert.equal(readFileSync(path, "utf8"), healthy);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("connection status rejects copied adapters at an unregistered project root without writing", () => {
+  const value = fixture();
+  const original = join(value.root, "one", "generic-repo");
+  const copied = join(value.root, "two", "generic-repo");
+  try {
+    mkdirSync(join(original, ".git"), { recursive: true });
+    connectAgent("codex", { ...options(value), projectDir: original, projectId: undefined });
+    registerProject(value.home, { id: "generic-repo", root: original, source: "git" }, { apply: true });
+    cpSync(original, copied, { recursive: true });
+    const path = join(copied, ".codex", "config.toml");
+    const before = readFileSync(path, "utf8");
+    const status = connectionStatus({ ...options(value), projectDir: copied, projectId: undefined })
+      .find((item) => item.client === "codex");
+    assert.equal(status.connected, true);
+    assert.equal(status.verified, false);
+    assert.equal(status.drifted, true);
+    assert.match(status.error, /registered.*root|not registered/i);
+    assert.equal(readFileSync(path, "utf8"), before);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }

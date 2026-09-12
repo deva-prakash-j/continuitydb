@@ -436,9 +436,9 @@ function connection(client, options) {
   return { command, args, env };
 }
 
-function codexBlock(options, topology) {
+function codexOwnedEntry(options) {
   const value = connection("codex", options);
-  const ownedEntry = {
+  return {
     ...(options.transport === "http"
       ? { url: value.url, bearer_token_env_var: value.bearer_token_env_var }
       : { command: value.command, args: value.args }),
@@ -449,12 +449,39 @@ function codexBlock(options, topology) {
     tool_timeout_sec: 30,
     ...(options.transport === "stdio" ? { env: value.env } : {}),
   };
+}
+
+function encodeCodexMetadata(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function decodeCodexMetadata(value) {
+  let metadata;
+  try { metadata = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
+  catch { throw new Error("invalid ContinuityDB managed Codex metadata"); }
+  if (metadata?.version !== 1 || !["complete", "mcp-only"].includes(metadata.mode)
+    || validateProjectId(metadata.projectId) !== metadata.projectId
+    || typeof metadata.separator !== "boolean"
+    || !/^[a-f0-9]{64}$/.test(metadata.entrySha256)) {
+    throw new Error("invalid ContinuityDB managed Codex metadata");
+  }
+  return metadata;
+}
+
+function codexBlock(options, separator) {
+  const value = connection("codex", options);
+  const ownedEntry = codexOwnedEntry(options);
+  const metadata = encodeCodexMetadata({
+    version: 1,
+    mode: options.mcpOnly ? "mcp-only" : "complete",
+    projectId: options.identity.id,
+    separator,
+    entrySha256: entryFingerprint(ownedEntry),
+  });
   const lines = [
     CODEX_START,
-    `# continuitydb managed original: ${encodeMcpOnlyOwnership(topology)}`,
-    `# continuitydb managed entry sha256: ${entryFingerprint(ownedEntry)}`,
+    `# continuitydb managed metadata: ${metadata}`,
   ];
-  if (options.mcpOnly) lines.push("# continuitydb adapter mode: mcp-only");
   lines.push("[mcp_servers.continuitydb]");
   if (options.transport === "http") {
     lines.push(`url = ${JSON.stringify(value.url)}`);
@@ -483,9 +510,35 @@ function replaceManagedToml(text, block, path) {
   if (/^\s*\[mcp_servers\.continuitydb(?:\]|\.)/m.test(unmanaged)) {
     throw new Error("an unmanaged Codex continuitydb server already exists; remove or rename it before connecting");
   }
-  const output = `${unmanaged}${unmanaged && !unmanaged.endsWith("\n") ? "\n" : ""}${block}`;
+  const output = managed === null
+    ? `${text}${text && !text.endsWith("\n") ? "\n" : ""}${block}`
+    : `${text.slice(0, managed.start)}${block.slice(0, -1)}${text.slice(managed.end + CODEX_END.length)}`;
   validateToml(output, path);
   return output;
+}
+
+function codexManagedMetadata(text, { allowLegacy = true } = {}) {
+  const managed = managedCodexBlock(text);
+  if (!managed) return null;
+  const block = text.slice(managed.start, managed.end + CODEX_END.length);
+  const matches = [...block.matchAll(/^# continuitydb managed metadata: ([A-Za-z0-9_-]+)$/gm)];
+  if (matches.length === 0 && allowLegacy) return { managed, block, metadata: null, entry: null };
+  if (matches.length !== 1) throw new Error("invalid ContinuityDB managed Codex metadata");
+  const metadata = decodeCodexMetadata(matches[0][1]);
+  const entry = parseToml(block).mcp_servers?.continuitydb;
+  if (!entry || entryFingerprint(entry) !== metadata.entrySha256) {
+    throw new Error("Codex MCP ownership fingerprint mismatch");
+  }
+  return { managed, block, metadata, entry };
+}
+
+function removeCodexManagedBlock(text, ownership) {
+  const { managed, metadata } = ownership;
+  let prefix = text.slice(0, managed.start);
+  let suffix = text.slice(managed.end + CODEX_END.length);
+  if (suffix.startsWith("\n")) suffix = suffix.slice(1);
+  if (metadata?.separator && prefix.endsWith("\n")) prefix = prefix.slice(0, -1);
+  return `${prefix}${suffix}`;
 }
 
 function jsonTarget(client, projectDir) {
@@ -933,17 +986,6 @@ function encodeMcpOnlyOwnership(value) {
   return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 }
 
-function decodeCodexTopology(value) {
-  let topology;
-  try { topology = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
-  catch { throw new Error("invalid ContinuityDB managed Codex original metadata"); }
-  if (!topology || !["missing", "empty", "existing"].includes(topology.state)
-    || (topology.state === "missing" ? topology.sha256 !== null : !/^[a-f0-9]{64}$/.test(topology.sha256))) {
-    throw new Error("invalid ContinuityDB managed Codex original metadata");
-  }
-  return topology;
-}
-
 function decodeMcpOnlyOwnership(value) {
   let metadata;
   try { metadata = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
@@ -1021,10 +1063,14 @@ function prepareMcpOnlyChange(client, rawOptions, action, identity) {
   if (client === "codex") {
     const projectDir = resolve(rawOptions.projectDir || process.cwd());
     const path = join(projectDir, ".codex", "config.toml");
-    if (action === "connect" && existsSync(path)) {
+    if (existsSync(path)) {
       const current = readText(path);
-      if (managedCodexBlock(current) && !/# continuitydb adapter mode: mcp-only/.test(current)) {
-        throw new Error("Codex has a complete ContinuityDB adapter; disconnect it before switching to MCP-only mode");
+      const ownership = codexManagedMetadata(current);
+      if (ownership?.metadata?.mode === "complete" || (ownership && !ownership.metadata)) {
+        const detail = action === "disconnect"
+          ? "refusing to disconnect a complete adapter with --mcp-only"
+          : "disconnect the complete adapter before switching to MCP-only mode";
+        throw new Error(`Codex adapter mode mismatch: ${detail}`);
       }
     }
     return {
@@ -1098,41 +1144,22 @@ function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
     path = join(options.projectDir, ".codex", "config.toml");
     const current = readText(path);
     validateToml(current, path);
-    const managed = managedCodexBlock(current);
-    let topology = null;
-    if (managed) {
-      const block = current.slice(managed.start, managed.end + CODEX_END.length);
-      const match = block.match(/^# continuitydb managed original: ([A-Za-z0-9_-]+)$/m);
-      const fingerprint = block.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m);
-      if (match) {
-        topology = decodeCodexTopology(match[1]);
-      }
-      if (match || fingerprint) {
-        if (!match || !fingerprint) throw new Error("invalid ContinuityDB managed Codex ownership metadata");
-        const entry = parseToml(current).mcp_servers?.continuitydb;
-        if (!entry || entryFingerprint(entry) !== fingerprint[1]) {
-          throw new Error("Codex MCP ownership fingerprint mismatch");
-        }
-        const managedProject = entry.env?.CONTINUITYDB_ALLOWED_PROJECTS;
-        if (action === "connect" && managedProject && managedProject !== identity.id) {
-          throw new Error(`ContinuityDB managed Codex server belongs to project ${managedProject}, not ${identity.id}`);
-        }
-      }
+    const ownership = codexManagedMetadata(current);
+    const managed = ownership?.managed || null;
+    if (action === "connect" && ownership?.metadata?.mode !== undefined
+      && ownership.metadata.mode !== (options.mcpOnly ? "mcp-only" : "complete")) {
+      throw new Error(`Codex ContinuityDB adapter mode is ${ownership.metadata.mode}; disconnect it before switching modes`);
+    }
+    const managedProject = ownership?.metadata?.projectId
+      || ownership?.entry?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+    if (action === "connect" && managedProject && managedProject !== identity.id) {
+      throw new Error(`ContinuityDB managed Codex server belongs to project ${managedProject}, not ${identity.id}`);
     }
     if (action === "connect") {
-      const base = topology ? restoredLifecycleContent(options, client, path, topology).content : current;
-      const original = topology || originalFileTopology(path, current);
-      content = replaceManagedToml(base, codexBlock(options, original), path);
-    } else if (topology) {
-      const restored = restoredLifecycleContent(options, client, path, topology);
-      content = restored.content;
-      return {
-        client, action, options, path, content, original: snapshot(path), deleteTarget: restored.deleteTarget,
-        kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
-      };
+      const separator = ownership?.metadata?.separator ?? (!managed && Boolean(current && !current.endsWith("\n")));
+      content = replaceManagedToml(current, codexBlock(options, separator), path);
     } else {
-      content = managed === null ? current
-        : `${current.slice(0, managed.start)}${current.slice(managed.end + CODEX_END.length + 1)}`;
+      content = ownership === null ? current : removeCodexManagedBlock(current, ownership);
       validateToml(content, path);
     }
   } else {
@@ -1578,7 +1605,7 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
 function hasManagedMcpOnlyTransport(client, projectDir) {
   const path = client === "codex" ? join(projectDir, ".codex", "config.toml") : jsonTarget(client, projectDir);
   if (!existsSync(path)) return false;
-  if (client === "codex") return /# continuitydb adapter mode: mcp-only/.test(readText(path));
+  if (client === "codex") return codexManagedMetadata(readText(path))?.metadata?.mode === "mcp-only";
   const entry = jsonMcpEntry(client, path);
   return Boolean(entry && mcpOnlyOwnershipValue(entry));
 }
@@ -1972,20 +1999,61 @@ function lifecycleStatusAssets(client, options, paths) {
   return [mcp, hooks, policy];
 }
 
+function registeredProjectForStatus(home, projectId) {
+  const path = join(home, "config.json");
+  if (!existsSync(path)) return null;
+  const config = JSON.parse(readText(path));
+  if (!isPlainObject(config) || (config.projects !== undefined && !Array.isArray(config.projects))) {
+    throw new Error("vault config projects must be an array");
+  }
+  let match = null;
+  const seen = new Set();
+  for (const project of config.projects || []) {
+    if (!isPlainObject(project)) throw new Error("registered project must be an object");
+    const id = validateProjectId(project.id);
+    if (seen.has(id)) throw new Error(`project ${id} is registered more than once`);
+    seen.add(id);
+    if (typeof project.root !== "string" || !isAbsolute(project.root)) {
+      throw new Error(`registered project root must be an absolute path: ${id}`);
+    }
+    if (project.source !== "git" && project.source !== "explicit") {
+      throw new Error(`registered project source must be git or explicit: ${id}`);
+    }
+    if (id === projectId) match = { id, root: resolve(project.root), source: project.source };
+  }
+  return match;
+}
+
 export function connectionStatus(rawOptions = {}) {
   const options = normalizeOptions(rawOptions);
+  let statusIdentity = null;
+  let identityError = null;
+  try {
+    statusIdentity = connectorIdentity(options.projectDir, rawOptions);
+    const registered = registeredProjectForStatus(options.home, statusIdentity.id);
+    if (!registered) {
+      identityError = `project ${statusIdentity.id} is not registered for status verification`;
+    } else if (resolve(registered.root) !== resolve(statusIdentity.root)) {
+      identityError = `project ${statusIdentity.id} is registered at ${registered.root}, not current root ${statusIdentity.root}`;
+    }
+  } catch (error) {
+    identityError = error.message;
+  }
   return SUPPORTED_AGENTS.map((client) => {
     const mcpPath = client === "codex" ? join(options.projectDir, ".codex", "config.toml") : jsonTarget(client, options.projectDir);
     try {
       let connected = false;
       let mcpOnly = false;
       let mcpOnlyMetadata = null;
+      let managedProjectId = null;
       if (client === "codex") {
         if (existsSync(mcpPath)) {
           const text = readText(mcpPath);
           validateToml(text, mcpPath);
-          connected = managedCodexBlock(text) !== null;
-          mcpOnly = connected && /# continuitydb adapter mode: mcp-only/.test(text);
+          const ownership = codexManagedMetadata(text);
+          connected = ownership !== null;
+          mcpOnly = ownership?.metadata?.mode === "mcp-only";
+          managedProjectId = ownership?.metadata?.projectId || null;
         }
       } else if (existsSync(mcpPath)) {
         const entry = jsonMcpEntry(client, mcpPath);
@@ -1996,6 +2064,11 @@ export function connectionStatus(rawOptions = {}) {
           if (encoded) {
             try { mcpOnlyMetadata = verifiedMcpOnlyMetadata(entry, readText(mcpPath)); }
             catch { mcpOnlyMetadata = { projectId: null }; }
+            managedProjectId = mcpOnlyMetadata.projectId;
+          } else {
+            managedProjectId = entry.env?.CONTINUITYDB_ALLOWED_PROJECTS
+              || entry.environment?.CONTINUITYDB_ALLOWED_PROJECTS
+              || null;
           }
         }
       }
@@ -2049,13 +2122,9 @@ export function connectionStatus(rawOptions = {}) {
         assets = [statusAsset(mcpPath, "mcp", "continuitydb-mcp-only", (current) => {
           if (client === "codex") {
             validateToml(current, mcpPath);
-            const block = managedCodexBlock(current);
-            if (!block || !/# continuitydb adapter mode: mcp-only/.test(current)) return false;
-            const server = parseToml(current).mcp_servers?.continuitydb;
-            const allowed = server?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
-            const managedText = current.slice(block.start, block.end + CODEX_END.length);
-            const fingerprint = managedText.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m)?.[1];
-            return Boolean(server && fingerprint) && entryFingerprint(server) === fingerprint
+            const ownership = codexManagedMetadata(current, { allowLegacy: false });
+            const allowed = ownership?.entry?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+            return ownership?.metadata?.mode === "mcp-only"
               && allowed !== "default" && allowed !== "*";
           }
           const entry = jsonMcpEntry(client, mcpPath);
@@ -2064,20 +2133,28 @@ export function connectionStatus(rawOptions = {}) {
             && validScopedMcpEntry(client, mcpPath);
         })];
       } else if (client === "claude" || client === "cursor") {
+        const policyPath = client === "claude"
+          ? join(options.projectDir, "CLAUDE.md")
+          : join(options.projectDir, ".cursor", "rules", "continuitydb.mdc");
+        try { managedProjectId = lifecyclePolicyMetadata(readText(policyPath), client)?.projectId || managedProjectId; }
+        catch { /* The policy asset reports malformed ownership below. */ }
         assets = lifecycleStatusAssets(client, options, {
           mcp: mcpPath,
           hooks: client === "claude"
             ? join(options.projectDir, ".claude", "settings.json")
             : join(options.projectDir, ".cursor", "hooks.json"),
-          policy: client === "claude"
-            ? join(options.projectDir, "CLAUDE.md")
-            : join(options.projectDir, ".cursor", "rules", "continuitydb.mdc"),
+          policy: policyPath,
         });
       } else if (client === "opencode") {
         const pluginPath = join(options.projectDir, ".opencode", "plugins", "continuitydb.js");
         const policyPath = join(options.projectDir, "AGENTS.md");
         let metadata = null;
         try { metadata = opencodePluginMetadata(readText(pluginPath)); } catch { /* reported by asset */ }
+        try {
+          managedProjectId = metadata?.projectId
+            || sharedPolicyMetadata(readText(policyPath))?.projectId
+            || managedProjectId;
+        } catch { /* The affected asset reports malformed ownership below. */ }
         assets = [
           statusAsset(mcpPath, "mcp", "continuitydb-mcp", (current) => (
             Boolean(metadata) && sha256(current) === metadata.config.generated && validScopedMcpEntry(client, mcpPath)
@@ -2089,6 +2166,7 @@ export function connectionStatus(rawOptions = {}) {
         const policyPath = join(options.projectDir, ".github", "copilot-instructions.md");
         let metadata = null;
         try { metadata = dedicatedPolicyMetadata(readText(policyPath), client); } catch { /* reported by asset */ }
+        managedProjectId = metadata?.projectId || managedProjectId;
         assets = [
           statusAsset(mcpPath, "mcp", "continuitydb-mcp", () => {
             const entry = jsonMcpEntry(client, mcpPath);
@@ -2107,22 +2185,24 @@ export function connectionStatus(rawOptions = {}) {
         ];
       } else {
         const policyPath = join(options.projectDir, "AGENTS.md");
+        try { managedProjectId = sharedPolicyMetadata(readText(policyPath))?.projectId || managedProjectId; }
+        catch { /* The policy asset reports malformed ownership below. */ }
         assets = [
           statusAsset(mcpPath, "mcp", "continuitydb-mcp", (current) => {
             validateToml(current, mcpPath);
-            const server = parseToml(current).mcp_servers?.continuitydb;
-            const allowed = server?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
-            const managed = managedCodexBlock(current);
-            const block = managed && current.slice(managed.start, managed.end + CODEX_END.length);
-            const fingerprint = block?.match(/^# continuitydb managed entry sha256: ([a-f0-9]{64})$/m)?.[1];
-            return Boolean(managedCodexBlock(current) && server)
-              && Boolean(fingerprint) && entryFingerprint(server) === fingerprint
+            const ownership = codexManagedMetadata(current, { allowLegacy: false });
+            const allowed = ownership?.entry?.env?.CONTINUITYDB_ALLOWED_PROJECTS;
+            return ownership?.metadata?.mode === "complete"
               && allowed !== "default" && allowed !== "*";
           }),
           statusAsset(policyPath, "policy", "continuitydb-policy", (current) => expectedSharedPolicy(current, client, options.projectDir)),
         ];
       }
-      const verified = assets.every((asset) => asset.verified);
+      const projectMismatch = managedProjectId && statusIdentity && managedProjectId !== statusIdentity.id
+        ? `managed ${client} adapter belongs to project ${managedProjectId}, not current project ${statusIdentity.id}`
+        : null;
+      const scopeError = identityError || projectMismatch;
+      const verified = assets.every((asset) => asset.verified) && !scopeError;
       return {
         client,
         connected,
@@ -2130,6 +2210,7 @@ export function connectionStatus(rawOptions = {}) {
         verified,
         drifted: !verified,
         assets,
+        ...(scopeError ? { error: scopeError } : {}),
         ...connectorCapabilities(client, mcpOnly),
       };
     } catch (error) {

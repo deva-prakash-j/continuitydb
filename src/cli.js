@@ -162,12 +162,18 @@ function withDetection(connections, detectedAgents) {
   const detection = new Map(detectedAgents.map((item) => [item.client, item]));
   return connections.map((item) => {
     const found = detection.get(item.client);
+    const detected = Boolean(found?.installed);
+    const limitations = [...(item.limitations || [])];
+    if (!detected) {
+      limitations.push(`The ${item.client} executable was not detected on PATH; install it before using this generated adapter.`);
+    }
     return {
       ...item,
       selected: true,
       planned: item.applied !== true,
-      detected: Boolean(found?.installed),
+      detected,
       detected_executable: found?.executable || null,
+      limitations,
     };
   });
 }

@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -29,6 +29,13 @@ function run(args) {
     stderr: result.stderr,
   })}`);
   return result.stdout.trim() ? JSON.parse(result.stdout) : null;
+}
+
+function runFailure(args, pattern) {
+  const result = spawnSync(binary, args, { encoding: "utf8", timeout: 30_000 });
+  assert.notEqual(result.status, 0, `${args.join(" ")} unexpectedly succeeded`);
+  assert.match(result.stderr, pattern);
+  return result;
 }
 
 function snapshotTree(directory) {
@@ -152,6 +159,16 @@ try {
     assert.equal(existsSync(absolute), true, `missing complete adapter asset: ${path}`);
     assert.doesNotMatch(readFileSync(absolute, "utf8"), /(?:project scope: `default`|ALLOWED_PROJECTS\s*[=:]\s*["']default)/i);
   }
+  for (const connection of setup.connections.filter((item) => !item.detected)) {
+    assert.match(connection.limitations.join("\n"), /executable.*not detected.*PATH/i);
+  }
+
+  const codexConfig = join(project, ".codex", "config.toml");
+  const postConnectToml = '\n[user_after_connect]\nkeep = "binary-user-byte"\n';
+  writeFileSync(codexConfig, `${readFileSync(codexConfig, "utf8")}${postConnectToml}`);
+  const updatedSetup = run(["setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply"]);
+  assert.equal(updatedSetup.connections.find((item) => item.client === "codex").changed, false);
+  assert.equal(readFileSync(codexConfig, "utf8").endsWith(postConnectToml), true);
   assert.equal(run(["doctor", "--home", home]).ok, true);
   const healthyStatus = run(["agents", "status", "--home", home, "--project-dir", project]);
   assert.equal(healthyStatus.agents.filter((item) => item.connected && item.verified && !item.drifted).length, 5);
@@ -166,9 +183,33 @@ try {
   assert.equal(driftedClaude.assets.find((item) => item.path === claudePolicy).changed, true);
   writeFileSync(claudePolicy, healthyClaudePolicy);
 
+  const completeBeforeModeProbe = readFileSync(codexConfig, "utf8");
+  runFailure([
+    "agents", "connect", "codex", "--home", home, "--project-dir", project,
+    "--mcp-only", "--apply",
+  ], /mode.*disconnect|disconnect.*mode/i);
+  runFailure([
+    "agents", "disconnect", "codex", "--home", home, "--project-dir", project,
+    "--mcp-only", "--apply",
+  ], /mode mismatch|complete adapter/i);
+  assert.equal(readFileSync(codexConfig, "utf8"), completeBeforeModeProbe);
+
+  const copiedProject = join(root, "copied", "generic-repo");
+  mkdirSync(join(root, "copied"));
+  cpSync(project, copiedProject, { recursive: true });
+  const copiedCodex = join(copiedProject, ".codex", "config.toml");
+  const copiedBefore = readFileSync(copiedCodex, "utf8");
+  const copiedStatus = run(["agents", "status", "--home", home, "--project-dir", copiedProject]);
+  const copiedCodexStatus = copiedStatus.agents.find((item) => item.client === "codex");
+  assert.equal(copiedCodexStatus.verified, false);
+  assert.equal(copiedCodexStatus.drifted, true);
+  assert.match(copiedCodexStatus.error, /registered.*root|not registered/i);
+  assert.equal(readFileSync(copiedCodex, "utf8"), copiedBefore);
+
   const disconnected = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
   assert.equal(disconnected.results.every((item) => item.applied && item.verified), true);
   assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
+  assert.equal(readFileSync(codexConfig, "utf8"), postConnectToml);
   const disconnectRetry = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--apply"]);
   assert.equal(disconnectRetry.results.every((item) => !item.changed), true);
 
@@ -177,6 +218,11 @@ try {
   assert.equal(readFileSync(join(project, "AGENTS.md"), "utf8"), userAgents);
   const mcpOnlyStatus = run(["agents", "status", "--home", home, "--project-dir", project]);
   assert.equal(mcpOnlyStatus.agents.filter((item) => item.connected && item.verified && item.recall_mode === "mcp-only").length, 5);
+  const mcpOnlyBeforeModeProbe = readFileSync(codexConfig, "utf8");
+  runFailure([
+    "agents", "connect", "codex", "--home", home, "--project-dir", project, "--apply",
+  ], /mode.*disconnect|disconnect.*mode/i);
+  assert.equal(readFileSync(codexConfig, "utf8"), mcpOnlyBeforeModeProbe);
   const mcpOnlyDisconnected = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--mcp-only", "--apply"]);
   assert.equal(mcpOnlyDisconnected.results.every((item) => item.applied && item.verified), true);
   const mcpOnlyRetry = run(["agents", "disconnect", "all", "--home", home, "--project-dir", project, "--mcp-only", "--apply"]);
@@ -267,7 +313,7 @@ try {
     version: version.version,
     platform: version.platform,
     arch: version.arch,
-    checks: ["self-install", "setup", "five-complete-adapters", "status-drift", "mcp-only", "disconnect-retry", "doctor", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
+    checks: ["self-install", "setup", "five-complete-adapters", "codex-surgical-update", "status-drift", "status-project-root", "mode-transitions", "missing-executable-limitations", "mcp-only", "disconnect-retry", "doctor", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
   }, null, 2)}\n`);
 } finally {
   rmSync(root, { recursive: true, force: true });
