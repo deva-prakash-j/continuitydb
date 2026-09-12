@@ -2,6 +2,24 @@
 
 Thanks for improving ContinuityDB.
 
+If you are new to the project, start with a
+[`good first issue`](https://github.com/deva-prakash-j/continuitydb/labels/good%20first%20issue)
+or discuss an idea before committing to a large change. Usage questions belong
+in [GitHub Discussions](https://github.com/deva-prakash-j/continuitydb/discussions).
+
+## Local development
+
+```bash
+git clone https://github.com/deva-prakash-j/continuitydb.git
+cd continuitydb
+npm ci
+npm test
+```
+
+Run `npm run release:check` before opening a pull request. Standalone binary
+tests require the Node version pinned by the release workflow; ordinary source
+development supports the versions declared in `package.json`.
+
 ## Before opening a pull request
 
 1. Open or reference an issue for changes to public contracts, storage formats,
@@ -27,3 +45,7 @@ Thanks for improving ContinuityDB.
 Use focused commits and explain observable behavior, tests, migration risk and
 security impact in the pull request. At least one maintainer review is required;
 security-boundary changes require two.
+
+Small documentation, examples, and client-compatibility improvements are
+welcome. Never include real tokens, private repositories, raw memory records,
+or employer data in tests, examples, issues, or pull requests.

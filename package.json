@@ -2,18 +2,31 @@
   "name": "continuitydb",
   "version": "0.7.0",
   "private": false,
-  "description": "Portable, Git-grounded context graph for AI agents",
+  "description": "Git-grounded, provider-neutral context continuity for AI coding agents",
   "type": "module",
   "license": "Apache-2.0",
   "keywords": [
     "ai",
-    "agent",
-    "memory",
+    "ai-agents",
+    "agent-memory",
+    "coding-agents",
+    "developer-tools",
+    "git",
+    "local-first",
     "mcp",
+    "model-context-protocol",
     "rag",
     "code-graph",
     "context-engine"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/deva-prakash-j/continuitydb.git"
+  },
+  "homepage": "https://github.com/deva-prakash-j/continuitydb#readme",
+  "bugs": {
+    "url": "https://github.com/deva-prakash-j/continuitydb/issues"
+  },
   "bin": {
     "continuitydb": "src/cli.js",
     "continuitydb-hook": "src/lifecycle-hook.js"
@@ -39,6 +52,7 @@
     "SECURITY.md",
     "CHANGELOG.md",
     "CONTRIBUTING.md",
+    "SUPPORT.md",
     "CODE_OF_CONDUCT.md",
     "GOVERNANCE.md",
     "THIRD_PARTY_NOTICES.md"

@@ -1,0 +1,22 @@
+title: "Show and tell: "
+body:
+  - type: markdown
+    attributes:
+      value: Show how you use ContinuityDB, what worked, and where it was awkward.
+  - type: textarea
+    id: setup
+    attributes:
+      label: Your setup
+      description: Which agents, clients, repositories, and platform are involved?
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: What ContinuityDB helped with
+    validations:
+      required: true
+  - type: textarea
+    id: friction
+    attributes:
+      label: Friction or missing pieces

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/deva-prakash-j/continuitydb/discussions
+    about: Ask for help, share a workflow, or discuss an early idea.
+  - name: Security vulnerability
+    url: https://github.com/deva-prakash-j/continuitydb/security/advisories/new
+    about: Privately report a vulnerability or sensitive security issue.

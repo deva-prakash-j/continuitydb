@@ -5,33 +5,89 @@
 [![Node.js 22.5+](https://img.shields.io/badge/node-%3E%3D22.5-339933?logo=node.js&logoColor=white)](package.json)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#project-status)
 
-**Portable, Git-grounded context continuity for AI agents.**
+**Give every coding agent the same project context—across repositories,
+sessions, and tools—with Git-grounded citations when context comes from a
+repository.**
 
-ContinuityDB lets useful engineering context survive a new chat, repository,
-IDE, coding agent, or model provider. Agents retrieve a small, cited context
-pack from lexical, semantic, and dependency-graph signals while tenant, owner,
-project, sensitivity, and temporal boundaries are enforced before content is
-returned.
+ContinuityDB is a local-first context service for Codex, Claude Code, Cursor,
+OpenCode, GitHub Copilot, and custom MCP clients. It keeps useful engineering
+context outside any one chat or model provider, then returns a small,
+scope-filtered context pack. When Git provenance is supplied or ingested, the
+pack preserves commit, path, symbol, and branch evidence for verification.
+
+[Download a standalone build](https://github.com/deva-prakash-j/continuitydb/releases)
+· [Quick start](#60-second-quick-start)
+· [How it works](docs/architecture.md)
+· [Client compatibility](docs/client-compatibility.md)
+· [Ask a question](https://github.com/deva-prakash-j/continuitydb/discussions)
+
+Use ContinuityDB when:
+
+- a new coding-agent session forgets an architectural decision from yesterday;
+- a change in one repository affects a schema, event, or service in another;
+- several coding agents need the same evidence without sharing raw transcripts;
+- recalled context must be project-scoped, branch-aware, and auditable.
+
+## 60-second quick start
+
+Download the binary and `.sha256` file for your platform from
+[Releases](https://github.com/deva-prakash-j/continuitydb/releases), verify the
+checksum, then preview a user-scoped install:
+
+```bash
+chmod +x ./continuitydb-linux-x64
+./continuitydb-linux-x64 install
+./continuitydb-linux-x64 install --apply
+
+export PATH="$HOME/.local/bin:$PATH"
+continuitydb setup --agents detected --project-dir "$PWD" --apply
+```
+
+Now save one piece of project context and retrieve it from another session or
+agent identity:
+
+```bash
+CONTINUITYDB_OWNER_ID=demo-user CONTINUITYDB_AGENT_ID=agent-a \
+continuitydb capture \
+  --project charge-api \
+  --kind working \
+  --body "Publish charge-schema before regenerating the API client" \
+  --idempotency-key charge-release-order-v1
+
+CONTINUITYDB_OWNER_ID=demo-user CONTINUITYDB_AGENT_ID=agent-b \
+continuitydb context "What is the release order?" \
+  --project charge-api \
+  --allow-projects charge-api
+```
+
+The result is a token-bounded, project-scoped context pack—not an unscoped
+transcript dump. Git citations appear when a capture or repository ingestion
+includes Git provenance. See the
+[binary setup guide](docs/binary-distribution.md) for macOS, Windows, semantic
+search, and recovery details.
+
+## Why ContinuityDB?
+
+| Approach | What it handles | What ContinuityDB adds |
+|---|---|---|
+| Repository instructions | Stable guidance inside one repository | Cross-repository context and dependency edges |
+| Chat history | Continuity inside one conversation/provider | Provider-neutral, cross-agent recall |
+| Generic vector memory | Similar-text retrieval | Git citations, branch/commit validity, lexical and graph signals |
+| Raw transcript storage | Maximum conversation history | Explicit capture, scoped retrieval, lifecycle and approval controls |
 
 ## Project status
 
-> **Project status:** v0.7 alpha candidate. The embedded SQLite/FTS5 mode is implemented,
-> tested, and suitable for local evaluation. The repository includes a
-> PostgreSQL/pgvector reference schema and distributed architecture, but the
-> production adapter and billion-record proof do not exist yet. Remote MCP and
-> client adapters are evidence-graded: a tested configuration is not described
-> as a real-client tool-call proof unless that exact client performed the call.
+> **v0.7 alpha:** the embedded SQLite/FTS5 runtime and supported standalone
+> builds are ready for local evaluation. The PostgreSQL/pgvector files are a
+> reference design, not a production adapter. Client claims remain
+> evidence-graded: configuration tests are not presented as real-client
+> tool-call proof.
 
 ### Verification status
 
-The v0.7 release candidate at `8c0fa54c8d4981de458f6cdb498a358a5a0faa3b`
-has passed its builder and supported-native CI gates:
+The current `main` build has passed its builder and supported-native CI gates:
 
-- full automated suite: **125/125 passing**, with 0 failed and 0 skipped;
-- OpenAPI validation: **20 paths**;
-- exact lexical Recall@5: **9/9**, with **0 isolation violations**;
-- dependency audit: **0 known production vulnerabilities**;
-- package dry-run: **86 files**;
+- full automated, API, package, quality, security, and dependency gates;
 - Linux x64, macOS arm64, and Windows x64 standalone executables: native
   functional smoke, local semantic inference, checksum, and artifact upload
   **terminal green**;
@@ -43,11 +99,9 @@ locks plus compare-and-swap rollback. Direct edits made by programs that do not
 participate in the lock protocol are rechecked immediately before replacement,
 but do not receive a portable cross-process transaction guarantee.
 
-See the exact commands, GitHub run URLs, artifact digests, environment, and
-evidence boundaries in the
+See exact commands, run URLs, artifact digests, and evidence boundaries in the
 [v0.7 verification record](docs/build-verification-2026-09-11-v0.7.md).
-The independent Astraea verdict remains the final release gate. Intel macOS
-uses the npm distribution because upstream Node 25 SEA executables
+Intel macOS uses the source/npm distribution because upstream Node 25 SEA executables
 [segfault on x64 macOS](https://github.com/nodejs/node/issues/62893).
 
 ## The problem
@@ -955,8 +1009,10 @@ that close a documented limitation with tests and evidence are especially welcom
 | [v0.4 verification](docs/build-verification-2026-09-10-v0.4.md) | Central MCP, handoff, UI, provenance, branch, budget and audit gates |
 | [v0.5 verification](docs/build-verification-2026-09-10-v0.5.md) | Pinned local model, integrity, quality, footprint, and CLI backfill gates |
 | [v0.6 verification](docs/build-verification-2026-09-11-v0.6.md) | Remote MCP, OIDC, client contracts, lifecycle adapters, and interoperability evidence |
+| [v0.7 verification](docs/build-verification-2026-09-11-v0.7.md) | Standalone builds, setup/install transactions, native CI, checksums, and provenance |
 | [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
 | [Security policy](SECURITY.md) | Supported line and private reporting process |
+| [Support](SUPPORT.md) | Questions, bug reports, feature requests, and security-report routing |
 | [Contributing](CONTRIBUTING.md) | Development and pull-request expectations |
 | [Governance](GOVERNANCE.md) | Maintainer and decision model |
 | [Code of Conduct](CODE_OF_CONDUCT.md) | Community participation rules |
