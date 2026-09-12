@@ -620,7 +620,14 @@ test("existing main prerelease rejects draft state before refresh", () => {
   assert.doesNotMatch(readFileSync(calls, "utf8"), /gh release upload/);
 });
 
-function runPublishedStableShell({ sha, draft = false, mainAncestor = true, remoteTagSha = sha }) {
+function runPublishedStableShell({
+  sha,
+  draft = false,
+  mainAncestor = true,
+  remoteTagSha = sha,
+  moveTagDuringMetadata = "",
+  moveMainDuringMetadata = "",
+}) {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-published-stable-"));
   const bin = join(root, "bin");
   const calls = join(root, "calls");
@@ -644,7 +651,7 @@ function runPublishedStableShell({ sha, draft = false, mainAncestor = true, remo
   writeFileSync(fakeGit, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'git %s\\n' "$*" >> "$CALL_LOG"\ncase "$1" in\n  fetch) exit 0 ;;\n  merge-base) [[ "$(cat "$MAIN_STATE")" == true ]] ;;\n  rev-parse) printf '%s\\n' "$GITHUB_SHA" ;;\n  *) exit 2 ;;\nesac\n`, "utf8");
   chmodSync(fakeGit, 0o755);
   const fakeGh = join(bin, "gh");
-  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else cat "$TAG_STATE"; printf '\\n'; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'false\\n'; fi\n  if [[ "$*" == *"isDraft"* ]]; then printf '%s\\n' "$RELEASE_DRAFT"; fi\n  if [[ "$*" == *"tagName"* ]]; then printf '%s\\n' "$GITHUB_REF_NAME"; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release download" ]]; then\n  destination=''\n  while (( $# > 0 )); do\n    if [[ "$1" == "--dir" ]]; then destination="$2"; break; fi\n    shift\n  done\n  cp "$SOURCE_RELEASE_DIR"/* "$destination"/\n  exit 0\nfi\nif [[ "$1 $2" == "attestation verify" ]]; then exit 0; fi\nexit 2\n`, "utf8");
+  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else cat "$TAG_STATE"; printf '\\n'; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'false\\n'; fi\n  if [[ "$*" == *"isDraft"* ]]; then printf '%s\\n' "$RELEASE_DRAFT"; fi\n  if [[ "$*" == *"tagName"* ]]; then\n    printf '%s\\n' "$GITHUB_REF_NAME"\n    if [[ -n "$MOVE_TAG_DURING_METADATA" ]]; then printf '%s' "$MOVE_TAG_DURING_METADATA" > "$TAG_STATE"; fi\n    if [[ -n "$MOVE_MAIN_DURING_METADATA" ]]; then printf '%s' "$MOVE_MAIN_DURING_METADATA" > "$MAIN_STATE"; fi\n  fi\n  exit 0\nfi\nif [[ "$1 $2" == "release download" ]]; then\n  destination=''\n  while (( $# > 0 )); do\n    if [[ "$1" == "--dir" ]]; then destination="$2"; break; fi\n    shift\n  done\n  cp "$SOURCE_RELEASE_DIR"/* "$destination"/\n  exit 0\nfi\nif [[ "$1 $2" == "attestation verify" ]]; then exit 0; fi\nexit 2\n`, "utf8");
   chmodSync(fakeGh, 0o755);
   const verify = workflow.jobs.publish.steps
     .find((step) => String(step.name || "").includes("Verify published release assets"));
@@ -660,6 +667,8 @@ function runPublishedStableShell({ sha, draft = false, mainAncestor = true, remo
       TAG_STATE: tagState,
       SOURCE_RELEASE_DIR: release,
       RELEASE_DRAFT: String(draft),
+      MOVE_TAG_DURING_METADATA: moveTagDuringMetadata,
+      MOVE_MAIN_DURING_METADATA: moveMainDuringMetadata,
       GH_REPO: "test/repo",
       GITHUB_REF: "refs/tags/v0.7.0",
       GITHUB_REF_NAME: "v0.7.0",
@@ -690,6 +699,20 @@ test("post-publication execution requires non-draft state and fresh stable ident
   const movedTag = runPublishedStableShell({ sha, remoteTagSha: "f".repeat(40) });
   assert.notEqual(movedTag.result.status, 0);
   assert.doesNotMatch(movedTag.calls, /gh release download/);
+
+  const tagMovedDuringMetadata = runPublishedStableShell({
+    sha,
+    moveTagDuringMetadata: "e".repeat(40),
+  });
+  assert.notEqual(tagMovedDuringMetadata.result.status, 0);
+  assert.doesNotMatch(tagMovedDuringMetadata.calls, /gh release download/);
+
+  const mainMovedDuringMetadata = runPublishedStableShell({
+    sha,
+    moveMainDuringMetadata: "false",
+  });
+  assert.notEqual(mainMovedDuringMetadata.result.status, 0);
+  assert.doesNotMatch(mainMovedDuringMetadata.calls, /gh release download/);
 });
 
 test("release check builds the standalone binary before the generated Codex config probe", () => {
