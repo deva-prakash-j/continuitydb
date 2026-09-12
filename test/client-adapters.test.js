@@ -65,6 +65,23 @@ test("client validator normalizes generated paths structurally when its temporar
   }
 });
 
+test("client validator compares generated Markdown policy with platform-neutral line endings", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-policy-eol-"));
+  const examples = join(root, "examples");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "codex.AGENTS.md");
+    const content = readFileSync(path, "utf8").replaceAll("\r\n", "\n").replaceAll("\n", "\r\n");
+    writeFileSync(path, content);
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("client validator rejects drift in every shipped generated hook example", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-client-example-drift-"));
   const examples = join(root, "examples");

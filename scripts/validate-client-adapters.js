@@ -202,8 +202,10 @@ function validateGeneratedExamples(projectDir, home) {
   assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[1])), generatedCursor);
   assert.deepEqual(JSON.parse(readRepositoryFile(GENERATED_EXAMPLES[2])), generatedClaude,
     `${GENERATED_EXAMPLES[2]} does not match the generated hook example`);
-  assert.equal(readRepositoryFile(GENERATED_EXAMPLES[3]).trimEnd(),
-    readFileSync(join(projectDir, "AGENTS.md"), "utf8").trimEnd());
+  const semanticMarkdown = (value) => value.replaceAll("\r\n", "\n").replaceAll("\r", "\n").trimEnd();
+  assert.equal(semanticMarkdown(readRepositoryFile(GENERATED_EXAMPLES[3])),
+    semanticMarkdown(readFileSync(join(projectDir, "AGENTS.md"), "utf8")),
+    `${GENERATED_EXAMPLES[3]} does not match the generated policy example`);
   return [...GENERATED_EXAMPLES];
 }
 
