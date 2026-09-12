@@ -32,6 +32,7 @@ import {
   connectionStatus,
   detectAgents,
   disconnectAgents,
+  setupAgentSummary,
   SUPPORTED_AGENTS,
 } from "./agent-connectors.js";
 import { isStandaloneBinary } from "./binary-runtime.js";
@@ -131,10 +132,13 @@ if (!command || command === "help" || flags.help) {
   process.exit(0);
 }
 
-function agentSelection(value) {
+function agentSelection(value, detectedAgents = null) {
   const requested = listFlag(value || "detected");
   if (requested.includes("all")) return [...SUPPORTED_AGENTS];
-  if (requested.includes("detected")) return detectAgents().filter((item) => item.installed).map((item) => item.client);
+  if (requested.includes("detected")) {
+    const detection = detectedAgents || detectAgents();
+    return detection.filter((item) => item.installed).map((item) => item.client);
+  }
   const unsupported = requested.filter((item) => !SUPPORTED_AGENTS.includes(item));
   if (unsupported.length) throw new Error(`unsupported agents: ${unsupported.join(", ")}`);
   return [...new Set(requested)];
@@ -378,7 +382,9 @@ try {
   } else if (command === "install") {
     output(installStandaloneBinary({ prefix: flags.prefix, apply: Boolean(flags.apply), force: Boolean(flags.force) }));
   } else if (command === "setup") {
-    const selected = agentSelection(flags.agents);
+    const requestedAgents = flags.agents ? String(flags.agents) : "detected";
+    const detectedAgents = detectAgents();
+    const selected = agentSelection(requestedAgents, detectedAgents);
     const projectDir = resolve(flags.project_dir || process.cwd());
     const identity = resolveProjectIdentity({ projectDir, explicitProject: flags.project });
     const connectionOptions = { ...agentOptions(), projectId: identity.id };
@@ -394,7 +400,10 @@ try {
         home,
         config: configPath,
         stats: null,
-        detected_agents: detectAgents(),
+        project: identity,
+        agents: setupAgentSummary({ requested: requestedAgents, detectedAgents, connections: previewConnections }),
+        configuration_scope: "project",
+        detected_agents: detectedAgents,
         connections: previewConnections,
         registration: previewRegistration,
         embeddings: flags.semantic ? { planned: true, provider: "local" } : null,
@@ -437,7 +446,10 @@ try {
         home,
         config: configPath,
         stats: initialized.stats,
-        detected_agents: detectAgents(),
+        project: identity,
+        agents: setupAgentSummary({ requested: requestedAgents, detectedAgents, connections }),
+        configuration_scope: "project",
+        detected_agents: detectedAgents,
         connections,
         registration: initialized.registration,
         embeddings: initialized.embeddings,

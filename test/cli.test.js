@@ -120,18 +120,68 @@ test("CLI setup previews and applies all project agent connections idempotently"
     assert.equal(preview.status, 0, preview.stderr);
     const previewValue = JSON.parse(preview.stdout);
     assert.equal(previewValue.connections.length, 5);
+    assert.deepEqual(previewValue.project, {
+      id: "cli-test", root: project, source: "explicit", git_root: null,
+    });
+    assert.deepEqual(previewValue.agents.connected, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.equal(previewValue.agents.requested, "all");
+    assert.equal(previewValue.configuration_scope, "project");
     assert.deepEqual(previewValue.run, { command: "continuitydb", args: ["run", "--home", home] });
     assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
     assert.equal(existsSync(home), false, "setup preview must not initialize the vault");
     const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
     assert.equal(applied.status, 0, applied.stderr);
-    assert.equal(JSON.parse(applied.stdout).connections.every((item) => item.applied), true);
+    const appliedValue = JSON.parse(applied.stdout);
+    assert.equal(appliedValue.connections.every((item) => item.applied), true);
+    assert.deepEqual(appliedValue.project, previewValue.project);
+    assert.deepEqual(appliedValue.agents.connected, previewValue.agents.connected);
+    assert.equal(appliedValue.configuration_scope, "project");
     const status = spawnSync(process.execPath, [cli, "agents", "status", "--home", home, "--project-dir", project], { encoding: "utf8" });
     assert.equal(status.status, 0, status.stderr);
     assert.equal(JSON.parse(status.stdout).agents.filter((item) => item.connected).length, 5);
     const repeated = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
     assert.equal(repeated.status, 0, repeated.stderr);
     assert.equal(JSON.parse(repeated.stdout).connections.every((item) => !item.changed), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup reports a filesystem-detected OpenCode-only project connection", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-detected-summary-"));
+  const project = join(root, "billing-api");
+  const home = join(root, "vault");
+  const bin = join(root, "bin");
+  const userHome = join(root, "user-home");
+  const executionMarker = join(root, "opencode-executed");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(bin);
+    mkdirSync(userHome);
+    writeFileSync(join(bin, "opencode"), `#!/bin/sh\nprintf executed > ${executionMarker}\n`, { mode: 0o755 });
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "detected",
+    ], { encoding: "utf8", env: { ...process.env, PATH: bin, HOME: userHome, USERPROFILE: userHome } });
+    assert.equal(result.status, 0, result.stderr);
+    const value = JSON.parse(result.stdout);
+    assert.deepEqual(value.project, {
+      id: "billing-api", root: project, source: "git", git_root: project,
+    });
+    assert.deepEqual(value.agents, {
+      requested: "detected",
+      detected: ["opencode"],
+      connected: ["opencode"],
+      supported_not_installed: ["codex", "claude", "cursor", "copilot"],
+    });
+    assert.equal(value.configuration_scope, "project");
+    assert.equal(value.connections.length, 1);
+    assert.equal(value.connections[0].client, "opencode");
+    assert.equal(value.connections[0].path, join(project, "opencode.json"));
+    assert.equal(existsSync(join(project, "opencode.json")), false);
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(executionMarker), false, "detected client binaries must never execute");
+    assert.deepEqual(readdirSync(userHome), [], "setup preview must not create global client configuration");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -201,10 +251,30 @@ test("CLI setup authorizes the exact AgentForge Git identity without a default f
     assert.equal(server.env.CONTINUITYDB_ALLOWED_PROJECTS.includes("default"), false);
 
     client = new Client({ name: "agentforge-regression", version: "0.7.0" });
+    const ambientEnvironment = {
+      ...process.env,
+      CONTINUITYDB_ALLOWED_PROJECTS: "ambient-project",
+      CONTINUITYDB_ALLOWED_SENSITIVITIES: "restricted",
+      CONTINUITYDB_CAPTURE_POLICY_FILE: join(root, "hostile-ambient-policy.json"),
+      CONTINUITYDB_TENANT_ID: "ambient-tenant",
+      CONTINUITYDB_PRINCIPAL_ID: "ambient-principal",
+      CONTINUITYDB_OWNER_ID: "ambient-owner",
+      CONTINUITYDB_AGENT_ID: "ambient-agent",
+    };
+    const isolatedEnvironment = Object.fromEntries(Object.entries(ambientEnvironment).filter(([key]) => ![
+      "CONTINUITYDB_ALLOWED_PROJECTS",
+      "CONTINUITYDB_ALLOWED_SENSITIVITIES",
+      "CONTINUITYDB_CAPTURE_POLICY_FILE",
+      "CONTINUITYDB_TENANT_ID",
+      "CONTINUITYDB_PRINCIPAL_ID",
+      "CONTINUITYDB_OWNER_ID",
+      "CONTINUITYDB_AGENT_ID",
+    ].includes(key)));
+    assert.equal(isolatedEnvironment.CONTINUITYDB_CAPTURE_POLICY_FILE, undefined);
     await client.connect(new StdioClientTransport({
       command: server.command,
       args: server.args,
-      env: { ...process.env, ...server.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" },
+      env: { ...isolatedEnvironment, ...server.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" },
     }));
     const captured = await client.callTool({
       name: "memory_capture",

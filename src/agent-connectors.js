@@ -576,6 +576,17 @@ export function detectAgents(environment = process.env) {
   });
 }
 
+export function setupAgentSummary({ requested = "detected", detectedAgents, connections }) {
+  const detected = detectedAgents.filter((item) => item.installed).map((item) => item.client);
+  const connected = [...new Set(connections.map((item) => item.client))];
+  return {
+    requested,
+    detected,
+    connected,
+    supported_not_installed: SUPPORTED_AGENTS.filter((client) => !detected.includes(client)),
+  };
+}
+
 export function defaultInstallPrefix() {
   return process.platform === "win32"
     ? join(process.env.LOCALAPPDATA || homedir(), "ContinuityDB")

@@ -9,6 +9,7 @@ import {
   connectionStatus,
   detectAgents,
   disconnectAgent,
+  setupAgentSummary,
   SUPPORTED_AGENTS,
 } from "../src/agent-connectors.js";
 
@@ -207,6 +208,29 @@ test("agent detection reads PATH without executing discovered programs", () => {
     const detected = detectAgents({ PATH: bin });
     assert.equal(detected.find((item) => item.client === "codex").installed, true);
     assert.equal(detected.find((item) => item.client === "claude").installed, false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("agent setup summary separates requested, detected, connected, and unsupported clients", () => {
+  const value = fixture();
+  try {
+    const bin = join(value.root, "bin");
+    mkdirSync(bin);
+    writeFileSync(join(bin, "opencode"), "must never run", { mode: 0o755 });
+    const detected = detectAgents({ PATH: bin });
+    const summary = setupAgentSummary({
+      requested: "detected",
+      detectedAgents: detected,
+      connections: [{ client: "opencode", applied: false }],
+    });
+    assert.deepEqual(summary, {
+      requested: "detected",
+      detected: ["opencode"],
+      connected: ["opencode"],
+      supported_not_installed: ["codex", "claude", "cursor", "copilot"],
+    });
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
