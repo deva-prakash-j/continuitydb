@@ -578,10 +578,14 @@ export function detectAgents(environment = process.env) {
 
 export function setupAgentSummary({ requested = "detected", detectedAgents, connections }) {
   const detected = detectedAgents.filter((item) => item.installed).map((item) => item.client);
-  const connected = [...new Set(connections.map((item) => item.client))];
+  const selected = [...new Set(connections.map((item) => item.client))];
+  const planned = [...new Set(connections.filter((item) => item.applied !== true).map((item) => item.client))];
+  const connected = [...new Set(connections.filter((item) => item.applied === true).map((item) => item.client))];
   return {
     requested,
     detected,
+    selected,
+    planned,
     connected,
     supported_not_installed: SUPPORTED_AGENTS.filter((client) => !detected.includes(client)),
   };

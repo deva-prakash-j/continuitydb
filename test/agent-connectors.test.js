@@ -213,7 +213,7 @@ test("agent detection reads PATH without executing discovered programs", () => {
   }
 });
 
-test("agent setup summary separates requested, detected, connected, and unsupported clients", () => {
+test("agent setup summary separates selected preview plans from applied connections", () => {
   const value = fixture();
   try {
     const bin = join(value.root, "bin");
@@ -228,9 +228,20 @@ test("agent setup summary separates requested, detected, connected, and unsuppor
     assert.deepEqual(summary, {
       requested: "detected",
       detected: ["opencode"],
-      connected: ["opencode"],
+      selected: ["opencode"],
+      planned: ["opencode"],
+      connected: [],
       supported_not_installed: ["codex", "claude", "cursor", "copilot"],
     });
+
+    const applied = setupAgentSummary({
+      requested: "detected",
+      detectedAgents: detected,
+      connections: [{ client: "opencode", applied: true }],
+    });
+    assert.deepEqual(applied.selected, ["opencode"]);
+    assert.deepEqual(applied.planned, []);
+    assert.deepEqual(applied.connected, ["opencode"]);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }

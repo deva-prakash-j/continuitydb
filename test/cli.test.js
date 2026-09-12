@@ -123,7 +123,9 @@ test("CLI setup previews and applies all project agent connections idempotently"
     assert.deepEqual(previewValue.project, {
       id: "cli-test", root: project, source: "explicit", git_root: null,
     });
-    assert.deepEqual(previewValue.agents.connected, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.deepEqual(previewValue.agents.selected, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.deepEqual(previewValue.agents.planned, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.deepEqual(previewValue.agents.connected, []);
     assert.equal(previewValue.agents.requested, "all");
     assert.equal(previewValue.configuration_scope, "project");
     assert.deepEqual(previewValue.run, { command: "continuitydb", args: ["run", "--home", home] });
@@ -134,7 +136,9 @@ test("CLI setup previews and applies all project agent connections idempotently"
     const appliedValue = JSON.parse(applied.stdout);
     assert.equal(appliedValue.connections.every((item) => item.applied), true);
     assert.deepEqual(appliedValue.project, previewValue.project);
-    assert.deepEqual(appliedValue.agents.connected, previewValue.agents.connected);
+    assert.deepEqual(appliedValue.agents.selected, previewValue.agents.selected);
+    assert.deepEqual(appliedValue.agents.planned, []);
+    assert.deepEqual(appliedValue.agents.connected, previewValue.agents.selected);
     assert.equal(appliedValue.configuration_scope, "project");
     const status = spawnSync(process.execPath, [cli, "agents", "status", "--home", home, "--project-dir", project], { encoding: "utf8" });
     assert.equal(status.status, 0, status.stderr);
@@ -171,7 +175,9 @@ test("CLI setup reports a filesystem-detected OpenCode-only project connection",
     assert.deepEqual(value.agents, {
       requested: "detected",
       detected: ["opencode"],
-      connected: ["opencode"],
+      selected: ["opencode"],
+      planned: ["opencode"],
+      connected: [],
       supported_not_installed: ["codex", "claude", "cursor", "copilot"],
     });
     assert.equal(value.configuration_scope, "project");
