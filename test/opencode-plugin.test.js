@@ -364,3 +364,51 @@ test("idle save reads only the explicit structured handoff and fails closed", as
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("generated local plugin rejects quarantined checkpoints and preserves latest handoff", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-local-quarantine-"));
+  try {
+    const { home, project } = seedLocal(root, "inventory.v2");
+    const bin = installHookWrapper(root);
+    const module = await importGenerated(root, {
+      projectId: "inventory.v2", transport: "stdio", home,
+      tenantId: "tenant-a", ownerId: "owner-a", sensitivities: ["private", "restricted"],
+    });
+    const handoff = join(project, ".continuitydb-handoff.json");
+    await withEnvironment({ PATH: `${bin}${delimiter}${process.env.PATH || ""}` }, async () => {
+      const plugin = await module.ContinuityDBPlugin({ directory: project });
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "local-quarantine-task", goal: "Resume safely",
+        current_state: "LOCAL_ACTIVE_BASELINE", checkpoint_id: "local-checkpoint-1",
+      }));
+      assert.equal((await plugin.event({ event: { type: "session.idle" } })).saved, true);
+
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "local-quarantine-task", goal: "Resume safely",
+        current_state: "LOCAL_STALE_SUCCESSOR", checkpoint_id: "local-checkpoint-2",
+        previous_checkpoint_id: "not-the-latest",
+      }));
+      await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /not saved.*quarantined/i);
+
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "local-restricted-task", goal: "Held work",
+        current_state: "LOCAL_RESTRICTED_CHECKPOINT", checkpoint_id: "local-restricted-1",
+        sensitivity: "restricted",
+      }));
+      await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /not saved.*quarantined/i);
+
+      const vault = new ContextVault(home);
+      assert.equal(vault.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "local-quarantine-task",
+        allowed_sensitivities: ["private", "restricted"],
+      }).handoff.current_state, "LOCAL_ACTIVE_BASELINE");
+      assert.equal(vault.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "local-restricted-task",
+        allowed_sensitivities: ["private", "restricted"],
+      }), null);
+      vault.close();
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

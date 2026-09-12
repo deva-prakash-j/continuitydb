@@ -23,6 +23,19 @@ function runHook(args, env) {
   });
 }
 
+function runHookResult(args, env) {
+  const hook = new URL("../src/lifecycle-hook.js", import.meta.url).pathname;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [hook, ...args], { env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
 function seedLocalMemory(root, projectId, body) {
   const home = join(root, "vault");
   registerProject(home, { id: projectId, root: join(root, "project"), source: "explicit" }, { apply: true });
@@ -191,9 +204,76 @@ test("repeated identical checkpoint is an idempotent truthful duplicate", async 
     const second = JSON.parse(await runHook(["checkpoint", "--file", checkpoint, "--client", "claude", "--verbose"], env));
     assert.equal(first.saved, true);
     assert.equal(first.duplicate, false);
+    assert.equal(first.disposition, "active");
+    assert.equal(first.status, "active");
+    assert.equal(typeof first.reason, "string");
     assert.equal(second.saved, true);
     assert.equal(second.duplicate, true);
+    assert.equal(second.disposition, "active");
+    assert.equal(second.status, "active");
+    assert.equal(typeof second.reason, "string");
     assert.equal(second.memory_id, first.memory_id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local lifecycle reports quarantined checkpoints as not saved and leaves latest unchanged", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-quarantine-test-"));
+  try {
+    const home = seedLocalMemory(root, "billing-api", "Quarantine fixture");
+    const env = {
+      CONTINUITYDB_HOME: home,
+      CONTINUITYDB_PROJECT_ID: "billing-api",
+      CONTINUITYDB_HTTP_URL: "",
+      CONTINUITYDB_ALLOWED_SENSITIVITIES: "private,restricted",
+    };
+    const path = join(root, "handoff.json");
+    writeFileSync(path, JSON.stringify({
+      project_id: "billing-api", task_id: "quarantine-task", goal: "Resume safely",
+      current_state: "ACTIVE_BASELINE", checkpoint_id: "checkpoint-1",
+    }));
+    const active = JSON.parse(await runHook(["checkpoint", "--file", path, "--verbose"], env));
+    assert.equal(active.saved, true);
+
+    writeFileSync(path, JSON.stringify({
+      project_id: "billing-api", task_id: "quarantine-task", goal: "Resume safely",
+      current_state: "STALE_SUCCESSOR", checkpoint_id: "checkpoint-2",
+      previous_checkpoint_id: "not-the-latest",
+    }));
+    const stale = await runHookResult(["checkpoint", "--file", path, "--verbose"], env);
+    assert.equal(stale.code, 1);
+    assert.equal(stale.stderr, "");
+    const staleOutput = JSON.parse(stale.stdout);
+    assert.equal(staleOutput.saved, false);
+    assert.equal(staleOutput.duplicate, false);
+    assert.equal(staleOutput.disposition, "quarantined");
+    assert.equal(staleOutput.status, "quarantined");
+    assert.match(staleOutput.reason, /latest checkpoint/i);
+
+    writeFileSync(path, JSON.stringify({
+      project_id: "billing-api", task_id: "restricted-task", goal: "Held work",
+      current_state: "RESTRICTED_CHECKPOINT", checkpoint_id: "restricted-checkpoint-1",
+      sensitivity: "restricted",
+    }));
+    const restricted = await runHookResult(["checkpoint", "--file", path, "--verbose"], env);
+    assert.equal(restricted.code, 1);
+    const restrictedOutput = JSON.parse(restricted.stdout);
+    assert.equal(restrictedOutput.saved, false);
+    assert.equal(restrictedOutput.disposition, "quarantined");
+    assert.equal(restrictedOutput.status, "quarantined");
+    assert.match(restrictedOutput.reason, /sensitive|review/i);
+
+    const vault = new ContextVault(home);
+    assert.equal(vault.latestHandoff({
+      tenant_id: "local", owner_id: "local-user", project_id: "billing-api", task_id: "quarantine-task",
+      allowed_sensitivities: ["private", "restricted"],
+    }).handoff.current_state, "ACTIVE_BASELINE");
+    assert.equal(vault.latestHandoff({
+      tenant_id: "local", owner_id: "local-user", project_id: "billing-api", task_id: "restricted-task",
+      allowed_sensitivities: ["private", "restricted"],
+    }), null);
+    vault.close();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

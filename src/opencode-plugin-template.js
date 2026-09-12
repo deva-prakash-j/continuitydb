@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { validateTokenEnvironmentName } from "./http-client.js";
-import { linkCheckpointToLatest } from "./lifecycle-lineage.js";
+import { checkpointSaveOutcome, linkCheckpointToLatest } from "./lifecycle-lineage.js";
 import { validateProjectId } from "./project-identity.js";
 import { requiredIdentifier } from "./security.js";
 
@@ -66,6 +66,7 @@ export function renderOpenCodePlugin({
     + `const MAX_CHECKPOINT_BYTES = 128 * 1024;\n`
     + `const CHECKPOINT_FIELDS = new Set(["project_id","task_id","goal","current_state","completed_work","unresolved_questions","next_actions","relevant_files","state","branch","git_commit","checkpoint_id","previous_checkpoint_id","sensitivity"]);\n\n`
     + `const linkCheckpointToLatest = ${linkCheckpointToLatest.toString()};\n\n`
+    + `const checkpointSaveOutcome = ${checkpointSaveOutcome.toString()};\n\n`
     + `function hookArguments(action, file = null) {\n`
     + `  const args = ["hook", action, "--client", "opencode", "--project", CONFIG.projectId, "--home", CONFIG.home, "--tenant-id", CONFIG.tenantId, "--owner-id", CONFIG.ownerId, "--agent-id", "opencode", "--allowed-sensitivities", CONFIG.sensitivities.join(",")];\n`
     + `  if (action === "session-start") {\n`
@@ -81,7 +82,12 @@ export function renderOpenCodePlugin({
     + `    const environment = { ...process.env, CONTINUITYDB_HTTP_URL: "", CONTINUITYDB_HTTP_TOKEN_ENV: "" };\n`
     + `    delete environment.NODE_TEST_CONTEXT;\n`
     + `    execFile(CONFIG.executable, hookArguments(action, file), { env: environment, maxBuffer: MAX_RESPONSE_BYTES }, (error, stdout, stderr) => {\n`
-    + `      if (error) { reject(new Error((String(stderr || error.message).trim()) + " (exit " + String(error.code) + ")")); return; }\n`
+    + `      if (error) {\n`
+    + `        let outcome = null;\n`
+    + `        if (action === "checkpoint" && stdout) { try { outcome = JSON.parse(String(stdout)); } catch {} }\n`
+    + `        if (outcome && !outcome.saved) { reject(new Error("not saved: ContinuityDB handoff disposition=" + String(outcome.disposition || "missing") + " status=" + String(outcome.status || "missing") + (outcome.reason ? " (" + outcome.reason + ")" : ""))); return; }\n`
+    + `        reject(new Error((String(stderr).trim() || error.message) + " (exit " + String(error.code) + ")")); return;\n`
+    + `      }\n`
     + `      resolve(String(stdout));\n`
     + `    });\n`
     + `  });\n`
@@ -148,11 +154,9 @@ export function renderOpenCodePlugin({
     + `  let result;\n`
     + `  try { result = await request("v1/handoffs", { method: "POST", body: value, idempotencyKey: value.checkpoint_id }); }\n`
     + `  catch (error) { throw new Error("not saved: " + error.message); }\n`
-    + `  const disposition = result && result.disposition;\n`
-    + `  const status = result && result.record && result.record.status;\n`
-    + `  if (disposition !== "active" || status !== "active") throw new Error("not saved: ContinuityDB handoff disposition=" + String(disposition || "missing") + " status=" + String(status || "missing") + (result && result.reason ? " (" + result.reason + ")" : ""));\n`
-    + `  if (typeof result.record.id !== "string" || result.handoff && result.handoff.checkpoint_id !== value.checkpoint_id || !result.handoff) throw new Error("not saved: ContinuityDB returned an invalid handoff save response");\n`
-    + `  return { saved: true, duplicate: Boolean(result.duplicate), memory_id: result.record.id, checkpoint_id: result.handoff.checkpoint_id };\n`
+    + `  const outcome = checkpointSaveOutcome(result);\n`
+    + `  if (!outcome.saved || outcome.checkpoint_id !== value.checkpoint_id) throw new Error("not saved: ContinuityDB handoff disposition=" + outcome.disposition + " status=" + outcome.status + " (" + outcome.reason + ")");\n`
+    + `  return outcome;\n`
     + `}\n\n`
     + `export const ContinuityDBPlugin = async ({ directory }) => ({\n`
     + `  "experimental.session.compacting": async (_input, output) => { const value = CONFIG.transport === "stdio" ? await runLocalHook("session-start") : await remoteContext(); output.context.push(value); },\n`

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { loadLifecycleContext, saveLifecycleCheckpoint } from "./lifecycle-context.js";
+import { checkpointSaveOutcome } from "./lifecycle-lineage.js";
 
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
 const CHECKPOINT_FIELDS = new Set([
@@ -163,14 +164,9 @@ export async function runLifecycleHook(argv = process.argv.slice(2), io = proces
       tokenEnv: flags.http_token_env || process.env.CONTINUITYDB_HTTP_TOKEN_ENV || null,
       env: process.env,
     });
-    io.stdout.write(`${JSON.stringify(flags.verbose
-      ? {
-        saved: true,
-        duplicate: Boolean(result.duplicate),
-        memory_id: result.record.id,
-        checkpoint_id: result.handoff.checkpoint_id,
-      }
-      : {})}\n`);
+    const outcome = checkpointSaveOutcome(result);
+    io.stdout.write(`${JSON.stringify(flags.verbose || !outcome.saved ? outcome : {})}\n`);
+    if (!outcome.saved) return 1;
   } else {
     io.stdout.write(`Usage:\n  continuitydb hook session-start --project ID [--task-id ID] [--task TEXT] [--branch REF] [--client claude|cursor]\n  continuitydb hook checkpoint --project ID --file HANDOFF.json [--verbose]\n`);
     return command ? 1 : 0;

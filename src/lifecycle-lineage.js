@@ -9,3 +9,26 @@ export function linkCheckpointToLatest(checkpoint, latest) {
   }
   return value;
 }
+
+/** Convert a persistence result into the bounded, truthful lifecycle output contract. */
+export function checkpointSaveOutcome(result) {
+  const disposition = typeof result?.disposition === "string" ? result.disposition : "missing";
+  const status = typeof result?.record?.status === "string" ? result.record.status : "missing";
+  const validIdentity = typeof result?.record?.id === "string"
+    && typeof result?.handoff?.checkpoint_id === "string";
+  const saved = disposition === "active" && status === "active" && validIdentity;
+  const reason = typeof result?.reason === "string" && result.reason
+    ? result.reason
+    : saved ? "handoff is active" : "ContinuityDB returned an invalid handoff save response";
+  return {
+    saved,
+    duplicate: saved && Boolean(result?.duplicate),
+    disposition,
+    status,
+    reason,
+    ...(validIdentity ? {
+      memory_id: result.record.id,
+      checkpoint_id: result.handoff.checkpoint_id,
+    } : {}),
+  };
+}
