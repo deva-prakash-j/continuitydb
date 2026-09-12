@@ -199,6 +199,115 @@ test("Codex and OpenCode share reference-aware AGENTS policy ownership", () => {
   }
 });
 
+test("OpenCode installs complete plugin+policy assets transactionally and idempotently", () => {
+  const value = fixture();
+  const config = join(value.project, "opencode.json");
+  const plugin = join(value.project, ".opencode", "plugins", "continuitydb.js");
+  const agents = join(value.project, "AGENTS.md");
+  const original = '{"theme":"user-theme","mcp":{"other":{"type":"remote","url":"https://other.example/mcp"}}}\r\n';
+  try {
+    writeFileSync(config, original);
+    writeFileSync(agents, "# User rules\n");
+    const preview = connectAgent("opencode", options(value, false));
+    assert.equal(preview.recall_mode, "plugin+policy");
+    assert.equal(preview.capture_mode, "explicit-governed");
+    assert.equal(preview.applied, false);
+    assert.deepEqual(preview.assets.map((asset) => asset.path), [config, plugin, agents]);
+    assert.equal(readFileSync(config, "utf8"), original);
+    assert.equal(existsSync(plugin), false);
+
+    const applied = connectAgent("opencode", options(value));
+    assert.equal(applied.applied, true);
+    assert.equal(applied.verified, true);
+    assert.equal(applied.assets.length, 3);
+    assert.deepEqual(applied.assets.map((asset) => asset.kind), ["mcp", "plugin", "policy"]);
+    const parsed = JSON.parse(readFileSync(config, "utf8"));
+    assert.equal(parsed.theme, "user-theme");
+    assert.equal(parsed.mcp.other.url, "https://other.example/mcp");
+    assert.equal(parsed.mcp.continuitydb.type, "local");
+    assert.deepEqual(parsed.plugin, ["./.opencode/plugins/continuitydb.js"]);
+    assert.match(readFileSync(plugin, "utf8"), /experimental\.session\.compacting/);
+    assert.match(readFileSync(agents, "utf8"), /Recall mode: `plugin\+policy`/);
+
+    const bytes = [config, plugin, agents].map((path) => readFileSync(path, "utf8"));
+    const repeated = connectAgent("opencode", options(value));
+    assert.equal(repeated.changed, false);
+    assert.deepEqual([config, plugin, agents].map((path) => readFileSync(path, "utf8")), bytes);
+
+    const removed = disconnectAgent("opencode", options(value));
+    assert.equal(removed.verified, true);
+    assert.equal(readFileSync(config, "utf8"), original);
+    assert.equal(existsSync(plugin), false);
+    assert.equal(readFileSync(agents, "utf8"), "# User rules\n");
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode plugin write failure rolls back config and leaves policy untouched", () => {
+  const value = fixture();
+  const config = join(value.project, "opencode.json");
+  const plugin = join(value.project, ".opencode", "plugins", "continuitydb.js");
+  const agents = join(value.project, "AGENTS.md");
+  const originalConfig = "  \r\n";
+  const originalAgents = "# Existing rules\n";
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "test";
+    writeFileSync(config, originalConfig);
+    writeFileSync(agents, originalAgents);
+    assert.throws(() => connectAgent("opencode", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => { if (path === plugin) throw new Error("injected plugin write failure"); },
+    }), /injected plugin write failure/);
+    assert.equal(readFileSync(config, "utf8"), originalConfig);
+    assert.equal(existsSync(plugin), false);
+    assert.equal(readFileSync(agents, "utf8"), originalAgents);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("OpenCode preflight rejects unmanaged or symlinked plugin assets before config mutation", () => {
+  for (const setup of [
+    (value, plugin) => { mkdirSync(join(value.project, ".opencode", "plugins"), { recursive: true }); writeFileSync(plugin, "// user plugin\n"); },
+    (value, plugin) => { mkdirSync(join(value.project, ".opencode", "plugins"), { recursive: true }); const target = join(value.root, "plugin.js"); writeFileSync(target, "// target\n"); symlinkSync(target, plugin); },
+  ]) {
+    const value = fixture();
+    const config = join(value.project, "opencode.json");
+    const plugin = join(value.project, ".opencode", "plugins", "continuitydb.js");
+    const original = '{"keep":true}\n';
+    try {
+      writeFileSync(config, original);
+      setup(value, plugin);
+      assert.throws(() => connectAgent("opencode", options(value)), /(unmanaged OpenCode plugin|regular file, not a symlink)/i);
+      assert.equal(readFileSync(config, "utf8"), original);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("OpenCode ownership fingerprints fail closed on plugin or generated config drift", () => {
+  for (const drift of ["plugin", "config"]) {
+    const value = fixture();
+    const config = join(value.project, "opencode.json");
+    const plugin = join(value.project, ".opencode", "plugins", "continuitydb.js");
+    try {
+      connectAgent("opencode", options(value));
+      const path = drift === "plugin" ? plugin : config;
+      writeFileSync(path, `${readFileSync(path, "utf8").trimEnd()} \n`);
+      const before = [config, plugin, join(value.project, "AGENTS.md")].map((item) => readFileSync(item, "utf8"));
+      assert.throws(() => connectAgent("opencode", options(value)), /OpenCode .*ownership fingerprint mismatch/);
+      assert.deepEqual([config, plugin, join(value.project, "AGENTS.md")].map((item) => readFileSync(item, "utf8")), before);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Codex and Copilot install complete policy-led adapters with truthful asset results", () => {
   const value = fixture();
   const agents = join(value.project, "AGENTS.md");

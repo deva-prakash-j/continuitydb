@@ -20,6 +20,7 @@ import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { validateTokenEnvironmentName } from "./http-client.js";
 import { defaultDataHome } from "./paths.js";
+import { renderOpenCodePlugin } from "./opencode-plugin-template.js";
 import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
 import { resolveProjectIdentity, validateProjectId } from "./project-identity.js";
 import { requiredIdentifier } from "./security.js";
@@ -35,6 +36,8 @@ export const SUPPORTED_AGENTS = Object.freeze(["codex", "claude", "opencode", "c
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const CODEX_START = "# >>> continuitydb managed configuration >>>";
 const CODEX_END = "# <<< continuitydb managed configuration <<<";
+const OPENCODE_PLUGIN_REFERENCE = "./.opencode/plugins/continuitydb.js";
+const OPENCODE_OWNERSHIP_PREFIX = "// continuitydb managed opencode ownership: ";
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
@@ -941,6 +944,166 @@ function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
   };
 }
 
+function opencodePluginMetadata(content) {
+  if (!content) return null;
+  const firstLineEnd = content.indexOf("\n");
+  const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
+  if (!firstLine.startsWith(OPENCODE_OWNERSHIP_PREFIX)) {
+    throw new Error("unmanaged OpenCode plugin already exists; remove or rename it before connecting");
+  }
+  let value;
+  try {
+    value = JSON.parse(Buffer.from(firstLine.slice(OPENCODE_OWNERSHIP_PREFIX.length), "base64url").toString("utf8"));
+  } catch {
+    throw new Error("invalid ContinuityDB managed OpenCode plugin ownership metadata");
+  }
+  const file = value?.config;
+  if (value?.version !== 1 || validateProjectId(value.projectId) !== value.projectId
+    || !/^[a-f0-9]{64}$/.test(value.pluginSha256)
+    || !file || !["missing", "empty", "existing"].includes(file.state)
+    || (file.state === "missing" ? file.sha256 !== null : !/^[a-f0-9]{64}$/.test(file.sha256))
+    || !/^[a-f0-9]{64}$/.test(file.generated)
+    || !value.directories || typeof value.directories.opencode !== "boolean"
+    || typeof value.directories.plugins !== "boolean") {
+    throw new Error("invalid ContinuityDB managed OpenCode plugin ownership metadata");
+  }
+  const core = firstLineEnd === -1 ? "" : content.slice(firstLineEnd + 1);
+  if (sha256(core) !== value.pluginSha256) throw new Error("OpenCode plugin ownership fingerprint mismatch");
+  return { ...value, core };
+}
+
+function opencodeConfigValue(path) {
+  const value = parseJson(path);
+  if (value.plugin !== undefined && !Array.isArray(value.plugin)) {
+    throw new Error(`OpenCode plugin configuration must be an array: ${path}`);
+  }
+  if (value.plugin?.some((item) => typeof item !== "string")) {
+    throw new Error(`OpenCode plugin configuration entries must be strings: ${path}`);
+  }
+  return value;
+}
+
+function hasOwn(object, key) {
+  return Boolean(object && Object.prototype.hasOwnProperty.call(object, key));
+}
+
+function assertUnmanagedOpenCodeConfig(value, path, action) {
+  const namespace = value.mcp === undefined ? null : managedJsonNamespace(value, "mcp", path);
+  if (hasOwn(namespace, "continuitydb")) {
+    throw new Error(`an unmanaged OpenCode continuitydb server already exists; refusing to ${action}`);
+  }
+  if (value.plugin?.includes(OPENCODE_PLUGIN_REFERENCE)) {
+    throw new Error(`an unmanaged OpenCode plugin reference already exists; refusing to ${action}`);
+  }
+}
+
+function connectedOpenCodeConfig(current, options) {
+  const value = structuredClone(current);
+  value.$schema ||= "https://opencode.ai/config.json";
+  managedJsonNamespace(value, "mcp", jsonTarget("opencode", options.projectDir)).continuitydb = connection("opencode", options);
+  const plugins = value.plugin ? [...value.plugin] : [];
+  if (!plugins.includes(OPENCODE_PLUGIN_REFERENCE)) plugins.push(OPENCODE_PLUGIN_REFERENCE);
+  value.plugin = plugins;
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function encodedOpenCodeMetadata(value) {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+}
+
+function prepareOpenCodeChanges(rawOptions, action, identity) {
+  const client = "opencode";
+  const options = normalizeOptions(rawOptions, { identity });
+  const configPath = jsonTarget(client, options.projectDir);
+  const pluginPath = join(options.projectDir, ".opencode", "plugins", "continuitydb.js");
+  const pluginCurrent = readText(pluginPath);
+  const metadata = opencodePluginMetadata(pluginCurrent);
+  if (existsSync(pluginPath) && !metadata) {
+    throw new Error("unmanaged OpenCode plugin already exists; remove or rename it before connecting");
+  }
+  const configCurrent = readText(configPath);
+  const parsedCurrent = opencodeConfigValue(configPath);
+
+  if (!metadata) assertUnmanagedOpenCodeConfig(parsedCurrent, configPath, action);
+  if (metadata) {
+    const requestedProject = action === "connect" ? identity.id : rawOptions.projectId;
+    if (requestedProject && metadata.projectId !== requestedProject) {
+      throw new Error(`ContinuityDB managed OpenCode plugin belongs to project ${metadata.projectId}, not ${requestedProject}`);
+    }
+    if (!existsSync(configPath) || sha256(configCurrent) !== metadata.config.generated) {
+      throw new Error("OpenCode configuration ownership fingerprint mismatch");
+    }
+  }
+
+  let configContent;
+  let pluginContent = "";
+  let deleteConfig = false;
+  let deletePlugin = false;
+  let cleanupDirectories = [];
+  if (action === "connect") {
+    const original = metadata
+      ? restoredLifecycleContent(options, client, configPath, metadata.config)
+      : { content: configCurrent, deleteTarget: false };
+    const originalValue = original.content.trim() ? JSON.parse(original.content) : {};
+    if (!isPlainObject(originalValue)) throw new Error(`configuration root must be a JSON object: ${configPath}`);
+    if (originalValue.plugin !== undefined && !Array.isArray(originalValue.plugin)) {
+      throw new Error(`OpenCode plugin configuration must be an array: ${configPath}`);
+    }
+    if (!metadata) assertUnmanagedOpenCodeConfig(originalValue, configPath, action);
+    configContent = connectedOpenCodeConfig(originalValue, options);
+    const core = renderOpenCodePlugin({
+      projectId: identity.id,
+      transport: options.transport,
+      home: options.home,
+      url: options.url,
+      tokenEnv: options.tokenEnv,
+      tenantId: options.tenantId,
+      ownerId: options.ownerId,
+      sensitivities: options.sensitivities,
+    });
+    const topology = metadata || {
+      version: 1,
+      projectId: identity.id,
+      config: originalFileTopology(configPath, configCurrent),
+      directories: {
+        opencode: existsSync(join(options.projectDir, ".opencode")),
+        plugins: existsSync(join(options.projectDir, ".opencode", "plugins")),
+      },
+    };
+    const ownership = {
+      version: 1,
+      projectId: identity.id,
+      pluginSha256: sha256(core),
+      config: { state: topology.config.state, sha256: topology.config.sha256, generated: sha256(configContent) },
+      directories: topology.directories,
+    };
+    pluginContent = `${OPENCODE_OWNERSHIP_PREFIX}${encodedOpenCodeMetadata(ownership)}\n${core}`;
+  } else if (metadata) {
+    const restored = restoredLifecycleContent(options, client, configPath, metadata.config);
+    configContent = restored.content;
+    deleteConfig = restored.deleteTarget;
+    deletePlugin = true;
+    cleanupDirectories = [
+      ...(!metadata.directories.plugins ? [join(options.projectDir, ".opencode", "plugins")] : []),
+      ...(!metadata.directories.opencode ? [join(options.projectDir, ".opencode")] : []),
+    ];
+  } else {
+    configContent = configCurrent;
+  }
+
+  for (const path of [configPath, pluginPath]) ensureSafeParents(options.projectDir, path, false);
+  const unownedDisconnectNoop = action === "disconnect" && !metadata;
+  return [{
+    client, action, options, path: configPath, content: configContent, original: snapshot(configPath),
+    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client], deleteTarget: deleteConfig,
+    noOp: unownedDisconnectNoop,
+  }, {
+    client, action, options, path: pluginPath, content: pluginContent, original: snapshot(pluginPath),
+    kind: "plugin", owner: "continuitydb-opencode-plugin", assetClients: [client], deleteTarget: deletePlugin,
+    noOp: unownedDisconnectNoop, cleanupDirectories,
+  }];
+}
+
 function copilotPolicyContent(body, ownership) {
   const firstLineEnd = body.indexOf("\n");
   const metadata = `<!-- continuitydb managed mcp ownership: document=${ownership.document}; namespace=${ownership.namespace}; entry_sha256=${ownership.entrySha256} -->`;
@@ -1202,6 +1365,7 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
 
 function prepareAgentChanges(client, rawOptions, action, identity = null) {
   if (client === "copilot") return prepareCopilotChanges(rawOptions, action, identity);
+  if (client === "opencode") return prepareOpenCodeChanges(rawOptions, action, identity);
   if (client === "claude" || client === "cursor") {
     return prepareLifecycleClientChanges(client, rawOptions, action, identity);
   }
@@ -1422,7 +1586,13 @@ function batch(clients, rawOptions, action) {
             capture_mode: "explicit-governed",
             limitations: ["Cursor read-only cloud sessions use the always-loaded policy fallback until lifecycle hooks are available."],
           }
-          : {};
+          : client === "opencode"
+            ? {
+              recall_mode: "plugin+policy",
+              capture_mode: "explicit-governed",
+              limitations: ["OpenCode first-task recall is policy-led; the plugin enforces compaction recall and explicit structured idle handoff only."],
+            }
+            : {};
     return {
       client,
       project_dir: primary.project_dir,

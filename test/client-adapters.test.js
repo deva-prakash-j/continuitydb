@@ -37,6 +37,7 @@ test("OpenCode plugin injects bounded continuity context and saves explicit idle
   const original = Object.fromEntries([
     "CONTINUITYDB_HTTP_URL", "CONTINUITYDB_PROJECT_ID", "CONTINUITYDB_TASK_ID",
     "CONTINUITYDB_BRANCH", "CONTINUITYDB_TASK", "CONTINUITYDB_HANDOFF_FILE",
+    "CONTINUITYDB_HTTP_TOKEN_ENV", "CONTINUITYDB_OPENCODE_TEST_TOKEN",
   ].map((key) => [key, process.env[key]]));
   try {
     const seeded = vault.propose({
@@ -65,6 +66,8 @@ test("OpenCode plugin injects bounded continuity context and saves explicit idle
       CONTINUITYDB_BRANCH: "main",
       CONTINUITYDB_TASK: "Find OpenCodePluginMarker",
       CONTINUITYDB_HANDOFF_FILE: handoffPath,
+      CONTINUITYDB_HTTP_TOKEN_ENV: "CONTINUITYDB_OPENCODE_TEST_TOKEN",
+      CONTINUITYDB_OPENCODE_TEST_TOKEN: "test-only-token",
     });
     const plugin = await ContinuityDBPlugin({ directory: root });
     const output = { context: [] };
