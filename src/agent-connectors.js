@@ -581,6 +581,16 @@ function replaceJsonValue(text, property, value) {
   return `${text.slice(0, property.value.start)}${JSON.stringify(value)}${text.slice(property.value.end)}`;
 }
 
+function copilotEntryFingerprint(text, path) {
+  const layout = parseJsonLayout(text, path);
+  const servers = propertyNamed(layout.root, "servers");
+  if (servers && servers.value.type !== "object") {
+    throw new Error(`configuration namespace servers must be a JSON object: ${path}`);
+  }
+  const continuitydb = propertyNamed(servers?.value, "continuitydb");
+  return continuitydb ? sha256(text.slice(continuitydb.value.start, continuitydb.value.end)) : null;
+}
+
 function connectCopilotJson(current, path, server, owned) {
   const layout = parseJsonLayout(current, path);
   if (layout.root === null) {
@@ -713,7 +723,7 @@ function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
 
 function copilotPolicyContent(body, ownership) {
   const firstLineEnd = body.indexOf("\n");
-  const metadata = `<!-- continuitydb managed mcp ownership: document=${ownership.document}; namespace=${ownership.namespace} -->`;
+  const metadata = `<!-- continuitydb managed mcp ownership: document=${ownership.document}; namespace=${ownership.namespace}; entry_sha256=${ownership.entrySha256} -->`;
   return `${body.slice(0, firstLineEnd)}\n${metadata}${body.slice(firstLineEnd)}`;
 }
 
@@ -741,6 +751,12 @@ function prepareCopilotChanges(rawOptions, action, identity) {
       : "refusing to disconnect it";
     throw new Error(`an unmanaged Copilot continuitydb server already exists; ${suffix}`);
   }
+  if (existingServer) {
+    const currentFingerprint = sha256(mcpCurrent.slice(existingServer.value.start, existingServer.value.end));
+    if (metadata.ownership.entrySha256 !== currentFingerprint) {
+      throw new Error("Copilot MCP ownership fingerprint mismatch; refusing to replace or remove the current server");
+    }
+  }
 
   let mcpContent;
   // Policy metadata describes ownership of the entry that existed when it was
@@ -752,7 +768,10 @@ function prepareCopilotChanges(rawOptions, action, identity) {
   if (action === "connect") {
     const connected = connectCopilotJson(mcpCurrent, mcpPath, connection(client, options), ownership);
     mcpContent = connected.content;
-    ownership = connected.ownership;
+    ownership = {
+      ...connected.ownership,
+      entrySha256: copilotEntryFingerprint(mcpContent, mcpPath),
+    };
     const descriptor = policyAssetDescriptors(client, {
       projectDir: options.projectDir,
       projectId: identity.id,
@@ -793,7 +812,7 @@ function dedicatedPolicyMetadata(current, client) {
   if (firstLine !== `${POLICY_START} consumers: ${client}`) {
     throw new Error(`invalid ContinuityDB managed ${client} policy metadata`);
   }
-  const ownershipMatches = [...block.matchAll(/<!-- continuitydb managed mcp ownership: document=(missing|empty|existing); namespace=(created|existing) -->/g)];
+  const ownershipMatches = [...block.matchAll(/<!-- continuitydb managed mcp ownership: document=(missing|empty|existing); namespace=(created|existing); entry_sha256=([a-f0-9]{64}) -->/g)];
   if (ownershipMatches.length !== 1) {
     throw new Error(`invalid ContinuityDB managed ${client} MCP ownership metadata`);
   }
@@ -803,7 +822,11 @@ function dedicatedPolicyMetadata(current, client) {
   }
   return {
     projectId: validateProjectId(projectMatches[0][1]),
-    ownership: { document: ownershipMatches[0][1], namespace: ownershipMatches[0][2] },
+    ownership: {
+      document: ownershipMatches[0][1],
+      namespace: ownershipMatches[0][2],
+      entrySha256: ownershipMatches[0][3],
+    },
   };
 }
 

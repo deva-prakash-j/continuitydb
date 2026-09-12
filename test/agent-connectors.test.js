@@ -388,6 +388,11 @@ test("Copilot reconnect recomputes stale ownership when the managed server is ab
       ownership: /document=existing; namespace=created/,
     },
     {
+      name: "recreated whitespace-only document",
+      current: "\r\n\t  ",
+      ownership: /document=empty; namespace=created/,
+    },
+    {
       name: "still missing document",
       current: null,
       ownership: /document=missing; namespace=created/,
@@ -423,6 +428,77 @@ test("Copilot reconnect recomputes stale ownership when the managed server is ab
     } finally {
       rmSync(value.root, { recursive: true, force: true });
     }
+  }
+});
+
+test("Copilot ownership fingerprint rejects stale or changed MCP entries", () => {
+  const userOwned = '{\r\n  "servers": {\r\n    "continuitydb": {"type":"stdio","command":"user-owned","args":["mcp"]}\r\n  },\r\n  "keep": true\r\n}\r\n';
+  for (const action of ["connect", "disconnect"]) {
+    const value = fixture();
+    const mcp = join(value.project, ".vscode", "mcp.json");
+    const policy = join(value.project, ".github", "copilot-instructions.md");
+    try {
+      connectAgent("copilot", options(value));
+      const policyBefore = readFileSync(policy, "utf8");
+      rmSync(mcp);
+      writeFileSync(mcp, userOwned);
+      assert.throws(
+        () => action === "connect"
+          ? connectAgent("copilot", options(value))
+          : disconnectAgent("copilot", options(value)),
+        /Copilot MCP ownership fingerprint mismatch/,
+        action,
+      );
+      assert.equal(readFileSync(mcp, "utf8"), userOwned, action);
+      assert.equal(readFileSync(policy, "utf8"), policyBefore, action);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  for (const changedField of ["command", "args", "env"]) {
+    const value = fixture();
+    const mcp = join(value.project, ".vscode", "mcp.json");
+    try {
+      connectAgent("copilot", options(value));
+      const changed = JSON.parse(readFileSync(mcp, "utf8"));
+      if (changedField === "command") changed.servers.continuitydb.command = "/user/replacement";
+      if (changedField === "args") changed.servers.continuitydb.args = ["mcp", "--home", "/user/replacement"];
+      if (changedField === "env") changed.servers.continuitydb.env.CONTINUITYDB_OWNER_ID = "user-replacement";
+      const changedBytes = `${JSON.stringify(changed, null, 2)}\n`;
+      writeFileSync(mcp, changedBytes);
+      assert.throws(
+        () => connectAgent("copilot", options(value)),
+        /Copilot MCP ownership fingerprint mismatch/,
+        changedField,
+      );
+      assert.equal(readFileSync(mcp, "utf8"), changedBytes, changedField);
+      assert.throws(
+        () => disconnectAgent("copilot", options(value)),
+        /Copilot MCP ownership fingerprint mismatch/,
+        changedField,
+      );
+      assert.equal(readFileSync(mcp, "utf8"), changedBytes, changedField);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  const value = fixture();
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  const policy = join(value.project, ".github", "copilot-instructions.md");
+  try {
+    const first = connectAgent("copilot", options(value));
+    const managed = readFileSync(mcp, "utf8");
+    assert.match(readFileSync(policy, "utf8"), /entry_sha256=[a-f0-9]{64}/);
+    const repeated = connectAgent("copilot", options(value));
+    assert.equal(repeated.changed, false);
+    assert.equal(readFileSync(mcp, "utf8"), managed);
+    assert.equal(first.verified && repeated.verified, true);
+    disconnectAgent("copilot", options(value));
+    assert.equal(existsSync(mcp), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
   }
 });
 
