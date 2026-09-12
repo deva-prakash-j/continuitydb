@@ -143,6 +143,12 @@ function shellSingleQuote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
+function sameCanonicalPath(left, right, platform) {
+  return platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
 function installGuidance({ binDirectory, pathConfigured, platform }) {
   const nextSteps = [];
   if (!pathConfigured) {
@@ -182,7 +188,7 @@ export function installStandaloneBinary({
   const launcher = join(binDirectory, executableName);
   const pathDelimiter = platform === "win32" ? ";" : ":";
   const pathConfigured = pathValue.split(pathDelimiter)
-    .some((item) => canonicalInstallPrefix(item || ".", platform) === binDirectory);
+    .some((item) => sameCanonicalPath(canonicalInstallPrefix(item || ".", platform), binDirectory, platform));
   const plan = {
     prefix: installationPrefix,
     source: sourcePath,

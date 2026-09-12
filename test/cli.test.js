@@ -260,17 +260,19 @@ test("CLI setup authorizes the exact AgentForge Git identity without a default f
       CONTINUITYDB_PRINCIPAL_ID: "ambient-principal",
       CONTINUITYDB_OWNER_ID: "ambient-owner",
       CONTINUITYDB_AGENT_ID: "ambient-agent",
+      CONTINUITYDB_MCP_SCOPES: "memory:read",
+      CONTINUITYDB_MCP_CAPTURE_BURST: "0",
+      CONTINUITYDB_MCP_CAPTURE_PER_SECOND: "0",
+      CONTINUITYDB_HTTP_URL: "https://ambient.invalid",
+      CONTEXT_VAULT_ALLOWED_PROJECTS: "legacy-ambient-project",
     };
-    const isolatedEnvironment = Object.fromEntries(Object.entries(ambientEnvironment).filter(([key]) => ![
-      "CONTINUITYDB_ALLOWED_PROJECTS",
-      "CONTINUITYDB_ALLOWED_SENSITIVITIES",
-      "CONTINUITYDB_CAPTURE_POLICY_FILE",
-      "CONTINUITYDB_TENANT_ID",
-      "CONTINUITYDB_PRINCIPAL_ID",
-      "CONTINUITYDB_OWNER_ID",
-      "CONTINUITYDB_AGENT_ID",
-    ].includes(key)));
+    const isolatedEnvironment = Object.fromEntries(Object.entries(ambientEnvironment).filter(([key]) => (
+      !key.startsWith("CONTINUITYDB_") && !key.startsWith("CONTEXT_VAULT_")
+    )));
     assert.equal(isolatedEnvironment.CONTINUITYDB_CAPTURE_POLICY_FILE, undefined);
+    assert.equal(isolatedEnvironment.CONTINUITYDB_MCP_SCOPES, undefined);
+    assert.equal(isolatedEnvironment.CONTINUITYDB_HTTP_URL, undefined);
+    assert.equal(isolatedEnvironment.CONTEXT_VAULT_ALLOWED_PROJECTS, undefined);
     await client.connect(new StdioClientTransport({
       command: server.command,
       args: server.args,

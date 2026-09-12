@@ -59,6 +59,17 @@ test("standalone installer reports truthful POSIX PATH guidance without editing 
     assert.equal(presentPreview.path_configured, true);
     assert.deepEqual(presentPreview.next_steps, ["continuitydb version"]);
 
+    const caseVariantPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "linux",
+      version: "9.9.9",
+      pathValue: `/usr/bin:${join(prefix, "bin").toUpperCase()}`,
+    });
+    assert.equal(caseVariantPreview.path_configured, false);
+    assert.match(caseVariantPreview.next_steps[0], /^export PATH=/);
+
     const installedAbsent = installStandaloneBinary({
       source,
       prefix,
@@ -118,6 +129,17 @@ test("standalone installer reports neutral Windows PATH guidance in preview and 
     assert.equal(presentPreview.path_configured, true);
     assert.deepEqual(presentPreview.next_steps, ["continuitydb version"]);
 
+    const caseVariantPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "win32",
+      version: "9.9.9",
+      pathValue: `C:\\Windows\\System32;${join(prefix, "bin").toUpperCase()}`,
+    });
+    assert.equal(caseVariantPreview.path_configured, true);
+    assert.deepEqual(caseVariantPreview.next_steps, ["continuitydb version"]);
+
     const installedAbsent = installStandaloneBinary({
       source,
       prefix,
@@ -136,7 +158,7 @@ test("standalone installer reports neutral Windows PATH guidance in preview and 
       standalone: true,
       platform: "win32",
       version: "9.9.9",
-      pathValue: `C:\\Windows\\System32;${join(prefix, "bin")}`,
+      pathValue: `C:\\Windows\\System32;${join(prefix, "bin").toUpperCase()}`,
       apply: true,
     });
     assert.equal(present.path_configured, true);
