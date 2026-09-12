@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { validateGeneratedAdapterTree } from "./validate-client-adapters.js";
 
 const extension = process.platform === "win32" ? ".exe" : "";
 const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
@@ -152,6 +153,11 @@ try {
   assert.equal(setup.connections.length, 5);
   assert.equal(setup.connections.every((item) => item.applied), true);
   assert.equal(setup.connections.every((item) => item.verified && item.assets.length >= 2), true);
+  const standaloneAdapterValidation = validateGeneratedAdapterTree(project, {
+    home,
+    projectId: "generic-repo",
+  });
+  assert.equal(standaloneAdapterValidation.generated_assets, 12);
   const expectedAssets = [
     ".codex/config.toml", "AGENTS.md", ".mcp.json", ".claude/settings.json", "CLAUDE.md",
     "opencode.json", ".opencode/plugins/continuitydb.js", ".cursor/mcp.json", ".cursor/hooks.json",
@@ -316,7 +322,7 @@ try {
     version: version.version,
     platform: version.platform,
     arch: version.arch,
-    checks: ["self-install", "setup", "five-complete-adapters", "codex-surgical-update", "status-drift", "status-project-root", "mode-transitions", "missing-executable-limitations", "mcp-only", "disconnect-retry", "doctor", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
+    checks: ["self-install", "setup", "five-complete-adapters", "standalone-adapter-validation", "codex-surgical-update", "status-drift", "status-project-root", "mode-transitions", "missing-executable-limitations", "mcp-only", "disconnect-retry", "doctor", "http-service", "setup-failure-retry", "mcp-tools", "capture-search"],
   }, null, 2)}\n`);
 } finally {
   rmSync(root, { recursive: true, force: true });

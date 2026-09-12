@@ -16,6 +16,14 @@ function actionIndex(steps, prefix) {
   return steps.findIndex((step) => String(step.uses || "").startsWith(prefix));
 }
 
+function requireBlockingCommand(steps, command, message) {
+  const index = runIndex(steps, command);
+  invariant(index >= 0, message);
+  invariant(!steps[index].if && steps[index]["continue-on-error"] !== true,
+    `${message}; the command must be unconditional and blocking`);
+  return index;
+}
+
 function validatePinnedActions(steps) {
   for (const step of steps) {
     if (!step.uses) continue;
@@ -31,7 +39,7 @@ export function validateReleaseWorkflow(document) {
   invariant(Array.isArray(push?.branches) && push.branches.includes("main"),
     "every push to main must trigger the native release workflow");
   invariant(Array.isArray(push?.tags) && push.tags.includes("v*"),
-    "version-tag release trigger is required");
+    "stable v0.7.0 tag path requires the version-tag release trigger v*");
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
   invariant(build && publish, "build and publish jobs are required");
@@ -49,6 +57,8 @@ export function validateReleaseWorkflow(document) {
 
   const steps = build.steps || [];
   validatePinnedActions(steps);
+  requireBlockingCommand(steps, "npm run validate:clients", "native client adapter validation is missing");
+  requireBlockingCommand(steps, "npm run test:clients", "native client adapter tests are missing");
   const buildIndex = runIndex(steps, "npm run build:binary");
   const signIndex = steps.findIndex((step) => String(step.run || "").includes("codesign --force --sign"));
   const smokeIndex = runIndex(steps, "npm run smoke:binary");
@@ -71,6 +81,8 @@ export function validateReleaseWorkflow(document) {
   const publishCondition = String(publish.if || "");
   invariant(publishCondition.includes("refs/heads/main") && publishCondition.includes("refs/tags/v"),
     "publish must run for main pushes and version-tag pushes only");
+  invariant(publishCondition.includes("success()") && !publishCondition.includes("always()"),
+    "publication requires terminal success of every supported native build");
   const publishSteps = publish.steps || [];
   validatePinnedActions(publishSteps);
   const downloadIndex = actionIndex(publishSteps, "actions/download-artifact@");
@@ -80,6 +92,9 @@ export function validateReleaseWorkflow(document) {
   const publishedVerifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify published release assets"));
   invariant(downloadIndex >= 0 && verifyIndex > downloadIndex && attestIndex > verifyIndex && releaseIndex > attestIndex,
     "downloaded native artifacts must be checksum-verified and attested before release publication");
+  invariant(publishSteps[attestIndex]?.with?.["subject-path"] === "release/continuitydb-*"
+    && !publishSteps[attestIndex].if && publishSteps[attestIndex]["continue-on-error"] !== true,
+  "provenance for the complete supported native asset set must succeed before publication");
   invariant(publishedVerifyIndex > releaseIndex,
     "published release assets must be independently verified after publication");
   const verifyCommand = String(publishSteps[verifyIndex]?.run || "");
@@ -125,13 +140,24 @@ export function validateReleaseWorkflow(document) {
     "all six published assets must pass provenance verification");
   invariant(publishedVerifyCommand.includes("targetCommitish") && publishedVerifyCommand.includes("isPrerelease"),
     "published release identity must be verified after publication");
-  return { valid: true, native_targets: [...names].sort() };
+  return { valid: true, native_targets: [...names].sort(), client_adapters_verified: true };
 }
 
 export function validateCiWorkflow(document) {
   const jobs = document?.jobs || {};
-  invariant(jobs.binary, "CI binary job is required");
+  invariant(jobs.test && jobs.container && jobs.binary, "CI test, container, and binary jobs are required");
+  invariant(Array.isArray(jobs.test.strategy?.matrix?.node)
+    && jobs.test.strategy.matrix.node.length === 2
+    && jobs.test.strategy.matrix.node.includes(22)
+    && jobs.test.strategy.matrix.node.includes(24),
+  "CI source tests must run on Node 22 and Node 24");
   for (const job of Object.values(jobs)) validatePinnedActions(job.steps || []);
+  for (const jobName of ["test", "container", "binary"]) {
+    requireBlockingCommand(jobs[jobName].steps || [], "npm run validate:clients",
+      `${jobName} client adapter validation is missing`);
+  }
+  requireBlockingCommand(jobs.container.steps || [], "npm run test:clients",
+    "container client adapter tests are missing");
   const steps = jobs.binary.steps || [];
   const functionalIndex = runIndex(steps, "npm run test:binary");
   const semanticIndex = runIndex(steps, "npm run smoke:binary:semantic");
@@ -145,7 +171,7 @@ export function validateCiWorkflow(document) {
     invariant(!steps[index].if, "CI binary verification/checksum/upload gates must be unconditional");
     invariant(steps[index]["continue-on-error"] !== true, "CI binary release gates must be blocking");
   }
-  return { valid: true, binary_artifact_verified: true };
+  return { valid: true, binary_artifact_verified: true, client_adapters_verified: true };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

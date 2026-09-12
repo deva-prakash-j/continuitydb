@@ -34,6 +34,8 @@ jobs:
           node-version: 25.9.0
           cache: npm
       - run: npm ci --ignore-scripts
+      - run: npm run test:clients
+      - run: npm run validate:clients
       - run: npm run validate:release-workflow
       - run: npm run build:binary
       - if: runner.os == 'macOS'
@@ -51,7 +53,7 @@ jobs:
           retention-days: 14
 
   publish:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: success() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-24.04
     permissions:

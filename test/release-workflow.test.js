@@ -190,6 +190,50 @@ test("CI uploads only an immutable, semantically verified native binary", () => 
   assert.throws(() => validateCiWorkflow(mutableUpload), /full immutable commit SHA/);
 });
 
+test("normal, container, Linux binary, and supported native jobs run complete client validation", () => {
+  const validatedCi = validateCiWorkflow(ciWorkflow);
+  assert.equal(validatedCi.client_adapters_verified, true);
+  assert.deepEqual(ciWorkflow.jobs.test.strategy.matrix.node, [22, 24]);
+  for (const jobName of ["test", "container", "binary"]) {
+    const commands = (ciWorkflow.jobs[jobName].steps || []).map((step) => step.run);
+    assert.ok(commands.includes("npm run validate:clients"), `${jobName} omits adapter validation`);
+  }
+  assert.ok(ciWorkflow.jobs.container.steps.some((step) => step.run === "npm run test:clients"));
+
+  const validatedRelease = validateReleaseWorkflow(workflow);
+  assert.equal(validatedRelease.client_adapters_verified, true);
+  const nativeCommands = workflow.jobs.build.steps.map((step) => step.run);
+  assert.ok(nativeCommands.includes("npm run validate:clients"));
+  assert.ok(nativeCommands.includes("npm run test:clients"));
+
+  const missingCiValidation = structuredClone(ciWorkflow);
+  missingCiValidation.jobs.container.steps = missingCiValidation.jobs.container.steps
+    .filter((step) => step.run !== "npm run validate:clients");
+  assert.throws(() => validateCiWorkflow(missingCiValidation), /container.*client adapter validation/i);
+
+  const missingNativeValidation = structuredClone(workflow);
+  missingNativeValidation.jobs.build.steps = missingNativeValidation.jobs.build.steps
+    .filter((step) => step.run !== "npm run test:clients");
+  assert.throws(() => validateReleaseWorkflow(missingNativeValidation), /native.*client adapter tests/i);
+});
+
+test("stable v0.7.0 publication waits for every native and provenance gate", () => {
+  assert.ok(workflow.on.push.tags.includes("v*"));
+  assert.match(workflow.jobs.publish.if, /github\.event_name == 'push'/);
+  assert.doesNotMatch(workflow.jobs.publish.if, /always\(\)/);
+  const provenance = workflow.jobs.publish.steps
+    .find((step) => String(step.uses || "").startsWith("actions/attest-build-provenance@"));
+  assert.equal(provenance.with["subject-path"], "release/continuitydb-*");
+
+  const falseSuccess = structuredClone(workflow);
+  falseSuccess.jobs.publish.if = `always() && (${falseSuccess.jobs.publish.if})`;
+  assert.throws(() => validateReleaseWorkflow(falseSuccess), /terminal success.*native/i);
+
+  const noStableTag = structuredClone(workflow);
+  noStableTag.on.push.tags = ["main-*"];
+  assert.throws(() => validateReleaseWorkflow(noStableTag), /stable v0\.7\.0 tag path/i);
+});
+
 test("release check builds the standalone binary before the generated Codex config probe", () => {
   assert.equal(packageDocument.scripts["test:codex-config"], "npm run test:codex-generated-config");
   assert.equal(

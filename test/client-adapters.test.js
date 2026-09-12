@@ -14,7 +14,15 @@ test("versioned client configuration examples pass contract validation", () => {
   assert.equal(result.status, 0, result.stderr);
   const value = JSON.parse(result.stdout);
   assert.equal(value.valid, true);
-  assert.deepEqual(value.clients, ["codex", "copilot", "claude-code", "opencode"]);
+  assert.deepEqual(value.clients, ["codex", "claude", "opencode", "cursor", "copilot"]);
+  assert.equal(value.generated_assets, 12);
+  assert.equal(value.managed_policies, 4);
+  assert.deepEqual(value.generated_examples, [
+    "examples/claude-code-hooks.example.json",
+    "examples/cursor-hooks.example.json",
+    "examples/clients/codex.AGENTS.md",
+  ]);
+  assert.equal(value.standalone_tree_validator, true);
 });
 
 test("OpenCode plugin injects bounded continuity context and saves explicit idle checkpoint", async () => {

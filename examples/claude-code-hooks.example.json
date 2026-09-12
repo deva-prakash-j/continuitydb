@@ -6,8 +6,25 @@
         "hooks": [
           {
             "type": "command",
-            "command": "continuitydb-hook",
-            "args": ["session-start", "--client", "claude"],
+            "command": "continuitydb",
+            "args": [
+              "hook",
+              "session-start",
+              "--client",
+              "claude",
+              "--project",
+              "inventory-service",
+              "--home",
+              "/absolute/private/path/continuitydb-data",
+              "--tenant-id",
+              "example-org",
+              "--owner-id",
+              "example-user",
+              "--agent-id",
+              "claude",
+              "--allowed-sensitivities",
+              "public,private"
+            ],
             "timeout": 30
           }
         ]
@@ -18,8 +35,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "continuitydb-hook",
-            "args": ["checkpoint", "--file", ".continuitydb-handoff.json"],
+            "command": "continuitydb",
+            "args": [
+              "hook",
+              "checkpoint",
+              "--client",
+              "claude",
+              "--project",
+              "inventory-service",
+              "--home",
+              "/absolute/private/path/continuitydb-data",
+              "--tenant-id",
+              "example-org",
+              "--owner-id",
+              "example-user",
+              "--agent-id",
+              "claude",
+              "--allowed-sensitivities",
+              "public,private",
+              "--file",
+              "/workspace/inventory-service/.continuitydb-handoff.json"
+            ],
             "timeout": 30
           }
         ]
