@@ -21,6 +21,7 @@ import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
 import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
 import { resolveProjectIdentity, validateProjectId } from "./project-identity.js";
+import { requiredIdentifier } from "./security.js";
 import {
   mergeManagedText,
   POLICY_END,
@@ -339,6 +340,7 @@ function restoreSnapshot(plan, result) {
       throw new Error(`rollback conflict: configuration changed concurrently: ${path}`);
     }
     if (original.existed) {
+      ensureSafeParents(plan.options.projectDir, path, true);
       const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.rollback`);
       writeFileSync(temporary, original.content, { flag: "wx", mode: original.mode || 0o600 });
       renameSync(temporary, path);
@@ -503,6 +505,12 @@ function lifecycleArgs(client, options, action) {
     args.push("--http-url", lifecycleServiceUrl(options.url), "--http-token-env", options.tokenEnv);
   } else {
     args.push("--home", options.home);
+    args.push(
+      "--tenant-id", options.tenantId,
+      "--owner-id", options.ownerId,
+      "--agent-id", client,
+      "--allowed-sensitivities", options.sensitivities.join(","),
+    );
   }
   if (action === "checkpoint") args.push("--file", join(options.projectDir, ".continuitydb-handoff.json"));
   return args;
@@ -536,14 +544,37 @@ function entryFingerprint(value) {
   return sha256(canonicalJson(value));
 }
 
-function lifecyclePolicyContent(client, body, ownership) {
+function encodedLifecycleTopology(topology) {
+  return Buffer.from(JSON.stringify(topology), "utf8").toString("base64url");
+}
+
+function decodedLifecycleTopology(value, client) {
+  let topology;
+  try { topology = JSON.parse(Buffer.from(value, "base64url").toString("utf8")); }
+  catch { throw new Error(`invalid ContinuityDB managed ${client} lifecycle topology`); }
+  const validFile = (file) => file && ["missing", "empty", "existing"].includes(file.state)
+    && (file.state === "missing" ? file.sha256 === null : /^[a-f0-9]{64}$/.test(file.sha256))
+    && /^[a-f0-9]{64}$/.test(file.generated);
+  const directoryKeys = Object.keys(topology?.directories || {}).sort().join(",");
+  const expectedDirectoryKeys = client === "claude" ? "claude" : "cursor,rules";
+  if (!topology || !validFile(topology.mcp) || !validFile(topology.hooks)
+    || !topology.policy || !["missing", "empty", "existing"].includes(topology.policy.state)
+    || directoryKeys !== expectedDirectoryKeys
+    || Object.values(topology.directories).some((item) => typeof item !== "boolean")) {
+    throw new Error(`invalid ContinuityDB managed ${client} lifecycle topology`);
+  }
+  return topology;
+}
+
+function lifecyclePolicyContent(client, body, ownership, topology) {
   const metadata = `<!-- continuitydb managed lifecycle ownership: mcp_sha256=${ownership.mcp}; start_sha256=${ownership.start}; stop_sha256=${ownership.stop} -->`;
+  const topologyMetadata = `<!-- continuitydb managed lifecycle topology: ${encodedLifecycleTopology(topology)} -->`;
   if (client === "cursor") {
     const marker = body.indexOf(POLICY_START);
-    return `${body.slice(0, marker)}${metadata}\n${body.slice(marker)}`;
+    return `${body.slice(0, marker)}${metadata}\n${topologyMetadata}\n${body.slice(marker)}`;
   }
   const firstLineEnd = body.indexOf("\n");
-  return `${body.slice(0, firstLineEnd)}\n${metadata}${body.slice(firstLineEnd)}`;
+  return `${body.slice(0, firstLineEnd)}\n${metadata}\n${topologyMetadata}${body.slice(firstLineEnd)}`;
 }
 
 function lifecyclePolicyMetadata(current, client) {
@@ -567,6 +598,8 @@ function lifecyclePolicyMetadata(current, client) {
   }
   const ownership = [...current.matchAll(/<!-- continuitydb managed lifecycle ownership: mcp_sha256=([a-f0-9]{64}); start_sha256=([a-f0-9]{64}); stop_sha256=([a-f0-9]{64}) -->/g)];
   if (ownership.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} lifecycle ownership metadata`);
+  const topologies = [...current.matchAll(/<!-- continuitydb managed lifecycle topology: ([A-Za-z0-9_-]+) -->/g)];
+  if (topologies.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} lifecycle topology metadata`);
   const projects = [...current.matchAll(/Project scope: `([^`]+)`\./g)];
   if (projects.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} policy project scope`);
   return {
@@ -574,7 +607,42 @@ function lifecyclePolicyMetadata(current, client) {
     mcp: ownership[0][1],
     start: ownership[0][2],
     stop: ownership[0][3],
+    topology: decodedLifecycleTopology(topologies[0][1], client),
   };
+}
+
+function originalFileTopology(path, current) {
+  return {
+    state: existsSync(path) ? (current === "" ? "empty" : "existing") : "missing",
+    sha256: existsSync(path) ? sha256(current) : null,
+  };
+}
+
+function lifecycleBackupPath(options, client, path, digest) {
+  return join(options.home, "backups", "agent-config", client, `${basename(path)}.${digest.slice(0, 16)}.bak`);
+}
+
+function restoredLifecycleContent(options, client, path, topology) {
+  if (topology.state === "missing") return { content: "", deleteTarget: true };
+  const backupPath = lifecycleBackupPath(options, client, path, topology.sha256);
+  if (!contains(options.home, backupPath)) throw new Error(`invalid ${client} lifecycle backup path`);
+  for (const directory of [
+    options.home,
+    join(options.home, "backups"),
+    join(options.home, "backups", "agent-config"),
+    join(options.home, "backups", "agent-config", client),
+  ]) {
+    if (!existsSync(directory)) throw new Error(`${client} lifecycle original backup is missing: ${path}`);
+    const metadata = lstatSync(directory);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new Error(`${client} lifecycle backup parent must be a real directory: ${directory}`);
+    }
+  }
+  const content = readText(backupPath);
+  if (!existsSync(backupPath) || sha256(content) !== topology.sha256) {
+    throw new Error(`${client} lifecycle original backup is missing or changed: ${path}`);
+  }
+  return { content, deleteTarget: false };
 }
 
 function lifecycleEventNames(client) {
@@ -812,15 +880,21 @@ function normalizeOptions(options = {}, { identity = null } = {}) {
   projects.forEach(validateProjectId);
   const tokenEnv = options.tokenEnv || "CONTINUITYDB_MCP_TOKEN";
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(tokenEnv)) throw new Error("invalid token environment variable name");
+  const tenantId = requiredIdentifier(options.tenantId || "local", "tenant_id");
+  const ownerId = requiredIdentifier(options.ownerId || "local-user", "owner_id");
+  const sensitivities = options.sensitivities?.length ? [...new Set(options.sensitivities.map(String))] : ["public", "private"];
+  if (sensitivities.some((value) => !["public", "private", "sensitive", "restricted"].includes(value))) {
+    throw new Error("invalid allowed sensitivity");
+  }
   return {
     ...options,
     projectDir,
     home,
     identity,
     projects,
-    tenantId: options.tenantId || "local",
-    ownerId: options.ownerId || "local-user",
-    sensitivities: options.sensitivities?.length ? options.sensitivities : ["public", "private"],
+    tenantId,
+    ownerId,
+    sensitivities,
     transport: options.transport || "stdio",
     tokenEnv,
     apply: Boolean(options.apply),
@@ -993,6 +1067,7 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
   })[0];
 
   const mcpPath = jsonTarget(client, options.projectDir);
+  const mcpCurrentText = readText(mcpPath);
   const mcpCurrent = parseJson(mcpPath);
   const mcpNamespace = mcpCurrent.mcpServers === undefined
     ? null
@@ -1005,52 +1080,101 @@ function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
   if (hasCurrentMcp && metadata && entryFingerprint(currentMcp) !== metadata.mcp) {
     throw new Error(`${client} MCP ownership fingerprint mismatch`);
   }
+  if (metadata && (!existsSync(mcpPath) || sha256(mcpCurrentText) !== metadata.topology.mcp.generated)) {
+    throw new Error(`${client} MCP file ownership fingerprint mismatch`);
+  }
 
   const hooksPath = client === "claude"
     ? join(options.projectDir, ".claude", "settings.json")
     : join(options.projectDir, ".cursor", "hooks.json");
+  const hooksCurrentText = readText(hooksPath);
   const hooksCurrent = parseJson(hooksPath);
+  if (metadata && (!existsSync(hooksPath) || sha256(hooksCurrentText) !== metadata.topology.hooks.generated)) {
+    throw new Error(`${client} hooks file ownership fingerprint mismatch`);
+  }
   const renderedHooks = renderLifecycleHooks(client, hooksCurrent, hooksPath, options, metadata, action);
   const unownedDisconnectNoop = action === "disconnect" && !metadata && !hasCurrentMcp;
+
+  const directories = client === "claude"
+    ? { claude: existsSync(join(options.projectDir, ".claude")) }
+    : {
+      cursor: existsSync(join(options.projectDir, ".cursor")),
+      rules: existsSync(join(options.projectDir, ".cursor", "rules")),
+    };
+  const originalTopology = metadata?.topology || {
+    mcp: originalFileTopology(mcpPath, mcpCurrentText),
+    hooks: originalFileTopology(hooksPath, hooksCurrentText),
+    policy: { state: existsSync(policyPath) ? (policyCurrent === "" ? "empty" : "existing") : "missing" },
+    directories,
+  };
 
   const connectedMcp = action === "connect"
     ? connectedJson(client, mcpCurrent, options)
     : disconnectedJson(client, mcpCurrent, mcpPath);
-  const mcpContent = `${JSON.stringify(connectedMcp, null, 2)}\n`;
-  const hooksContent = `${JSON.stringify(renderedHooks.value, null, 2)}\n`;
+  let mcpContent = `${JSON.stringify(connectedMcp, null, 2)}\n`;
+  let hooksContent = `${JSON.stringify(renderedHooks.value, null, 2)}\n`;
+  let deleteMcp = false;
+  let deleteHooks = false;
   let policyContent;
   let deletePolicy = false;
   if (action === "connect") {
     const entries = renderedHooks.generated;
     const names = renderedHooks.names;
+    const topology = {
+      ...originalTopology,
+      mcp: { ...originalTopology.mcp, generated: sha256(mcpContent) },
+      hooks: { ...originalTopology.hooks, generated: sha256(hooksContent) },
+    };
     const body = lifecyclePolicyContent(client, policyDescriptor.content, {
       mcp: entryFingerprint(connectedMcp.mcpServers.continuitydb),
       start: entryFingerprint(entries[names.start]),
       stop: entryFingerprint(entries[names.stop]),
-    });
+    }, topology);
     policyContent = client === "claude"
       ? mergeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END, body })
       : body;
-  } else if (client === "claude") {
-    policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
   } else {
-    policyContent = "";
-    deletePolicy = Boolean(metadata);
+    const restoredMcp = metadata
+      ? restoredLifecycleContent(options, client, mcpPath, originalTopology.mcp)
+      : { content: mcpContent, deleteTarget: false };
+    const restoredHooks = metadata
+      ? restoredLifecycleContent(options, client, hooksPath, originalTopology.hooks)
+      : { content: hooksContent, deleteTarget: false };
+    mcpContent = restoredMcp.content;
+    hooksContent = restoredHooks.content;
+    deleteMcp = restoredMcp.deleteTarget;
+    deleteHooks = restoredHooks.deleteTarget;
+    if (client === "claude") {
+      policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
+      deletePolicy = originalTopology.policy.state === "missing";
+    } else {
+      policyContent = "";
+      deletePolicy = Boolean(metadata);
+    }
   }
+
+  const cleanupDirectories = action === "disconnect" && metadata
+    ? client === "claude"
+      ? originalTopology.directories.claude ? [] : [join(options.projectDir, ".claude")]
+      : [
+        ...(!originalTopology.directories.rules ? [join(options.projectDir, ".cursor", "rules")] : []),
+        ...(!originalTopology.directories.cursor ? [join(options.projectDir, ".cursor")] : []),
+      ]
+    : [];
 
   for (const path of [mcpPath, hooksPath, policyPath]) ensureSafeParents(options.projectDir, path, false);
   return [{
     client, action, options, path: mcpPath, content: mcpContent, original: snapshot(mcpPath),
-    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
+    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client], deleteTarget: deleteMcp,
     noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(mcpPath)),
   }, {
     client, action, options, path: hooksPath, content: hooksContent, original: snapshot(hooksPath),
-    kind: "lifecycle", owner: `continuitydb-${client}-hooks`, assetClients: [client],
+    kind: "lifecycle", owner: `continuitydb-${client}-hooks`, assetClients: [client], deleteTarget: deleteHooks,
     noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(hooksPath)),
   }, {
     client, action, options, path: policyPath, content: policyContent, original: snapshot(policyPath),
     kind: "policy", owner: policyDescriptor.owner, assetClients: [client], deleteTarget: deletePolicy,
-    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(policyPath)),
+    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(policyPath)), cleanupDirectories,
   }];
 }
 
@@ -1209,7 +1333,21 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
     }
     if (finalize) finalize({ committed });
     verifyCommittedAgentPlans(committed);
-    return committed.map(({ plan, result }) => publicResult(plan, result));
+    const values = committed.map(({ plan, result }) => publicResult(plan, result));
+    // Remove only empty parents known not to predate the lifecycle adapter. A
+    // concurrent user file makes rmdir fail with ENOTEMPTY and is preserved;
+    // an unexpected failure enters normal rollback, which recreates parents.
+    for (const { plan } of committed) {
+      for (const directory of plan.cleanupDirectories || []) {
+        try { rmdirSync(directory); }
+        catch (error) {
+          if (error.code !== "ENOENT" && error.code !== "ENOTEMPTY" && error.code !== "EEXIST") {
+            throw error;
+          }
+        }
+      }
+    }
+    return values;
   } catch (error) {
     const rollbackErrors = [];
     for (const item of committed.reverse()) {

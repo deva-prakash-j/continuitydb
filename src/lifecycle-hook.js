@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { loadLifecycleContext, saveLifecycleCheckpoint } from "./lifecycle-context.js";
 
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
@@ -27,18 +27,55 @@ function required(value, name) {
   return value.trim();
 }
 
-function readCheckpoint(path) {
+function list(value, fallback) {
+  const source = value || fallback;
+  return String(source).split(",").map((item) => item.trim()).filter(Boolean);
+}
+
+function readBoundedDescriptor(descriptor) {
+  const chunks = [];
+  let size = 0;
+  while (size <= MAX_CHECKPOINT_BYTES) {
+    const buffer = Buffer.allocUnsafe(Math.min(16 * 1024, MAX_CHECKPOINT_BYTES + 1 - size));
+    const count = readSync(descriptor, buffer, 0, buffer.length, size);
+    if (count === 0) break;
+    chunks.push(buffer.subarray(0, count));
+    size += count;
+  }
+  return Buffer.concat(chunks, size);
+}
+
+export function readCheckpoint(path, { afterOpen = null } = {}) {
   if (!path) throw new Error("checkpoint requires --file or CONTINUITYDB_HANDOFF_FILE");
-  const before = lstatSync(path);
+  const before = lstatSync(path, { bigint: true });
   if (before.isSymbolicLink() || !before.isFile()) throw new Error("handoff checkpoint must be a regular file, not a symlink");
   const descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
   try {
-    const opened = fstatSync(descriptor);
+    const opened = fstatSync(descriptor, { bigint: true });
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error("handoff checkpoint changed during secure open");
     }
-    if (opened.size > MAX_CHECKPOINT_BYTES) throw new Error("handoff checkpoint file is too large");
-    const value = JSON.parse(readFileSync(descriptor, "utf8"));
+    if (opened.size > BigInt(MAX_CHECKPOINT_BYTES)) throw new Error("handoff checkpoint file is too large");
+    const first = readBoundedDescriptor(descriptor);
+    const mid = fstatSync(descriptor, { bigint: true });
+    if (first.byteLength > MAX_CHECKPOINT_BYTES || mid.size > BigInt(MAX_CHECKPOINT_BYTES)) {
+      throw new Error("handoff checkpoint file is too large");
+    }
+    if (mid.dev !== opened.dev || mid.ino !== opened.ino || mid.size !== opened.size
+      || mid.mtimeNs !== opened.mtimeNs || mid.ctimeNs !== opened.ctimeNs
+      || mid.size !== BigInt(first.byteLength)) {
+      throw new Error("handoff checkpoint changed during secure read");
+    }
+    afterOpen?.({ descriptor, opened });
+    const second = readBoundedDescriptor(descriptor);
+    const after = fstatSync(descriptor, { bigint: true });
+    if (!after.isFile() || after.dev !== opened.dev || after.ino !== opened.ino
+      || after.size !== opened.size || after.mtimeNs !== opened.mtimeNs || after.ctimeNs !== opened.ctimeNs
+      || after.size !== BigInt(second.byteLength) || !second.equals(first)) {
+      throw new Error("handoff checkpoint changed during secure read");
+    }
+    if (second.byteLength > MAX_CHECKPOINT_BYTES) throw new Error("handoff checkpoint file is too large");
+    const value = JSON.parse(second.toString("utf8"));
     if (!value || Array.isArray(value) || typeof value !== "object") throw new Error("handoff checkpoint must be a JSON object");
     for (const key of Object.keys(value)) {
       if (!CHECKPOINT_FIELDS.has(key)) throw new Error(`handoff checkpoint contains unsupported field: ${key}`);
@@ -86,6 +123,13 @@ export async function runLifecycleHook(argv = process.argv.slice(2), io = proces
       branch,
       task,
       tokenBudget: Number(flags.token_budget || process.env.CONTINUITYDB_TOKEN_BUDGET || 1200),
+      tenantId: flags.tenant_id || process.env.CONTINUITYDB_TENANT_ID || "local",
+      ownerId: flags.owner_id || process.env.CONTINUITYDB_OWNER_ID || "local-user",
+      agentId: flags.agent_id || process.env.CONTINUITYDB_AGENT_ID || flags.client || "lifecycle-hook",
+      allowedSensitivities: list(
+        flags.allowed_sensitivities || process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES,
+        "public,private",
+      ),
       remoteUrl,
       tokenEnv,
       env: process.env,
@@ -107,13 +151,25 @@ export async function runLifecycleHook(argv = process.argv.slice(2), io = proces
       home: flags.home || process.env.CONTINUITYDB_HOME,
       projectId,
       checkpoint: value,
-      agentId: flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "lifecycle-hook",
+      agentId: flags.agent_id || process.env.CONTINUITYDB_AGENT_ID
+        || flags.client || process.env.CONTINUITYDB_HOOK_CLIENT || "lifecycle-hook",
+      tenantId: flags.tenant_id || process.env.CONTINUITYDB_TENANT_ID || "local",
+      ownerId: flags.owner_id || process.env.CONTINUITYDB_OWNER_ID || "local-user",
+      allowedSensitivities: list(
+        flags.allowed_sensitivities || process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES,
+        "public,private",
+      ),
       remoteUrl: flags.http_url || process.env.CONTINUITYDB_HTTP_URL || null,
       tokenEnv: flags.http_token_env || process.env.CONTINUITYDB_HTTP_TOKEN_ENV || null,
       env: process.env,
     });
     io.stdout.write(`${JSON.stringify(flags.verbose
-      ? { saved: true, memory_id: result.record.id, checkpoint_id: result.handoff.checkpoint_id }
+      ? {
+        saved: true,
+        duplicate: Boolean(result.duplicate),
+        memory_id: result.record.id,
+        checkpoint_id: result.handoff.checkpoint_id,
+      }
       : {})}\n`);
   } else {
     io.stdout.write(`Usage:\n  continuitydb hook session-start --project ID [--task-id ID] [--task TEXT] [--branch REF] [--client claude|cursor]\n  continuitydb hook checkpoint --project ID --file HANDOFF.json [--verbose]\n`);

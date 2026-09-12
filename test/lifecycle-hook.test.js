@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer as createNodeServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import test from "node:test";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
 import { registerProject } from "../src/project-registry.js";
+import * as lifecycleHook from "../src/lifecycle-hook.js";
 
 function runHook(args, env) {
   const hook = new URL("../src/lifecycle-hook.js", import.meta.url).pathname;
@@ -87,6 +88,144 @@ test("lifecycle recall rejects an unbounded token budget before opening transpor
     CONTINUITYDB_TASK: "Continue rollout",
     CONTINUITYDB_HTTP_URL: "",
   }), /token_budget must be an integer between 64 and 32000/);
+});
+
+test("local lifecycle honors configured tenant, owner, agent, and sensitivity identity", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-local-hook-identity-test-"));
+  const home = join(root, "vault");
+  registerProject(home, { id: "billing-api", root: join(root, "project"), source: "explicit" }, { apply: true });
+  const vault = new ContextVault(home);
+  try {
+    for (const item of [
+      { tenant_id: "tenant-a", owner_id: "owner-a", body: "OWNER_A_PRIVATE_MARKER" },
+      { tenant_id: "tenant-a", owner_id: "owner-b", body: "OWNER_B_PRIVATE_MARKER" },
+      { tenant_id: "tenant-b", owner_id: "owner-a", body: "TENANT_B_PRIVATE_MARKER" },
+    ]) {
+      const proposed = vault.propose({
+        ...item,
+        namespace_id: "project/billing-api",
+        project_id: "billing-api",
+        sensitivity: "private",
+      });
+      vault.approve(proposed.record.id, { actor: "fixture" });
+    }
+  } finally {
+    vault.close();
+  }
+
+  try {
+    const startup = JSON.parse(await runHook([
+      "session-start", "--client", "claude", "--tenant-id", "tenant-a",
+      "--owner-id", "owner-a", "--agent-id", "claude-agent",
+      "--allowed-sensitivities", "private",
+    ], {
+      CONTINUITYDB_HOME: home,
+      CONTINUITYDB_PROJECT_ID: "billing-api",
+      CONTINUITYDB_TASK: "Find PRIVATE_MARKER",
+      CONTINUITYDB_HTTP_URL: "",
+    }));
+    const context = startup.hookSpecificOutput.additionalContext;
+    assert.match(context, /OWNER_A_PRIVATE_MARKER/);
+    assert.doesNotMatch(context, /OWNER_B_PRIVATE_MARKER|TENANT_B_PRIVATE_MARKER/);
+
+    const checkpoint = join(root, "identity-checkpoint.json");
+    writeFileSync(checkpoint, JSON.stringify({
+      project_id: "billing-api",
+      task_id: "identity-task",
+      goal: "Keep owner scope",
+      current_state: "Owner-scoped checkpoint",
+      checkpoint_id: "identity-checkpoint-1",
+    }));
+    await runHook([
+      "checkpoint", "--file", checkpoint, "--client", "claude",
+      "--tenant-id", "tenant-a", "--owner-id", "owner-a",
+      "--agent-id", "claude-agent", "--allowed-sensitivities", "private",
+    ], { CONTINUITYDB_HOME: home, CONTINUITYDB_PROJECT_ID: "billing-api", CONTINUITYDB_HTTP_URL: "" });
+    const reopened = new ContextVault(home);
+    try {
+      assert.equal(reopened.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "billing-api",
+        task_id: "identity-task", allowed_sensitivities: ["private"],
+      }).handoff.current_state, "Owner-scoped checkpoint");
+      assert.equal(reopened.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-b", project_id: "billing-api",
+        task_id: "identity-task", allowed_sensitivities: ["private"],
+      }), null);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local lifecycle rejects malformed identity and sensitivity inputs", async () => {
+  const base = {
+    CONTINUITYDB_HOME: "/unused",
+    CONTINUITYDB_PROJECT_ID: "billing-api",
+    CONTINUITYDB_TASK: "Continue rollout",
+    CONTINUITYDB_HTTP_URL: "",
+  };
+  await assert.rejects(runHook(["session-start", "--tenant-id", "bad tenant"], base), /tenant_id/);
+  await assert.rejects(
+    runHook(["session-start", "--allowed-sensitivities", "private,unknown"], base),
+    /allowed_sensitivities contains an invalid value/,
+  );
+  await assert.rejects(
+    runHook(["session-start", "--allowed-sensitivities", ","], base),
+    /allowed_sensitivities must be a non-empty list/,
+  );
+});
+
+test("repeated identical checkpoint is an idempotent truthful duplicate", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-idempotency-test-"));
+  try {
+    const home = seedLocalMemory(root, "billing-api", "Idempotency fixture");
+    const checkpoint = join(root, "handoff.json");
+    writeFileSync(checkpoint, JSON.stringify({
+      project_id: "billing-api", task_id: "repeat-task", goal: "Resume safely",
+      current_state: "Stable state", checkpoint_id: "repeat-checkpoint-1",
+    }));
+    const env = { CONTINUITYDB_HOME: home, CONTINUITYDB_PROJECT_ID: "billing-api", CONTINUITYDB_HTTP_URL: "" };
+    const first = JSON.parse(await runHook(["checkpoint", "--file", checkpoint, "--client", "claude", "--verbose"], env));
+    const second = JSON.parse(await runHook(["checkpoint", "--file", checkpoint, "--client", "claude", "--verbose"], env));
+    assert.equal(first.saved, true);
+    assert.equal(first.duplicate, false);
+    assert.equal(second.saved, true);
+    assert.equal(second.duplicate, true);
+    assert.equal(second.memory_id, first.memory_id);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("secure checkpoint read bounds bytes and detects same-inode growth after open", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-hook-read-race-test-"));
+  const checkpoint = join(root, "handoff.json");
+  try {
+    writeFileSync(checkpoint, JSON.stringify({
+      project_id: "billing-api", task_id: "race-task", goal: "Race safely",
+      current_state: "Before growth", checkpoint_id: "race-checkpoint-1",
+    }));
+    assert.equal(typeof lifecycleHook.readCheckpoint, "function");
+    assert.throws(() => lifecycleHook.readCheckpoint(checkpoint, {
+      afterOpen: () => appendFileSync(checkpoint, "x".repeat(129 * 1024)),
+    }), /(too large|changed during secure read)/);
+    assert.ok(readFileSync(checkpoint).byteLength > 128 * 1024);
+
+    const before = JSON.stringify({
+      project_id: "billing-api", task_id: "race-task", goal: "Race safely",
+      current_state: "Before growth", checkpoint_id: "race-checkpoint-1",
+    });
+    const changed = before.replace("Before", "After!");
+    assert.equal(Buffer.byteLength(changed), Buffer.byteLength(before));
+    writeFileSync(checkpoint, before);
+    assert.throws(() => lifecycleHook.readCheckpoint(checkpoint, {
+      afterOpen: () => writeFileSync(checkpoint, changed),
+    }), /changed during secure read/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("remote lifecycle requires a secure URL and an explicit token environment reference", async () => {

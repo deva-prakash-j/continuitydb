@@ -301,6 +301,10 @@ test("Claude and Cursor install complete lifecycle adapters with fixed project s
     assert.deepEqual(claudeStart.args.slice(0, 5), ["hook", "session-start", "--client", "claude", "--project"]);
     assert.ok(claudeStart.args.includes("service-a"));
     assert.ok(claudeStart.args.includes(value.home));
+    assert.deepEqual(claudeStart.args.slice(-8), [
+      "--tenant-id", "tenant-a", "--owner-id", "owner-a", "--agent-id", "claude",
+      "--allowed-sensitivities", "public,private",
+    ]);
     assert.doesNotMatch(JSON.stringify({ SessionStart: claude.hooks.SessionStart, Stop: claude.hooks.Stop }), /prompt|transcript/i);
     assert.match(readFileSync(claudePolicy, "utf8"), /Project scope: `service-a`/);
 
@@ -324,6 +328,95 @@ test("Claude and Cursor install complete lifecycle adapters with fixed project s
     assert.equal(JSON.parse(readFileSync(claudeSettings, "utf8")).hooks.UserPromptSubmit[0].hooks[0].command, "user-hook");
     assert.equal(JSON.parse(readFileSync(cursorHooks, "utf8")).hooks.beforeSubmitPrompt[0].command, "user-hook");
     assert.equal(existsSync(cursorRule), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("fresh Claude and Cursor disconnect removes owned files and empty created directories", () => {
+  for (const client of ["claude", "cursor"]) {
+    const value = fixture();
+    try {
+      const connected = connectAgent(client, options(value));
+      assert.equal(connected.assets.every((asset) => existsSync(asset.path)), true);
+      disconnectAgent(client, options(value));
+      assert.equal(connected.assets.every((asset) => !existsSync(asset.path)), true);
+      if (client === "claude") assert.equal(existsSync(join(value.project, ".claude")), false);
+      else {
+        assert.equal(existsSync(join(value.project, ".cursor", "rules")), false);
+        assert.equal(existsSync(join(value.project, ".cursor")), false);
+      }
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Claude and Cursor disconnect restores preexisting user JSON and instructions byte-exact", () => {
+  for (const client of ["claude", "cursor"]) {
+    const value = fixture();
+    const paths = client === "claude" ? {
+      mcp: join(value.project, ".mcp.json"),
+      hooks: join(value.project, ".claude", "settings.json"),
+      policy: join(value.project, "CLAUDE.md"),
+    } : {
+      mcp: join(value.project, ".cursor", "mcp.json"),
+      hooks: join(value.project, ".cursor", "hooks.json"),
+      policy: null,
+    };
+    const originals = {
+      mcp: '{\r\n  "keep" : "mcp-spacing",\r\n  "mcpServers" : { "other" : { "command" : "other" } }\r\n}\r\n',
+      hooks: client === "claude"
+        ? '{\r\n  "permissions" : { "allow" : ["Read"] },\r\n  "hooks" : { "UserPromptSubmit" : [ { "hooks" : [{"type":"command","command":"user"}] } ] }\r\n}\r\n'
+        : '{\r\n  "version" : 1,\r\n  "hooks" : { "beforeSubmitPrompt" : [ { "command" : "user" } ] },\r\n  "keep" : true\r\n}\r\n',
+      policy: "# Existing Claude policy\n\nKeep bytes.  \n",
+    };
+    try {
+      mkdirSync(join(paths.mcp, ".."), { recursive: true });
+      mkdirSync(join(paths.hooks, ".."), { recursive: true });
+      writeFileSync(paths.mcp, originals.mcp);
+      writeFileSync(paths.hooks, originals.hooks);
+      if (paths.policy) writeFileSync(paths.policy, originals.policy);
+      connectAgent(client, options(value));
+      disconnectAgent(client, options(value));
+      assert.equal(readFileSync(paths.mcp, "utf8"), originals.mcp);
+      assert.equal(readFileSync(paths.hooks, "utf8"), originals.hooks);
+      if (paths.policy) assert.equal(readFileSync(paths.policy, "utf8"), originals.policy);
+      assert.equal(existsSync(join(paths.hooks, "..")), true);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("Claude and Cursor ownership topology fails closed on post-connect file drift", () => {
+  for (const client of ["claude", "cursor"]) {
+    const value = fixture();
+    try {
+      const connected = connectAgent(client, options(value));
+      const hooks = connected.assets.find((asset) => asset.kind === "lifecycle").path;
+      const mcp = connected.assets.find((asset) => asset.kind === "mcp").path;
+      const policy = connected.assets.find((asset) => asset.kind === "policy").path;
+      const drifted = `${readFileSync(hooks, "utf8").trimEnd()} \n`;
+      writeFileSync(hooks, drifted);
+      const before = [mcp, hooks, policy].map((path) => readFileSync(path, "utf8"));
+      assert.throws(() => connectAgent(client, options(value)), /hooks file ownership fingerprint mismatch/);
+      assert.throws(() => disconnectAgent(client, options(value)), /hooks file ownership fingerprint mismatch/);
+      assert.deepEqual([mcp, hooks, policy].map((path) => readFileSync(path, "utf8")), before);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("lifecycle connector identity and sensitivity inputs are validated before writes", () => {
+  const value = fixture();
+  try {
+    assert.throws(() => connectAgent("claude", { ...options(value), tenantId: "bad tenant" }), /tenant_id/);
+    assert.throws(() => connectAgent("cursor", { ...options(value), ownerId: "bad owner" }), /owner_id/);
+    assert.throws(() => connectAgent("claude", { ...options(value), sensitivities: ["private", "unknown"] }), /invalid allowed sensitivity/);
+    assert.equal(existsSync(join(value.project, ".mcp.json")), false);
+    assert.equal(existsSync(join(value.project, ".cursor")), false);
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }

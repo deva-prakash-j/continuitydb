@@ -10,6 +10,7 @@ const MIN_TOKEN_BUDGET = 64;
 const MAX_TOKEN_BUDGET = 32_000;
 const TOKEN_ENV_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
 const RESERVED_TOKEN_ENV = new Set(["HOME", "PATH", "SHELL", "USER", "LOGNAME", "PWD"]);
+const SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
 
 function optionalIdentifier(value, name) {
   if (value === undefined || value === null || value === "") return null;
@@ -22,6 +23,15 @@ function validatedBudget(value = 1200) {
     throw new Error(`token_budget must be an integer between ${MIN_TOKEN_BUDGET} and ${MAX_TOKEN_BUDGET}`);
   }
   return budget;
+}
+
+function validatedSensitivities(values = ["public", "private"]) {
+  if (!Array.isArray(values) || values.length === 0) throw new Error("allowed_sensitivities must be a non-empty list");
+  const normalized = [...new Set(values.map(String))];
+  if (normalized.some((value) => !SENSITIVITIES.has(value))) {
+    throw new Error("allowed_sensitivities contains an invalid value");
+  }
+  return normalized;
 }
 
 function assertRegisteredProject(home, projectId) {
@@ -49,6 +59,10 @@ export async function loadLifecycleContext({
   branch = null,
   task,
   tokenBudget = 1200,
+  tenantId = "local",
+  ownerId = "local-user",
+  agentId = "lifecycle-hook",
+  allowedSensitivities = ["public", "private"],
   remoteUrl = null,
   tokenEnv = null,
   env = process.env,
@@ -60,6 +74,12 @@ export async function loadLifecycleContext({
     ? task.trim()
     : `Continue work in project ${fixedProjectId}`;
   const budget = validatedBudget(tokenBudget);
+  const identity = {
+    tenantId: requiredIdentifier(tenantId, "tenant_id"),
+    ownerId: requiredIdentifier(ownerId, "owner_id"),
+    agentId: requiredIdentifier(agentId, "agent_id"),
+    sensitivities: validatedSensitivities(allowedSensitivities),
+  };
 
   let vault = null;
   const client = remoteUrl
@@ -71,16 +91,16 @@ export async function loadLifecycleContext({
       return {
         latestHandoff: (input) => vault.latestHandoff({
           ...input,
-          tenant_id: "local",
-          owner_id: "local-user",
-          allowed_sensitivities: ["public", "private"],
+          tenant_id: identity.tenantId,
+          owner_id: identity.ownerId,
+          allowed_sensitivities: identity.sensitivities,
         }),
         contextPack: (input) => vault.contextPack({
           ...input,
-          tenant_id: "local",
-          owner_id: "local-user",
+          tenant_id: identity.tenantId,
+          owner_id: identity.ownerId,
           allowed_projects: [fixedProjectId],
-          allowed_sensitivities: ["public", "private"],
+          allowed_sensitivities: identity.sensitivities,
         }),
       };
     })();
@@ -117,12 +137,18 @@ export async function saveLifecycleCheckpoint({
   projectId,
   checkpoint,
   agentId = "lifecycle-hook",
+  tenantId = "local",
+  ownerId = "local-user",
+  allowedSensitivities = ["public", "private"],
   remoteUrl = null,
   tokenEnv = null,
   env = process.env,
 }) {
   const fixedProjectId = validateProjectId(projectId);
   const fixedAgentId = requiredIdentifier(agentId, "agent_id");
+  const fixedTenantId = requiredIdentifier(tenantId, "tenant_id");
+  const fixedOwnerId = requiredIdentifier(ownerId, "owner_id");
+  const fixedSensitivities = validatedSensitivities(allowedSensitivities);
   if (checkpoint.project_id !== fixedProjectId) {
     throw new Error(`checkpoint project ${checkpoint.project_id || "<missing>"} does not match configured project ${fixedProjectId}`);
   }
@@ -136,7 +162,9 @@ export async function saveLifecycleCheckpoint({
           task_id: value.task_id,
           branch: value.branch || null,
         });
-        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+        if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
+          value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+        }
       } catch (error) {
         if (error.statusCode !== 404) throw error;
       }
@@ -148,13 +176,13 @@ export async function saveLifecycleCheckpoint({
   const vault = new ContextVault(home);
   try {
     const identity = normalizeIdentity({
-      tenant_id: "local",
+      tenant_id: fixedTenantId,
       principal_id: fixedAgentId,
-      owner_id: "local-user",
+      owner_id: fixedOwnerId,
       agent_id: fixedAgentId,
       scopes: ["memory:capture"],
       allowed_projects: [fixedProjectId],
-      allowed_sensitivities: ["public", "private"],
+      allowed_sensitivities: fixedSensitivities,
     });
     if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
       const latest = vault.latestHandoff({
@@ -165,7 +193,9 @@ export async function saveLifecycleCheckpoint({
         branch: value.branch || null,
         allowed_sensitivities: identity.allowed_sensitivities,
       });
-      if (latest) value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      if (latest && latest.handoff.checkpoint_id !== value.checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      }
     }
     const input = {
       ...value,
