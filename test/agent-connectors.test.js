@@ -171,6 +171,75 @@ test("connectors preserve unrelated JSON and TOML content and create immutable b
   }
 });
 
+test("Codex and OpenCode share reference-aware AGENTS policy ownership", () => {
+  const value = fixture();
+  const agents = join(value.project, "AGENTS.md");
+  const userRules = "# User rules\n\nPreserve this exactly.  \n";
+  try {
+    writeFileSync(agents, userRules);
+    connectAgent("codex", options(value));
+    assert.match(readFileSync(agents, "utf8"), /consumers: codex/);
+
+    connectAgent("opencode", options(value));
+    const shared = readFileSync(agents, "utf8");
+    assert.match(shared, /consumers: codex,opencode/);
+    assert.match(shared, /memory_context_pack/);
+    assert.equal(shared.startsWith(userRules), true);
+
+    disconnectAgent("codex", options(value));
+    const oneConsumer = readFileSync(agents, "utf8");
+    assert.match(oneConsumer, /consumers: opencode/);
+    assert.match(oneConsumer, /memory_context_pack/);
+    assert.equal(oneConsumer.startsWith(userRules), true);
+
+    disconnectAgent("opencode", options(value));
+    assert.equal(readFileSync(agents, "utf8"), userRules);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("shared policy preview is write-free and malformed markers fail before MCP mutation", () => {
+  const value = fixture();
+  const agents = join(value.project, "AGENTS.md");
+  try {
+    const preview = connectAgent("codex", options(value, false));
+    assert.equal(preview.applied, false);
+    assert.equal(existsSync(agents), false);
+
+    const malformed = "<!-- >>> continuitydb managed policy >>>\nmissing end\n";
+    writeFileSync(agents, malformed);
+    assert.throws(() => connectAgent("codex", options(value)), /invalid ContinuityDB managed text block/);
+    assert.equal(readFileSync(agents, "utf8"), malformed);
+    assert.equal(existsSync(join(value.project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("shared policy write conflicts preserve the external edit and roll back MCP configuration", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const agents = join(value.project, "AGENTS.md");
+  const external = "# Rules changed concurrently\n";
+  try {
+    process.env.NODE_ENV = "test";
+    writeFileSync(agents, "# Original rules\n");
+    assert.throws(() => connectAgent("codex", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => {
+        if (path === agents) writeFileSync(agents, external, { mode: 0o600 });
+      },
+    }), /configuration changed before atomic replacement/);
+    assert.equal(readFileSync(agents, "utf8"), external);
+    assert.equal(existsSync(join(value.project, ".codex", "config.toml")), false);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("connectors reject symlinked configuration parents", () => {
   const value = fixture();
   try {

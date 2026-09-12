@@ -21,6 +21,13 @@ import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
 import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
 import { resolveProjectIdentity, validateProjectId } from "./project-identity.js";
+import {
+  mergeManagedText,
+  POLICY_END,
+  POLICY_START,
+  policyAssetDescriptors,
+  removeManagedText,
+} from "./agent-policy.js";
 
 export const SUPPORTED_AGENTS = Object.freeze(["codex", "claude", "opencode", "cursor", "copilot"]);
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -454,6 +461,76 @@ function prepareAgentChange(client, rawOptions, action, identity = null) {
   return { client, action, options, path, content, original: snapshot(path) };
 }
 
+function sharedPolicyMetadata(current) {
+  // Running the public remover first gives shared policy files the same strict
+  // missing/duplicate/nested/reversed marker validation used by all callers.
+  removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+  const start = current.indexOf(POLICY_START);
+  if (start === -1) return null;
+  const end = current.indexOf(POLICY_END, start) + POLICY_END.length;
+  const block = current.slice(start, end);
+  const firstLineEnd = block.indexOf("\n");
+  const firstLine = firstLineEnd === -1 ? block : block.slice(0, firstLineEnd);
+  const header = firstLine.match(/^<!-- >>> continuitydb managed policy >>> consumers: ([a-z]+(?:,[a-z]+)*)$/);
+  if (!header) throw new Error("invalid ContinuityDB managed policy metadata");
+  const consumers = header[1].split(",");
+  if (consumers.some((consumer) => consumer !== "codex" && consumer !== "opencode")
+    || [...new Set(consumers)].sort().join(",") !== header[1]) {
+    throw new Error("invalid ContinuityDB managed policy consumers");
+  }
+  const projectMatches = [...block.matchAll(/Project scope: `([^`]+)`\./g)];
+  if (projectMatches.length !== 1) throw new Error("invalid ContinuityDB managed policy project scope");
+  const projectId = validateProjectId(projectMatches[0][1]);
+  return { consumers, projectId };
+}
+
+function prepareSharedPolicyChange(clients, rawOptions, action, identity) {
+  const selected = clients.filter((client) => client === "codex" || client === "opencode");
+  if (!selected.length) return null;
+  const options = normalizeOptions(rawOptions, { identity });
+  const path = join(options.projectDir, "AGENTS.md");
+  const current = readText(path);
+  const metadata = sharedPolicyMetadata(current);
+  if (action === "disconnect" && metadata === null) return null;
+
+  if (action === "connect" && metadata && metadata.projectId !== identity.id) {
+    throw new Error(`ContinuityDB managed policy belongs to project ${metadata.projectId}, not ${identity.id}`);
+  }
+  const consumers = new Set(metadata?.consumers || []);
+  for (const client of selected) {
+    if (action === "connect") consumers.add(client);
+    else consumers.delete(client);
+  }
+  const orderedConsumers = [...consumers].sort();
+  let content;
+  let descriptor = null;
+  if (orderedConsumers.length === 0) {
+    content = removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+  } else {
+    const rendererClient = orderedConsumers.includes("codex") ? "codex" : "opencode";
+    descriptor = policyAssetDescriptors(rendererClient, {
+      projectDir: options.projectDir,
+      projectId: action === "connect" ? identity.id : metadata.projectId,
+      consumers: orderedConsumers,
+    })[0];
+    content = mergeManagedText(current, {
+      startMarker: POLICY_START,
+      endMarker: POLICY_END,
+      body: descriptor.content,
+    });
+  }
+  ensureSafeParents(options.projectDir, path, false);
+  return {
+    client: descriptor?.owner || "continuitydb-policy",
+    action,
+    options,
+    path,
+    content,
+    original: snapshot(path),
+    internalPolicyAsset: true,
+  };
+}
+
 function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.apply ?? false } = {}) {
   if (!plans.length) {
     if (apply && finalize) finalize({ committed: [] });
@@ -537,7 +614,10 @@ function batch(clients, rawOptions, action) {
   // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
   // path and rendered output must validate before the first client file changes.
   const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action, identity));
-  return applyAgentPlans(plans, { finalize: rawOptions._finalizeSetup });
+  const policyPlan = prepareSharedPolicyChange(unique, rawOptions, action, identity);
+  if (policyPlan) plans.push(policyPlan);
+  const results = applyAgentPlans(plans, { finalize: rawOptions._finalizeSetup });
+  return results.filter((_result, index) => !plans[index].internalPolicyAsset);
 }
 
 export function connectAgents(clients, rawOptions = {}) {
