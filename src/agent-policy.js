@@ -7,6 +7,16 @@ export const POLICY_END = "<!-- <<< continuitydb managed policy <<< -->";
 const POLICY_CLIENTS = new Set(["codex", "claude", "opencode", "cursor", "copilot"]);
 const SHARED_POLICY_MODES = Object.freeze({ codex: "policy-led", opencode: "plugin+policy" });
 const CLIENT_POLICY_ASSETS = Object.freeze({
+  claude: {
+    relativePath: ["CLAUDE.md"],
+    recallMode: "hook-enforced",
+    owner: "continuitydb-claude-policy",
+  },
+  cursor: {
+    relativePath: [".cursor", "rules", "continuitydb.mdc"],
+    recallMode: "hook+policy",
+    owner: "continuitydb-cursor-policy",
+  },
   copilot: {
     relativePath: [".github", "copilot-instructions.md"],
     recallMode: "policy-led",
@@ -104,16 +114,19 @@ export function policyAssetDescriptors(client, options) {
   const projectId = validateProjectId(options.projectId);
   const consumers = normalizedConsumers(options.consumers || [client]);
   if (clientAsset) {
+    const policy = renderContinuityPolicy({
+      client,
+      projectId,
+      recallMode: clientAsset.recallMode,
+      consumers,
+    });
     return [{
       path: join(projectDir, ...clientAsset.relativePath),
       kind: "managed-text",
       owner: clientAsset.owner,
-      content: renderContinuityPolicy({
-        client,
-        projectId,
-        recallMode: clientAsset.recallMode,
-        consumers,
-      }),
+      content: client === "cursor"
+        ? `---\ndescription: ContinuityDB project continuity policy\nalwaysApply: true\n---\n${policy}`
+        : policy,
     }];
   }
   return [{

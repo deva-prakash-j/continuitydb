@@ -117,9 +117,23 @@ test("policy descriptors target shared and client-specific instruction files", (
       consumers: ["copilot"],
     }),
   }]);
-  for (const client of ["claude", "cursor"]) {
-    assert.deepEqual(policyAssetDescriptors(client, options), []);
-  }
+  assert.deepEqual(policyAssetDescriptors("claude", {
+    projectDir, projectId: "billing-api", consumers: ["claude"],
+  }), [{
+    path: join(projectDir, "CLAUDE.md"),
+    kind: "managed-text",
+    owner: "continuitydb-claude-policy",
+    content: renderContinuityPolicy({
+      client: "claude", projectId: "billing-api", recallMode: "hook-enforced", consumers: ["claude"],
+    }),
+  }]);
+  const cursor = policyAssetDescriptors("cursor", {
+    projectDir, projectId: "billing-api", consumers: ["cursor"],
+  });
+  assert.equal(cursor[0].path, join(projectDir, ".cursor", "rules", "continuitydb.mdc"));
+  assert.equal(cursor[0].owner, "continuitydb-cursor-policy");
+  assert.match(cursor[0].content, /^---\ndescription:.*\nalwaysApply: true\n---\n/);
+  assert.match(cursor[0].content, /Recall mode: `hook\+policy`/);
 });
 
 function escapeRegex(value) {

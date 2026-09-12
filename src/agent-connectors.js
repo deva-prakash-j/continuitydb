@@ -491,6 +491,138 @@ function disconnectedJson(client, current, path) {
   return value;
 }
 
+function lifecycleServiceUrl(mcpUrl) {
+  const value = new URL(validateRemoteUrl(mcpUrl));
+  value.pathname = value.pathname.slice(0, -3);
+  return value.href;
+}
+
+function lifecycleArgs(client, options, action) {
+  const args = ["hook", action, "--client", client, "--project", options.identity.id];
+  if (options.transport === "http") {
+    args.push("--http-url", lifecycleServiceUrl(options.url), "--http-token-env", options.tokenEnv);
+  } else {
+    args.push("--home", options.home);
+  }
+  if (action === "checkpoint") args.push("--file", join(options.projectDir, ".continuitydb-handoff.json"));
+  return args;
+}
+
+function shellWord(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_./:=@+-]+$/.test(text)) return text;
+  return `'${text.replaceAll("'", `'"'"'`)}'`;
+}
+
+function lifecycleEntries(client, options) {
+  const command = executable(options);
+  if (client === "claude") return {
+    SessionStart: {
+      matcher: "startup|resume|clear|compact",
+      hooks: [{ type: "command", command, args: lifecycleArgs(client, options, "session-start"), timeout: 30 }],
+    },
+    Stop: {
+      hooks: [{ type: "command", command, args: lifecycleArgs(client, options, "checkpoint"), timeout: 30 }],
+    },
+  };
+  const render = (action) => [command, ...lifecycleArgs(client, options, action)].map(shellWord).join(" ");
+  return {
+    sessionStart: { command: render("session-start") },
+    stop: { command: render("checkpoint") },
+  };
+}
+
+function entryFingerprint(value) {
+  return sha256(canonicalJson(value));
+}
+
+function lifecyclePolicyContent(client, body, ownership) {
+  const metadata = `<!-- continuitydb managed lifecycle ownership: mcp_sha256=${ownership.mcp}; start_sha256=${ownership.start}; stop_sha256=${ownership.stop} -->`;
+  if (client === "cursor") {
+    const marker = body.indexOf(POLICY_START);
+    return `${body.slice(0, marker)}${metadata}\n${body.slice(marker)}`;
+  }
+  const firstLineEnd = body.indexOf("\n");
+  return `${body.slice(0, firstLineEnd)}\n${metadata}${body.slice(firstLineEnd)}`;
+}
+
+function lifecyclePolicyMetadata(current, client) {
+  if (!current) return null;
+  if (client === "claude") {
+    removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+    if (!current.includes(POLICY_START)) return null;
+  } else {
+    const starts = current.split(POLICY_START).length - 1;
+    const ends = current.split(POLICY_END).length - 1;
+    if (starts !== 1 || ends !== 1 || current.indexOf(POLICY_START) > current.indexOf(POLICY_END)) {
+      throw new Error("invalid ContinuityDB managed cursor rule");
+    }
+    if (!current.startsWith("---\n") || !/\nalwaysApply: true\n---\n/.test(current)) {
+      throw new Error("invalid ContinuityDB managed cursor rule frontmatter");
+    }
+  }
+  const firstLine = current.slice(current.indexOf(POLICY_START), current.indexOf("\n", current.indexOf(POLICY_START)));
+  if (firstLine !== `${POLICY_START} consumers: ${client}`) {
+    throw new Error(`invalid ContinuityDB managed ${client} policy metadata`);
+  }
+  const ownership = [...current.matchAll(/<!-- continuitydb managed lifecycle ownership: mcp_sha256=([a-f0-9]{64}); start_sha256=([a-f0-9]{64}); stop_sha256=([a-f0-9]{64}) -->/g)];
+  if (ownership.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} lifecycle ownership metadata`);
+  const projects = [...current.matchAll(/Project scope: `([^`]+)`\./g)];
+  if (projects.length !== 1) throw new Error(`invalid ContinuityDB managed ${client} policy project scope`);
+  return {
+    projectId: validateProjectId(projects[0][1]),
+    mcp: ownership[0][1],
+    start: ownership[0][2],
+    stop: ownership[0][3],
+  };
+}
+
+function lifecycleEventNames(client) {
+  return client === "claude"
+    ? { start: "SessionStart", stop: "Stop" }
+    : { start: "sessionStart", stop: "stop" };
+}
+
+function findOwnedHookIndex(items, fingerprint) {
+  return items.findIndex((item) => entryFingerprint(item) === fingerprint);
+}
+
+function looksLikeContinuityHook(value) {
+  const text = JSON.stringify(value);
+  return /continuitydb/i.test(text) && /(?:session-start|checkpoint|"hook")/.test(text);
+}
+
+function renderLifecycleHooks(client, current, path, options, metadata, action) {
+  const value = structuredClone(current);
+  if (client === "cursor") {
+    if (value.version !== undefined && value.version !== 1) throw new Error(`Cursor hooks version must be 1: ${path}`);
+    value.version = 1;
+  }
+  const hooks = managedJsonNamespace(value, "hooks", path);
+  const names = lifecycleEventNames(client);
+  const generated = lifecycleEntries(client, options);
+  for (const [role, eventName] of Object.entries(names)) {
+    if (hooks[eventName] !== undefined && !Array.isArray(hooks[eventName])) {
+      throw new Error(`configuration hook ${eventName} must be a JSON array: ${path}`);
+    }
+    const items = [...(hooks[eventName] || [])];
+    if (metadata) {
+      const index = findOwnedHookIndex(items, metadata[role]);
+      if (index !== -1) items.splice(index, 1);
+      else if (items.some(looksLikeContinuityHook)) {
+        throw new Error(`${client} lifecycle ownership fingerprint mismatch`);
+      }
+    } else if (items.some(looksLikeContinuityHook)) {
+      throw new Error(`an unmanaged ${client} ContinuityDB lifecycle hook already exists`);
+    }
+    if (action === "connect") items.push(generated[eventName]);
+    if (items.length) hooks[eventName] = items;
+    else delete hooks[eventName];
+  }
+  if (Object.keys(hooks).length === 0) delete value.hooks;
+  return { value, generated, names };
+}
+
 function skipJsonWhitespace(text, offset) {
   let position = offset;
   while (position < text.length && /\s/.test(text[position])) position += 1;
@@ -840,8 +972,93 @@ function dedicatedPolicyMetadata(current, client) {
   };
 }
 
+function prepareLifecycleClientChanges(client, rawOptions, action, identity) {
+  const baseOptions = normalizeOptions(rawOptions);
+  const policyPath = client === "claude"
+    ? join(baseOptions.projectDir, "CLAUDE.md")
+    : join(baseOptions.projectDir, ".cursor", "rules", "continuitydb.mdc");
+  const policyCurrent = readText(policyPath);
+  const metadata = lifecyclePolicyMetadata(policyCurrent, client);
+  if (action === "connect" && metadata && metadata.projectId !== identity.id) {
+    throw new Error(`ContinuityDB managed ${client} policy belongs to project ${metadata.projectId}, not ${identity.id}`);
+  }
+  const effectiveIdentity = identity || (metadata
+    ? { id: metadata.projectId }
+    : { id: validateProjectId(rawOptions.projectId || baseOptions.projects[0]) });
+  const options = normalizeOptions(rawOptions, { identity: effectiveIdentity });
+  const policyDescriptor = policyAssetDescriptors(client, {
+    projectDir: options.projectDir,
+    projectId: effectiveIdentity.id,
+    consumers: [client],
+  })[0];
+
+  const mcpPath = jsonTarget(client, options.projectDir);
+  const mcpCurrent = parseJson(mcpPath);
+  const mcpNamespace = mcpCurrent.mcpServers === undefined
+    ? null
+    : managedJsonNamespace(mcpCurrent, "mcpServers", mcpPath);
+  const currentMcp = mcpNamespace?.continuitydb;
+  const hasCurrentMcp = Boolean(mcpNamespace && Object.prototype.hasOwnProperty.call(mcpNamespace, "continuitydb"));
+  if (hasCurrentMcp && !metadata) {
+    throw new Error(`an unmanaged ${client} continuitydb server already exists; refusing to ${action}`);
+  }
+  if (hasCurrentMcp && metadata && entryFingerprint(currentMcp) !== metadata.mcp) {
+    throw new Error(`${client} MCP ownership fingerprint mismatch`);
+  }
+
+  const hooksPath = client === "claude"
+    ? join(options.projectDir, ".claude", "settings.json")
+    : join(options.projectDir, ".cursor", "hooks.json");
+  const hooksCurrent = parseJson(hooksPath);
+  const renderedHooks = renderLifecycleHooks(client, hooksCurrent, hooksPath, options, metadata, action);
+  const unownedDisconnectNoop = action === "disconnect" && !metadata && !hasCurrentMcp;
+
+  const connectedMcp = action === "connect"
+    ? connectedJson(client, mcpCurrent, options)
+    : disconnectedJson(client, mcpCurrent, mcpPath);
+  const mcpContent = `${JSON.stringify(connectedMcp, null, 2)}\n`;
+  const hooksContent = `${JSON.stringify(renderedHooks.value, null, 2)}\n`;
+  let policyContent;
+  let deletePolicy = false;
+  if (action === "connect") {
+    const entries = renderedHooks.generated;
+    const names = renderedHooks.names;
+    const body = lifecyclePolicyContent(client, policyDescriptor.content, {
+      mcp: entryFingerprint(connectedMcp.mcpServers.continuitydb),
+      start: entryFingerprint(entries[names.start]),
+      stop: entryFingerprint(entries[names.stop]),
+    });
+    policyContent = client === "claude"
+      ? mergeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END, body })
+      : body;
+  } else if (client === "claude") {
+    policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
+  } else {
+    policyContent = "";
+    deletePolicy = Boolean(metadata);
+  }
+
+  for (const path of [mcpPath, hooksPath, policyPath]) ensureSafeParents(options.projectDir, path, false);
+  return [{
+    client, action, options, path: mcpPath, content: mcpContent, original: snapshot(mcpPath),
+    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client],
+    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(mcpPath)),
+  }, {
+    client, action, options, path: hooksPath, content: hooksContent, original: snapshot(hooksPath),
+    kind: "lifecycle", owner: `continuitydb-${client}-hooks`, assetClients: [client],
+    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(hooksPath)),
+  }, {
+    client, action, options, path: policyPath, content: policyContent, original: snapshot(policyPath),
+    kind: "policy", owner: policyDescriptor.owner, assetClients: [client], deleteTarget: deletePolicy,
+    noOp: unownedDisconnectNoop || (action === "disconnect" && !existsSync(policyPath)),
+  }];
+}
+
 function prepareAgentChanges(client, rawOptions, action, identity = null) {
   if (client === "copilot") return prepareCopilotChanges(rawOptions, action, identity);
+  if (client === "claude" || client === "cursor") {
+    return prepareLifecycleClientChanges(client, rawOptions, action, identity);
+  }
   return [prepareMcpAgentChange(client, rawOptions, action, identity)];
 }
 
@@ -1036,8 +1253,16 @@ function batch(clients, rawOptions, action) {
       backup: result.backup,
     }));
     const capabilities = client === "codex" || client === "copilot"
-      ? { recall_mode: "policy-led", capture_mode: "explicit-governed" }
-      : {};
+      ? { recall_mode: "policy-led", capture_mode: "explicit-governed", limitations: [] }
+      : client === "claude"
+        ? { recall_mode: "hook-enforced", capture_mode: "explicit-governed", limitations: [] }
+        : client === "cursor"
+          ? {
+            recall_mode: "hook+policy",
+            capture_mode: "explicit-governed",
+            limitations: ["Cursor read-only cloud sessions use the always-loaded policy fallback until lifecycle hooks are available."],
+          }
+          : {};
     return {
       client,
       project_dir: primary.project_dir,

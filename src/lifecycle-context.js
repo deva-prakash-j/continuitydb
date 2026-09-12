@@ -1,0 +1,185 @@
+import { resolve } from "node:path";
+import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
+import { ContinuityApiClient } from "./http-client.js";
+import { validateProjectId } from "./project-identity.js";
+import { listRegisteredProjects } from "./project-registry.js";
+import { normalizeIdentity, requiredIdentifier } from "./security.js";
+import { ContextVault } from "./store.js";
+
+const MIN_TOKEN_BUDGET = 64;
+const MAX_TOKEN_BUDGET = 32_000;
+const TOKEN_ENV_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
+const RESERVED_TOKEN_ENV = new Set(["HOME", "PATH", "SHELL", "USER", "LOGNAME", "PWD"]);
+
+function optionalIdentifier(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  return requiredIdentifier(String(value), name);
+}
+
+function validatedBudget(value = 1200) {
+  const budget = Number(value);
+  if (!Number.isInteger(budget) || budget < MIN_TOKEN_BUDGET || budget > MAX_TOKEN_BUDGET) {
+    throw new Error(`token_budget must be an integer between ${MIN_TOKEN_BUDGET} and ${MAX_TOKEN_BUDGET}`);
+  }
+  return budget;
+}
+
+function assertRegisteredProject(home, projectId) {
+  if (!listRegisteredProjects(home).some((project) => project.id === projectId)) {
+    throw new Error(`project ${projectId} is not registered in ${resolve(home)}`);
+  }
+}
+
+function remoteClient({ remoteUrl, tokenEnv, env }) {
+  if (typeof tokenEnv !== "string" || !TOKEN_ENV_PATTERN.test(tokenEnv) || RESERVED_TOKEN_ENV.has(tokenEnv)) {
+    throw new Error("CONTINUITYDB_HTTP_TOKEN_ENV is required and must name a dedicated uppercase environment entry");
+  }
+  return new ContinuityApiClient({ baseUrl: remoteUrl, token: env[tokenEnv] || null });
+}
+
+/**
+ * Load one bounded, project-scoped lifecycle context without depending on a
+ * provider-specific output schema. A task id is deliberately optional: it
+ * controls handoff lookup only and never blocks normal context recall.
+ */
+export async function loadLifecycleContext({
+  home,
+  projectId,
+  taskId = null,
+  branch = null,
+  task,
+  tokenBudget = 1200,
+  remoteUrl = null,
+  tokenEnv = null,
+  env = process.env,
+}) {
+  const fixedProjectId = validateProjectId(projectId);
+  const fixedTaskId = optionalIdentifier(taskId, "task_id");
+  const fixedBranch = optionalIdentifier(branch, "branch");
+  const query = typeof task === "string" && task.trim()
+    ? task.trim()
+    : `Continue work in project ${fixedProjectId}`;
+  const budget = validatedBudget(tokenBudget);
+
+  let vault = null;
+  const client = remoteUrl
+    ? remoteClient({ remoteUrl, tokenEnv, env })
+    : (() => {
+      if (typeof home !== "string" || !home) throw new Error("CONTINUITYDB_HOME is required for local lifecycle hooks");
+      assertRegisteredProject(home, fixedProjectId);
+      vault = new ContextVault(home);
+      return {
+        latestHandoff: (input) => vault.latestHandoff({
+          ...input,
+          tenant_id: "local",
+          owner_id: "local-user",
+          allowed_sensitivities: ["public", "private"],
+        }),
+        contextPack: (input) => vault.contextPack({
+          ...input,
+          tenant_id: "local",
+          owner_id: "local-user",
+          allowed_projects: [fixedProjectId],
+          allowed_sensitivities: ["public", "private"],
+        }),
+      };
+    })();
+
+  try {
+    let handoff = null;
+    if (fixedTaskId) {
+      try {
+        handoff = await client.latestHandoff({
+          project_id: fixedProjectId,
+          task_id: fixedTaskId,
+          branch: fixedBranch,
+        });
+      } catch (error) {
+        if (error.statusCode !== 404) throw error;
+      }
+    }
+    const contextPack = await client.contextPack({
+      project_id: fixedProjectId,
+      task: query,
+      branch: fixedBranch,
+      token_budget: budget,
+      dependency_depth: 2,
+      exclude_types: ["handoff"],
+    });
+    return { handoff, contextPack };
+  } finally {
+    vault?.close();
+  }
+}
+
+export async function saveLifecycleCheckpoint({
+  home,
+  projectId,
+  checkpoint,
+  agentId = "lifecycle-hook",
+  remoteUrl = null,
+  tokenEnv = null,
+  env = process.env,
+}) {
+  const fixedProjectId = validateProjectId(projectId);
+  const fixedAgentId = requiredIdentifier(agentId, "agent_id");
+  if (checkpoint.project_id !== fixedProjectId) {
+    throw new Error(`checkpoint project ${checkpoint.project_id || "<missing>"} does not match configured project ${fixedProjectId}`);
+  }
+  const value = { ...checkpoint };
+  if (remoteUrl) {
+    const client = remoteClient({ remoteUrl, tokenEnv, env });
+    if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
+      try {
+        const latest = await client.latestHandoff({
+          project_id: fixedProjectId,
+          task_id: value.task_id,
+          branch: value.branch || null,
+        });
+        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      } catch (error) {
+        if (error.statusCode !== 404) throw error;
+      }
+    }
+    return client.saveHandoff(value);
+  }
+  if (typeof home !== "string" || !home) throw new Error("CONTINUITYDB_HOME is required for local lifecycle hooks");
+  assertRegisteredProject(home, fixedProjectId);
+  const vault = new ContextVault(home);
+  try {
+    const identity = normalizeIdentity({
+      tenant_id: "local",
+      principal_id: fixedAgentId,
+      owner_id: "local-user",
+      agent_id: fixedAgentId,
+      scopes: ["memory:capture"],
+      allowed_projects: [fixedProjectId],
+      allowed_sensitivities: ["public", "private"],
+    });
+    if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
+      const latest = vault.latestHandoff({
+        tenant_id: identity.tenant_id,
+        owner_id: identity.owner_id,
+        project_id: fixedProjectId,
+        task_id: value.task_id,
+        branch: value.branch || null,
+        allowed_sensitivities: identity.allowed_sensitivities,
+      });
+      if (latest) value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+    }
+    const input = {
+      ...value,
+      tenant_id: identity.tenant_id,
+      owner_id: identity.owner_id,
+      principal_id: identity.principal_id,
+      agent_id: identity.agent_id,
+    };
+    const policy = new CapturePolicy(loadCapturePolicy(null));
+    return vault.saveHandoff(input, {
+      assessment: policy.evaluateHandoff(input, identity, vault),
+      actor: `${identity.principal_id}/${identity.agent_id}`,
+    });
+  } finally {
+    vault.close();
+  }
+}

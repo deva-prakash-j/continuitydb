@@ -264,6 +264,140 @@ test("Codex and Copilot install complete policy-led adapters with truthful asset
   }
 });
 
+test("Claude and Cursor install complete lifecycle adapters with fixed project scope", () => {
+  const value = fixture();
+  const claudePolicy = join(value.project, "CLAUDE.md");
+  const claudeSettings = join(value.project, ".claude", "settings.json");
+  const cursorHooks = join(value.project, ".cursor", "hooks.json");
+  const cursorRule = join(value.project, ".cursor", "rules", "continuitydb.mdc");
+  try {
+    writeFileSync(claudePolicy, "# Existing Claude instructions\n");
+    mkdirSync(join(value.project, ".claude"));
+    writeFileSync(claudeSettings, '{"permissions":{"allow":["Read"]},"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"user-hook"}]}]}}\n');
+    mkdirSync(join(value.project, ".cursor"));
+    writeFileSync(cursorHooks, '{"version":1,"hooks":{"beforeSubmitPrompt":[{"command":"user-hook"}]},"keep":true}\n');
+
+    const preview = connectAgents(["claude", "cursor"], options(value, false));
+    assert.deepEqual(preview.map((item) => item.assets.length), [3, 3]);
+    assert.deepEqual(preview.map((item) => item.recall_mode), ["hook-enforced", "hook+policy"]);
+    assert.equal(preview.every((item) => item.capture_mode === "explicit-governed"), true);
+    assert.match(preview[1].limitations.join(" "), /read-only cloud/i);
+    assert.equal(existsSync(cursorRule), false);
+
+    const applied = connectAgents(["claude", "cursor"], options(value));
+    assert.equal(applied.every((item) => item.applied && item.verified), true);
+    assert.deepEqual(applied[0].assets.map((asset) => asset.path), [
+      join(value.project, ".mcp.json"), claudeSettings, claudePolicy,
+    ]);
+    assert.deepEqual(applied[1].assets.map((asset) => asset.path), [
+      join(value.project, ".cursor", "mcp.json"), cursorHooks, cursorRule,
+    ]);
+
+    const claude = JSON.parse(readFileSync(claudeSettings, "utf8"));
+    assert.equal(claude.permissions.allow[0], "Read");
+    assert.equal(claude.hooks.UserPromptSubmit[0].hooks[0].command, "user-hook");
+    const claudeStart = claude.hooks.SessionStart[0].hooks[0];
+    assert.equal(claudeStart.command, "/opt/continuitydb/bin/continuitydb");
+    assert.deepEqual(claudeStart.args.slice(0, 5), ["hook", "session-start", "--client", "claude", "--project"]);
+    assert.ok(claudeStart.args.includes("service-a"));
+    assert.ok(claudeStart.args.includes(value.home));
+    assert.doesNotMatch(JSON.stringify({ SessionStart: claude.hooks.SessionStart, Stop: claude.hooks.Stop }), /prompt|transcript/i);
+    assert.match(readFileSync(claudePolicy, "utf8"), /Project scope: `service-a`/);
+
+    const cursor = JSON.parse(readFileSync(cursorHooks, "utf8"));
+    assert.equal(cursor.keep, true);
+    assert.equal(cursor.hooks.beforeSubmitPrompt[0].command, "user-hook");
+    assert.match(cursor.hooks.sessionStart[0].command, /hook session-start --client cursor/);
+    assert.match(cursor.hooks.sessionStart[0].command, /--project service-a/);
+    assert.match(cursor.hooks.sessionStart[0].command, /--home/);
+    assert.doesNotMatch(JSON.stringify({ sessionStart: cursor.hooks.sessionStart, stop: cursor.hooks.stop }), /prompt|transcript/i);
+    assert.match(readFileSync(cursorRule, "utf8"), /untrusted evidence/i);
+
+    const beforeRerun = applied.flatMap((item) => item.assets).map((asset) => readFileSync(asset.path, "utf8"));
+    const rerun = connectAgents(["claude", "cursor"], options(value));
+    assert.equal(rerun.every((item) => !item.changed && item.verified), true);
+    assert.deepEqual(rerun.flatMap((item) => item.assets).map((asset) => readFileSync(asset.path, "utf8")), beforeRerun);
+
+    disconnectAgent("claude", options(value));
+    disconnectAgent("cursor", options(value));
+    assert.equal(readFileSync(claudePolicy, "utf8"), "# Existing Claude instructions\n");
+    assert.equal(JSON.parse(readFileSync(claudeSettings, "utf8")).hooks.UserPromptSubmit[0].hooks[0].command, "user-hook");
+    assert.equal(JSON.parse(readFileSync(cursorHooks, "utf8")).hooks.beforeSubmitPrompt[0].command, "user-hook");
+    assert.equal(existsSync(cursorRule), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Claude and Cursor adapter preflight rejects malformed assets and rolls back injected writes", () => {
+  for (const [client, relativePath] of [
+    ["claude", join(".claude", "settings.json")],
+    ["cursor", join(".cursor", "hooks.json")],
+  ]) {
+    const value = fixture();
+    try {
+      mkdirSync(join(value.project, relativePath, ".."), { recursive: true });
+      writeFileSync(join(value.project, relativePath), '{"hooks":[]}\n');
+      assert.throws(() => connectAgent(client, options(value)), /namespace hooks must be a JSON object/);
+      assert.equal(readFileSync(join(value.project, relativePath), "utf8"), '{"hooks":[]}\n');
+      assert.equal(existsSync(clientPaths(value.project)[client]), false);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  for (const [client, relativePath, malformed] of [
+    ["claude", "CLAUDE.md", "<!-- >>> continuitydb managed policy >>>\nmissing end\n"],
+    ["cursor", join(".cursor", "rules", "continuitydb.mdc"), "user-owned rule\n"],
+  ]) {
+    const value = fixture();
+    try {
+      const path = join(value.project, relativePath);
+      mkdirSync(join(path, ".."), { recursive: true });
+      writeFileSync(path, malformed);
+      assert.throws(() => connectAgent(client, options(value)), /invalid ContinuityDB managed/);
+      assert.equal(readFileSync(path, "utf8"), malformed);
+      assert.equal(existsSync(clientPaths(value.project)[client]), false);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  for (const client of ["claude", "cursor"]) {
+    const value = fixture();
+    try {
+      const mcp = clientPaths(value.project)[client];
+      mkdirSync(join(mcp, ".."), { recursive: true });
+      writeFileSync(mcp, '{"mcpServers":{"continuitydb":{"command":"user-owned"}}}\n');
+      assert.throws(() => connectAgent(client, options(value)), /unmanaged .*continuitydb server/i);
+      assert.throws(() => disconnectAgent(client, options(value)), /unmanaged .*continuitydb server/i);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  const value = fixture();
+  const originalMcp = '{"keep":"claude"}\n';
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "test";
+    writeFileSync(join(value.project, ".mcp.json"), originalMcp);
+    assert.throws(() => connectAgent("claude", {
+      ...options(value),
+      _testBeforeReplace: ({ path }) => {
+        if (path.endsWith(join(".claude", "settings.json"))) throw new Error("injected lifecycle write failure");
+      },
+    }), /injected lifecycle write failure/);
+    assert.equal(readFileSync(join(value.project, ".mcp.json"), "utf8"), originalMcp);
+    assert.equal(existsSync(join(value.project, ".claude", "settings.json")), false);
+    assert.equal(existsSync(join(value.project, "CLAUDE.md")), false);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("Copilot policy markers and unmanaged MCP conflicts fail closed before any adapter write", () => {
   const malformedPolicies = [
     ["<!-- >>> continuitydb managed policy >>>\nmissing end\n", /invalid ContinuityDB managed text block/],
@@ -660,10 +794,31 @@ test("remote connectors keep only an environment variable reference and require 
     const remote = { ...options(value), transport: "http", url: "https://memory.example/mcp", tokenEnv: "VAULT_TOKEN" };
     connectAgent("codex", remote);
     connectAgent("opencode", remote);
+    connectAgent("claude", remote);
+    connectAgent("cursor", remote);
     assert.match(readFileSync(join(value.project, ".codex", "config.toml"), "utf8"), /bearer_token_env_var = "VAULT_TOKEN"/);
     assert.match(readFileSync(join(value.project, "opencode.json"), "utf8"), /\{env:VAULT_TOKEN\}/);
+    const claudeHooks = readFileSync(join(value.project, ".claude", "settings.json"), "utf8");
+    const cursorHooks = readFileSync(join(value.project, ".cursor", "hooks.json"), "utf8");
+    for (const hooks of [claudeHooks, cursorHooks]) {
+      assert.match(hooks, /--http-url/);
+      assert.match(hooks, /https:\/\/memory\.example\//);
+      assert.match(hooks, /--http-token-env/);
+      assert.match(hooks, /VAULT_TOKEN/);
+      assert.doesNotMatch(hooks, /Bearer /);
+    }
     assert.throws(() => connectAgent("claude", { ...remote, url: "http://memory.example/mcp" }), /must use HTTPS/);
-    assert.doesNotThrow(() => connectAgent("claude", { ...remote, url: "http://127.0.0.1:7331/mcp" }));
+    const loopback = fixture();
+    try {
+      assert.doesNotThrow(() => connectAgent("claude", {
+        ...remote,
+        projectDir: loopback.project,
+        home: loopback.home,
+        url: "http://127.0.0.1:7331/mcp",
+      }));
+    } finally {
+      rmSync(loopback.root, { recursive: true, force: true });
+    }
   } finally {
     rmSync(value.root, { recursive: true, force: true });
   }
