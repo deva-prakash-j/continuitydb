@@ -16,12 +16,50 @@ function actionIndex(steps, prefix) {
   return steps.findIndex((step) => String(step.uses || "").startsWith(prefix));
 }
 
+function requireBlockingStep(step, message) {
+  invariant(step && !step.if, `${message}; the step must be unconditional`);
+  invariant(step["continue-on-error"] === undefined || step["continue-on-error"] === false,
+    `${message}; continue-on-error must be absent or the literal boolean false`);
+}
+
+function requireBlockingCommand(steps, command, message) {
+  const index = runIndex(steps, command);
+  invariant(index >= 0, message);
+  requireBlockingStep(steps[index], message);
+  return index;
+}
+
 function validatePinnedActions(steps) {
   for (const step of steps) {
     if (!step.uses) continue;
     invariant(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}$/.test(String(step.uses)),
       `third-party action must use a full immutable commit SHA: ${step.uses}`);
   }
+}
+
+function requireRemoteStableTagResolver(command, message) {
+  invariant(command.includes("resolve_remote_tag_commit()"), message);
+  invariant(command.includes('gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME"'), message);
+  invariant(command.includes('gh api "repos/$GH_REPO/git/tags/$object_sha"'), message);
+  invariant(command.includes('[[ "$object_type" == "commit" ]]'), message);
+}
+
+function requireFreshStableStateVerifier(command, message) {
+  const match = command.match(/verify_stable_release_state\(\)\s*\{([\s\S]*?)\n\s*\}/);
+  invariant(match, message);
+  const body = match[1];
+  invariant(body.includes("package.json") &&
+    body.includes('[[ "$GITHUB_REF_NAME" == "v${package_version}" ]]') &&
+    body.includes('[[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]'), message);
+  invariant(body.includes(
+    'git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"'), message);
+  invariant(body.includes(
+    'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main'), message);
+  invariant(body.includes(
+    'local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"') &&
+    body.includes('[[ "$local_tag_sha" == "$GITHUB_SHA" ]]'), message);
+  invariant(body.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
+    body.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'), message);
 }
 
 export function validateReleaseWorkflow(document) {
@@ -31,7 +69,7 @@ export function validateReleaseWorkflow(document) {
   invariant(Array.isArray(push?.branches) && push.branches.includes("main"),
     "every push to main must trigger the native release workflow");
   invariant(Array.isArray(push?.tags) && push.tags.includes("v*"),
-    "version-tag release trigger is required");
+    "stable v0.7.0 tag path requires the version-tag release trigger v*");
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
   invariant(build && publish, "build and publish jobs are required");
@@ -49,6 +87,8 @@ export function validateReleaseWorkflow(document) {
 
   const steps = build.steps || [];
   validatePinnedActions(steps);
+  requireBlockingCommand(steps, "npm run validate:clients", "native client adapter validation is missing");
+  requireBlockingCommand(steps, "npm run test:clients", "native client adapter tests are missing");
   const buildIndex = runIndex(steps, "npm run build:binary");
   const signIndex = steps.findIndex((step) => String(step.run || "").includes("codesign --force --sign"));
   const smokeIndex = runIndex(steps, "npm run smoke:binary");
@@ -62,8 +102,8 @@ export function validateReleaseWorkflow(document) {
   invariant(checksumIndex > semanticIndex, "checksums must be created only after semantic verification");
   invariant(uploadIndex > checksumIndex, "only post-verification bytes may be uploaded");
   for (const index of [smokeIndex, semanticIndex, checksumIndex, uploadIndex]) {
-    invariant(!steps[index].if, "verification/checksum/upload gates must run for every native matrix target");
-    invariant(steps[index]["continue-on-error"] !== true, "native release gates must be blocking");
+    requireBlockingStep(steps[index],
+      "verification/checksum/upload gates must run for every native matrix target");
   }
 
   const needs = Array.isArray(publish.needs) ? publish.needs : [publish.needs];
@@ -71,8 +111,47 @@ export function validateReleaseWorkflow(document) {
   const publishCondition = String(publish.if || "");
   invariant(publishCondition.includes("refs/heads/main") && publishCondition.includes("refs/tags/v"),
     "publish must run for main pushes and version-tag pushes only");
+  invariant(publishCondition.includes("success()") && !publishCondition.includes("always()"),
+    "publication requires terminal success of every supported native build");
   const publishSteps = publish.steps || [];
   validatePinnedActions(publishSteps);
+  const publishCheckoutIndex = actionIndex(publishSteps, "actions/checkout@");
+  invariant(publishCheckoutIndex >= 0, "stable releases require a repository checkout");
+  const publishCheckout = publishSteps[publishCheckoutIndex];
+  invariant(publishCheckout?.with?.["fetch-depth"] === 0,
+    "stable release ancestry checks require complete history");
+  invariant(publishCheckout?.with?.["persist-credentials"] === false,
+    "checkout credentials must remain disabled in the privileged publish job");
+  const stableGateIndex = publishSteps.findIndex((step) =>
+    String(step.name || "").includes("Verify stable tag release eligibility"));
+  invariant(stableGateIndex > publishCheckoutIndex,
+    "stable release eligibility must follow the complete repository checkout");
+  requireBlockingStep(publishSteps[stableGateIndex], "stable release eligibility must be unconditional");
+  const stableGateCommand = String(publishSteps[stableGateIndex]?.run || "");
+  invariant(stableGateCommand.includes('if [[ "$GITHUB_REF" != refs/tags/v* ]]; then'),
+    "stable release eligibility requires the exact stable tag event condition");
+  invariant(stableGateCommand.includes("package.json") &&
+    stableGateCommand.includes('[[ "$GITHUB_REF_NAME" == "v${package_version}" ]]'),
+  "stable tag must exactly match package version");
+  invariant(stableGateCommand.includes(
+    'git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"'),
+  "stable release ancestry must explicitly fetch origin/main");
+  invariant(stableGateCommand.includes(
+    'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main'),
+  "stable tag commit must be merged into origin/main");
+  invariant(stableGateCommand.includes(
+    'local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"') &&
+    stableGateCommand.includes('[[ "$local_tag_sha" == "$GITHUB_SHA" ]]'),
+  "local stable tag must resolve to the exact workflow commit");
+  requireRemoteStableTagResolver(stableGateCommand,
+    "remote stable tag must resolve to the exact workflow commit");
+  invariant(stableGateCommand.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
+    stableGateCommand.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'),
+  "remote stable tag must resolve to the exact workflow commit");
+  requireFreshStableStateVerifier(stableGateCommand,
+    "stable release eligibility requires the complete reusable stable-state verifier");
+  invariant(/\}\s+verify_stable_release_state\s*$/.test(stableGateCommand),
+    "stable release eligibility must invoke the reusable stable-state verifier");
   const downloadIndex = actionIndex(publishSteps, "actions/download-artifact@");
   const verifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify complete native release set"));
   const attestIndex = actionIndex(publishSteps, "actions/attest-build-provenance@");
@@ -80,6 +159,12 @@ export function validateReleaseWorkflow(document) {
   const publishedVerifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify published release assets"));
   invariant(downloadIndex >= 0 && verifyIndex > downloadIndex && attestIndex > verifyIndex && releaseIndex > attestIndex,
     "downloaded native artifacts must be checksum-verified and attested before release publication");
+  invariant(stableGateIndex < downloadIndex,
+    "stable release eligibility must pass before artifact and provenance processing");
+  invariant(publishSteps[attestIndex]?.with?.["subject-path"] === "release/continuitydb-*",
+    "provenance must cover the complete supported native asset set");
+  requireBlockingStep(publishSteps[attestIndex],
+    "provenance for the complete supported native asset set must succeed before publication");
   invariant(publishedVerifyIndex > releaseIndex,
     "published release assets must be independently verified after publication");
   const verifyCommand = String(publishSteps[verifyIndex]?.run || "");
@@ -105,6 +190,24 @@ export function validateReleaseWorkflow(document) {
     "an existing main prerelease must be bound to the exact commit before refresh");
   invariant(releaseCommand.includes("isPrerelease") && releaseCommand.includes('[[ "$existing_prerelease" == "true" ]]'),
     "an existing main release must remain a prerelease before refresh");
+  requireBlockingStep(publishSteps[releaseIndex], "release publication must be blocking");
+  requireRemoteStableTagResolver(releaseCommand,
+    "stable tag target must be resolved through the Git tag API before release mutation");
+  requireFreshStableStateVerifier(releaseCommand,
+    "stable tag target and fresh ancestry checks are required before release mutation");
+  invariant(releaseCommand.includes('if [[ "$RELEASE_PRERELEASE" == "false" ]]; then'),
+    "stable tag target condition must run before release mutation");
+  invariant(
+    /if \[\[ "\$RELEASE_PRERELEASE" == "false" \]\]; then\s+verify_stable_release_state\s+fi\s+gh release upload/.test(releaseCommand),
+    "fresh ancestry and tag checks must run immediately before stable upload");
+  invariant(
+    /else\s+verify_stable_release_state\s+gh release create "\$RELEASE_TAG" release\/\*/.test(releaseCommand),
+    "fresh ancestry and tag checks must run immediately before stable create");
+  invariant(releaseCommand.includes('[[ "$existing_prerelease" == "false" ]]'),
+    "an existing stable release must remain a non-prerelease before refresh");
+  invariant(releaseCommand.includes('--json isDraft --jq \'\.isDraft\'') &&
+    releaseCommand.includes('[[ "$existing_draft" == "false" ]]'),
+  "an existing release must not be a draft before refresh");
 
   const publishedVerifyCommand = String(publishSteps[publishedVerifyIndex]?.run || "");
   const publishedVerifyEnvironment = publishSteps[publishedVerifyIndex]?.env || {};
@@ -125,13 +228,43 @@ export function validateReleaseWorkflow(document) {
     "all six published assets must pass provenance verification");
   invariant(publishedVerifyCommand.includes("targetCommitish") && publishedVerifyCommand.includes("isPrerelease"),
     "published release identity must be verified after publication");
-  return { valid: true, native_targets: [...names].sort() };
+  requireBlockingStep(publishSteps[publishedVerifyIndex],
+    "post-publication release verification must be blocking");
+  requireRemoteStableTagResolver(publishedVerifyCommand,
+    "stable tag target must be resolved through the Git tag API after publication");
+  requireFreshStableStateVerifier(publishedVerifyCommand,
+    "stable tag target and fresh ancestry checks are required after publication");
+  invariant(publishedVerifyCommand.includes('if [[ "$RELEASE_PRERELEASE" == "true" ]]; then'),
+    "stable tag target condition must run after publication");
+  invariant(/else\s+published_tag=[\s\S]*?\[\[ "\$published_prerelease" == "false" \]\]\s+verify_stable_release_state\s+fi/.test(publishedVerifyCommand),
+    "fresh ancestry and tag checks must run after stable release metadata inspection and publication");
+  invariant(publishedVerifyCommand.includes('published_tag="$(gh release view "$RELEASE_TAG"') &&
+    publishedVerifyCommand.includes('[[ "$published_tag" == "$GITHUB_REF_NAME" ]]'),
+  "published stable release must retain the exact pushed tag name");
+  invariant(publishedVerifyCommand.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
+    publishedVerifyCommand.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'),
+  "stable tag target must match the exact workflow commit after publication");
+  invariant(publishedVerifyCommand.includes('--json isDraft --jq \'\.isDraft\'') &&
+    publishedVerifyCommand.includes('[[ "$published_draft" == "false" ]]'),
+  "the published release must not be a draft");
+  return { valid: true, native_targets: [...names].sort(), client_adapters_verified: true };
 }
 
 export function validateCiWorkflow(document) {
   const jobs = document?.jobs || {};
-  invariant(jobs.binary, "CI binary job is required");
+  invariant(jobs.test && jobs.container && jobs.binary, "CI test, container, and binary jobs are required");
+  invariant(Array.isArray(jobs.test.strategy?.matrix?.node)
+    && jobs.test.strategy.matrix.node.length === 2
+    && jobs.test.strategy.matrix.node.includes(22)
+    && jobs.test.strategy.matrix.node.includes(24),
+  "CI source tests must run on Node 22 and Node 24");
   for (const job of Object.values(jobs)) validatePinnedActions(job.steps || []);
+  for (const jobName of ["test", "container", "binary"]) {
+    requireBlockingCommand(jobs[jobName].steps || [], "npm run validate:clients",
+      `${jobName} client adapter validation is missing`);
+  }
+  requireBlockingCommand(jobs.container.steps || [], "npm run test:clients",
+    "container client adapter tests are missing");
   const steps = jobs.binary.steps || [];
   const functionalIndex = runIndex(steps, "npm run test:binary");
   const semanticIndex = runIndex(steps, "npm run smoke:binary:semantic");
@@ -142,10 +275,9 @@ export function validateCiWorkflow(document) {
   invariant(checksumIndex > semanticIndex, "CI checksums must follow semantic verification");
   invariant(uploadIndex > checksumIndex, "CI may upload only post-verification bytes");
   for (const index of [functionalIndex, semanticIndex, checksumIndex, uploadIndex]) {
-    invariant(!steps[index].if, "CI binary verification/checksum/upload gates must be unconditional");
-    invariant(steps[index]["continue-on-error"] !== true, "CI binary release gates must be blocking");
+    requireBlockingStep(steps[index], "CI binary verification/checksum/upload gates must be blocking");
   }
-  return { valid: true, binary_artifact_verified: true };
+  return { valid: true, binary_artifact_verified: true, client_adapters_verified: true };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

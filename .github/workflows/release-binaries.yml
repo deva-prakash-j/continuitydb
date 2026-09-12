@@ -34,6 +34,8 @@ jobs:
           node-version: 25.9.0
           cache: npm
       - run: npm ci --ignore-scripts
+      - run: npm run test:clients
+      - run: npm run validate:clients
       - run: npm run validate:release-workflow
       - run: npm run build:binary
       - if: runner.os == 'macOS'
@@ -51,7 +53,7 @@ jobs:
           retention-days: 14
 
   publish:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: success() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -59,6 +61,46 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify stable tag release eligibility
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            exit 0
+          fi
+
+          resolve_remote_tag_commit() {
+            local object_type object_sha
+            object_type="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
+            while [[ "$object_type" == "tag" ]]; do
+              object_type="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.type')"
+              object_sha="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.sha')"
+            done
+            [[ "$object_type" == "commit" ]]
+            printf '%s\n' "$object_sha"
+          }
+
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
+            stable_tag_sha="$(resolve_remote_tag_commit)"
+            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          }
+
+          verify_stable_release_state
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: continuitydb-*
@@ -112,14 +154,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          resolve_remote_tag_commit() {
+            local object_type object_sha
+            object_type="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
+            while [[ "$object_type" == "tag" ]]; do
+              object_type="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.type')"
+              object_sha="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.sha')"
+            done
+            [[ "$object_type" == "commit" ]]
+            printf '%s\n' "$object_sha"
+          }
+
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
+            stable_tag_sha="$(resolve_remote_tag_commit)"
+            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          }
+
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             existing_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+            existing_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq '.isDraft')"
+            [[ "$existing_draft" == "false" ]]
             if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
               existing_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
               [[ "$existing_target" == "$GITHUB_SHA" ]]
               [[ "$existing_prerelease" == "true" ]]
             else
               [[ "$existing_prerelease" == "false" ]]
+            fi
+            if [[ "$RELEASE_PRERELEASE" == "false" ]]; then
+              verify_stable_release_state
             fi
             gh release upload "$RELEASE_TAG" release/* --clobber --repo "$GH_REPO"
           elif [[ "$RELEASE_PRERELEASE" == "true" ]]; then
@@ -130,6 +201,7 @@ jobs:
               --generate-notes \
               --prerelease
           else
+            verify_stable_release_state
             gh release create "$RELEASE_TAG" release/* \
               --repo "$GH_REPO" \
               --verify-tag \
@@ -145,13 +217,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          resolve_remote_tag_commit() {
+            local object_type object_sha
+            object_type="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type')"
+            object_sha="$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.sha')"
+            while [[ "$object_type" == "tag" ]]; do
+              object_type="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.type')"
+              object_sha="$(gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object.sha')"
+            done
+            [[ "$object_type" == "commit" ]]
+            printf '%s\n' "$object_sha"
+          }
+
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
+            stable_tag_sha="$(resolve_remote_tag_commit)"
+            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          }
+
           published_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+          published_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq '.isDraft')"
+          [[ "$published_draft" == "false" ]]
           if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
             published_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
             [[ "$published_target" == "$GITHUB_SHA" ]]
             [[ "$published_prerelease" == "true" ]]
           else
+            published_tag="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json tagName --jq '.tagName')"
+            [[ "$published_tag" == "$GITHUB_REF_NAME" ]]
             [[ "$published_prerelease" == "false" ]]
+            verify_stable_release_state
           fi
 
           verify_dir="$(mktemp -d)"

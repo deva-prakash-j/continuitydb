@@ -17,16 +17,21 @@ verified until the named client has connected to the exact ContinuityDB transpor
 
 ## Matrix
 
-Evidence captured on 2026-09-11:
+Evidence captured on 2026-09-12:
 
-| Client | Tested version | MCP transport | Lifecycle adapter | Evidence |
+| Client | Tested version | MCP transport | Recall mode | Evidence |
 |---|---|---|---|---|
 | MCP TypeScript SDK | `@modelcontextprotocol/sdk` 1.30.0 | Authenticated Streamable HTTP and stdio; cross-agent shared-owner transfer, scoped tool lists, calls, session termination and identity-swap denial | N/A | **Tool-call verified** |
-| Codex CLI | 0.147.0 | Authenticated Streamable HTTP initialization and `tools/list` | Project `AGENTS.md` workflow; Codex has no ContinuityDB-specific native hook here | **Transport verified** |
-| GitHub Copilot cloud agent / code review | Official repository MCP JSON contract current on 2026-09-11 | Remote HTTP with explicit three-tool allowlist; all listed tools carry `readOnlyHint: true` | None | **Contract tested**; real GitHub-hosted run pending |
-| Claude Code | Official MCP and hook contracts current on 2026-09-11 | Remote HTTP configuration | `SessionStart` emits `hookSpecificOutput.additionalContext`; `Stop` saves only an explicit structured file | **Contract tested**; binary unavailable on the test VM |
-| OpenCode | Official MCP/plugin contracts current on 2026-09-11 | Remote MCP configuration | Compaction context injection and explicit idle checkpoint adapter | **Contract tested**; binary unavailable on the test VM |
-| Cursor | Existing stdio/HTTP-backed MCP configuration | stdio thin adapter | `sessionStart` and `stop` command shape | **Contract tested**; real client run pending |
+| Codex CLI | 0.147.0 | Authenticated Streamable HTTP initialization and `tools/list` | **policy-led** first-task recall through managed `AGENTS.md`; no native startup hook claimed | **Transport verified** |
+| GitHub Copilot cloud agent / code review | Official repository MCP JSON contract current on 2026-09-12 | Remote HTTP with explicit three-tool allowlist; all listed tools carry `readOnlyHint: true` | **policy-led** through `.github/copilot-instructions.md`; no native startup hook claimed | **Contract tested**; real GitHub-hosted run pending |
+| Claude Code | Official MCP and hook contracts current on 2026-09-12 | Local stdio or remote HTTP | **hook-enforced** `SessionStart`; `Stop` reads only an explicit structured file | **Contract tested**; client binary unavailable on the test VM |
+| OpenCode | Official MCP/plugin contracts current on 2026-09-12 | Local stdio or remote HTTP | **plugin+policy**: compaction is plugin-enforced and first-task recall is policy-led | **Contract tested**; client binary unavailable on the test VM |
+| Cursor | Official MCP/hook contracts current on 2026-09-12 | Local stdio or remote HTTP | **hook+policy**; policy fallback covers read-only cloud startup gaps | **Contract tested**; real client run pending |
+
+All generated adapters use `capture_mode: explicit-governed`. Ordinary prompts,
+raw transcripts, tool logs, secrets, and hidden reasoning are not captured.
+Read-only, plan, sandbox, and approval restrictions are not bypassed; denied or
+unavailable capture is reported as `not saved`.
 
 The Codex transport probe deliberately stops after tool discovery because the
 standalone Codex CLI on the test VM has no model API authentication. That is not

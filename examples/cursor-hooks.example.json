@@ -3,12 +3,12 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "continuitydb-hook session-start --client cursor"
+        "command": "continuitydb hook session-start --client cursor --project inventory-service --home /absolute/private/path/continuitydb-data --tenant-id example-org --owner-id example-user --agent-id cursor --allowed-sensitivities 'public,private'"
       }
     ],
     "stop": [
       {
-        "command": "continuitydb-hook checkpoint --client cursor --file .continuitydb-handoff.json"
+        "command": "continuitydb hook checkpoint --client cursor --project inventory-service --home /absolute/private/path/continuitydb-data --tenant-id example-org --owner-id example-user --agent-id cursor --allowed-sensitivities 'public,private' --file /workspace/inventory-service/.continuitydb-handoff.json"
       }
     ]
   }

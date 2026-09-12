@@ -5,6 +5,21 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Added one-command complete project adapters for Codex, Claude Code, OpenCode,
+  Cursor, and VS Code Copilot, with truthful `policy-led`, `hook-enforced`,
+  `plugin+policy`, and `hook+policy` recall labels plus an explicit `--mcp-only`
+  escape hatch.
+- Made generated agent policy require explicit durable-memory intent for
+  governed capture, forbid raw prompt/transcript/tool-log capture and
+  plan/read-only bypasses, and require the truthful result `not saved` whenever
+  capture is denied or unavailable.
+- Expanded client validation to generate and verify all 12 managed assets,
+  compare all four generated hook/policy examples with actual adapter output,
+  semantically validate all 12 shipped client examples, reject any new example
+  without an explicit validator, and reuse
+  the same tree validator against the standalone binary's output.
+- Required Node 22/24, container, Linux binary, and all supported native release
+  jobs to run blocking client-adapter validation before artifact publication.
 - Added a Node single-executable build that includes the runtime, SQLite,
   ContinuityDB application, and integrity-pinned ONNX/WASM inference runtime.
 - Added versioned user-scoped self-install with no shell-profile mutation and

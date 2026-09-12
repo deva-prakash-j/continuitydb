@@ -1,20 +1,137 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { ContinuityDBPlugin } from "../examples/clients/opencode-continuitydb.js";
 import { createContinuityServer } from "../src/http-server.js";
 import { ContextVault } from "../src/store.js";
 
 test("versioned client configuration examples pass contract validation", () => {
-  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
   const result = spawnSync(process.execPath, [script], { encoding: "utf8" });
   assert.equal(result.status, 0, result.stderr);
   const value = JSON.parse(result.stdout);
   assert.equal(value.valid, true);
-  assert.deepEqual(value.clients, ["codex", "copilot", "claude-code", "opencode"]);
+  assert.deepEqual(value.clients, ["codex", "claude", "opencode", "cursor", "copilot"]);
+  assert.equal(value.generated_assets, 12);
+  assert.equal(value.managed_policies, 4);
+  assert.deepEqual(value.generated_examples, [
+    "examples/claude-code-hooks.example.json",
+    "examples/cursor-hooks.example.json",
+    "examples/clients/claude-code.hooks.json",
+    "examples/clients/codex.AGENTS.md",
+  ]);
+  assert.equal(value.shipped_examples, 12);
+  assert.equal(value.semantically_validated_examples, 12);
+  assert.equal(value.standalone_tree_validator, true);
+});
+
+test("client validator canonicalizes its own temporary root across a platform symlink alias", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-validator-alias-"));
+  const physicalTmp = join(root, "physical-tmp");
+  const aliasedTmp = join(root, "aliased-tmp");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    mkdirSync(physicalTmp);
+    symlinkSync(physicalTmp, aliasedTmp, process.platform === "win32" ? "junction" : "dir");
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: aliasedTmp, TMP: aliasedTmp, TEMP: aliasedTmp },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator normalizes generated paths structurally when its temporary root contains backslashes", {
+  skip: process.platform === "win32" ? "backslash is a path separator on Windows" : false,
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-validator-backslash-\\"));
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: root, TMP: root, TEMP: root },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator compares generated Markdown policy with platform-neutral line endings", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-policy-eol-"));
+  const examples = join(root, "examples");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "codex.AGENTS.md");
+    const content = readFileSync(path, "utf8").replaceAll("\r\n", "\n").replaceAll("\n", "\r\n");
+    writeFileSync(path, content);
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator rejects drift in every shipped generated hook example", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-example-drift-"));
+  const examples = join(root, "examples");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "claude-code.hooks.json");
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    value.hooks.SessionStart[0].hooks[0].command = "drifted-hook";
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, "drifted shipped Claude hook example was ignored");
+    assert.match(result.stderr, /claude-code\.hooks\.json|generated hook example/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator rejects a stale OpenCode plugin reference", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-example-drift-"));
+  const examples = join(root, "examples");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "opencode.json");
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    value.plugin = ["./missing-stale-plugin.js"];
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, "stale OpenCode plugin reference was accepted");
+    assert.match(result.stderr, /opencode.*plugin/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator rejects a stale Codex stdio executable", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-codex-example-drift-"));
+  const examples = join(root, "examples");
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "codex.stdio.config.toml");
+    writeFileSync(path, readFileSync(path, "utf8").replace('command = "continuitydb"', 'command = "definitely-stale-command"'));
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, "stale Codex executable was accepted");
+    assert.match(result.stderr, /codex.*command|command.*continuitydb/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("OpenCode plugin injects bounded continuity context and saves explicit idle checkpoint", async () => {
@@ -37,6 +154,7 @@ test("OpenCode plugin injects bounded continuity context and saves explicit idle
   const original = Object.fromEntries([
     "CONTINUITYDB_HTTP_URL", "CONTINUITYDB_PROJECT_ID", "CONTINUITYDB_TASK_ID",
     "CONTINUITYDB_BRANCH", "CONTINUITYDB_TASK", "CONTINUITYDB_HANDOFF_FILE",
+    "CONTINUITYDB_HTTP_TOKEN_ENV", "CONTINUITYDB_OPENCODE_TEST_TOKEN",
   ].map((key) => [key, process.env[key]]));
   try {
     const seeded = vault.propose({
@@ -65,6 +183,8 @@ test("OpenCode plugin injects bounded continuity context and saves explicit idle
       CONTINUITYDB_BRANCH: "main",
       CONTINUITYDB_TASK: "Find OpenCodePluginMarker",
       CONTINUITYDB_HANDOFF_FILE: handoffPath,
+      CONTINUITYDB_HTTP_TOKEN_ENV: "CONTINUITYDB_OPENCODE_TEST_TOKEN",
+      CONTINUITYDB_OPENCODE_TEST_TOKEN: "test-only-token",
     });
     const plugin = await ContinuityDBPlugin({ directory: root });
     const output = { context: [] };

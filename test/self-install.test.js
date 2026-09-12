@@ -30,6 +30,144 @@ test("standalone installer previews, installs versioned binary, and is idempoten
   }
 });
 
+test("standalone installer reports truthful POSIX PATH guidance without editing shell profiles", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-guidance-posix-"));
+  const source = join(root, "downloaded-continuitydb");
+  const prefix = join(root, "prefix");
+  const profile = join(root, ".profile");
+  const sentinel = "# user-owned shell profile\n";
+  writeFileSync(source, "binary-fixture", { mode: 0o755 });
+  writeFileSync(profile, sentinel);
+  try {
+    const absent = installStandaloneBinary({
+      source, prefix, standalone: true, platform: "linux", version: "9.9.9", pathValue: "/usr/bin",
+    });
+    assert.equal(absent.shell_profile_modified, false);
+    assert.equal(absent.path_configured, false);
+    assert.equal(absent.path_entry, join(prefix, "bin"));
+    assert.match(absent.next_steps[0], /^export PATH=/);
+    assert.equal(absent.next_steps.at(-1), "continuitydb version");
+
+    const presentPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "linux",
+      version: "9.9.9",
+      pathValue: `/usr/bin:${join(prefix, "bin")}`,
+    });
+    assert.equal(presentPreview.path_configured, true);
+    assert.deepEqual(presentPreview.next_steps, ["continuitydb version"]);
+
+    const caseVariantPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "linux",
+      version: "9.9.9",
+      pathValue: `/usr/bin:${join(prefix, "bin").toUpperCase()}`,
+    });
+    assert.equal(caseVariantPreview.path_configured, false);
+    assert.match(caseVariantPreview.next_steps[0], /^export PATH=/);
+
+    const installedAbsent = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "linux",
+      version: "9.9.9",
+      pathValue: "/usr/bin",
+      apply: true,
+    });
+    assert.equal(installedAbsent.path_configured, false);
+    assert.match(installedAbsent.next_steps[0], /^export PATH=/);
+
+    const present = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "linux",
+      version: "9.9.9",
+      pathValue: `/usr/bin:${join(prefix, "bin")}`,
+      apply: true,
+    });
+    assert.equal(present.shell_profile_modified, false);
+    assert.equal(present.path_configured, true);
+    assert.equal(present.path_entry, join(prefix, "bin"));
+    assert.equal(present.next_steps.some((step) => /^export PATH=/.test(step)), false);
+    assert.deepEqual(present.next_steps, ["continuitydb version"]);
+    assert.equal(readFileSync(profile, "utf8"), sentinel);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("standalone installer reports neutral Windows PATH guidance in preview and apply results", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-guidance-win32-"));
+  const source = join(root, "downloaded-continuitydb.exe");
+  const prefix = join(root, "prefix");
+  writeFileSync(source, "binary-fixture", { mode: 0o755 });
+  try {
+    const absent = installStandaloneBinary({
+      source, prefix, standalone: true, platform: "win32", version: "9.9.9", pathValue: "C:\\Windows\\System32",
+    });
+    assert.equal(absent.shell_profile_modified, false);
+    assert.equal(absent.path_configured, false);
+    assert.equal(absent.path_entry, join(prefix, "bin"));
+    assert.match(absent.next_steps[0], /add .* to your user PATH.*Windows Environment Variables/i);
+    assert.doesNotMatch(absent.next_steps[0], /(?:setx|powershell|profile)/i);
+    assert.equal(absent.next_steps.at(-1), "continuitydb version");
+
+    const presentPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "win32",
+      version: "9.9.9",
+      pathValue: `C:\\Windows\\System32;${join(prefix, "bin")}`,
+    });
+    assert.equal(presentPreview.path_configured, true);
+    assert.deepEqual(presentPreview.next_steps, ["continuitydb version"]);
+
+    const caseVariantPreview = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "win32",
+      version: "9.9.9",
+      pathValue: `C:\\Windows\\System32;${join(prefix, "bin").toUpperCase()}`,
+    });
+    assert.equal(caseVariantPreview.path_configured, true);
+    assert.deepEqual(caseVariantPreview.next_steps, ["continuitydb version"]);
+
+    const installedAbsent = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "win32",
+      version: "9.9.9",
+      pathValue: "C:\\Windows\\System32",
+      apply: true,
+    });
+    assert.equal(installedAbsent.path_configured, false);
+    assert.match(installedAbsent.next_steps[0], /Windows Environment Variables/i);
+
+    const present = installStandaloneBinary({
+      source,
+      prefix,
+      standalone: true,
+      platform: "win32",
+      version: "9.9.9",
+      pathValue: `C:\\Windows\\System32;${join(prefix, "bin").toUpperCase()}`,
+      apply: true,
+    });
+    assert.equal(present.path_configured, true);
+    assert.deepEqual(present.next_steps, ["continuitydb version"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("standalone installer refuses to replace an unmanaged launcher", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-conflict-"));
   const source = join(root, "downloaded-continuitydb");

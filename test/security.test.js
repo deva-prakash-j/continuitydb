@@ -36,6 +36,17 @@ test("token policy rejects group-readable files", () => {
   }
 });
 
+test("token policy does not apply POSIX mode-bit enforcement on Windows", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-policy-windows-test-"));
+  const path = join(root, "policy.json");
+  try {
+    writeFileSync(path, JSON.stringify({ tokens: [] }), { mode: 0o644 });
+    assert.deepEqual(loadTokenPolicy(path, { platform: "win32" }), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("OIDC authorization verifies JWTs and maps only signed scoped identity claims", async () => {
   const { privateKey, publicKey } = await generateKeyPair("RS256");
   const jwk = await exportJWK(publicKey);

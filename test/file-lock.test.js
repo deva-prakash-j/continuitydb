@@ -3,13 +3,14 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { acquireFileLock } from "../src/file-lock.js";
 
-const WORKER = new URL("../test-support/file-lock-worker.mjs", import.meta.url);
+const WORKER = fileURLToPath(new URL("../test-support/file-lock-worker.mjs", import.meta.url));
 
 function worker(resource, mode = "hold") {
-  return spawn(process.execPath, [WORKER.pathname, resource, mode], {
+  return spawn(process.execPath, [WORKER, resource, mode], {
     stdio: ["pipe", "pipe", "pipe"],
   });
 }

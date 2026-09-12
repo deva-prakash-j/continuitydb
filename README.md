@@ -43,6 +43,11 @@ export PATH="$HOME/.local/bin:$PATH"
 continuitydb setup --agents detected --project-dir "$PWD" --apply
 ```
 
+That one setup command registers the current Git project and installs the full
+adapter for every detected supported client. Use `--agents all` to generate all
+five adapters even when their executables are not on `PATH`. Setup reports each
+adapter's assets, enforcement mode, limitations, and verification state.
+
 Now save one piece of project context and retrieve it from another session or
 agent identity:
 
@@ -100,7 +105,7 @@ participate in the lock protocol are rechecked immediately before replacement,
 but do not receive a portable cross-process transaction guarantee.
 
 See exact commands, run URLs, artifact digests, and evidence boundaries in the
-[v0.7 verification record](docs/build-verification-2026-09-11-v0.7.md).
+[v0.7 verification record](docs/v0.7-verification.md).
 Intel macOS uses the source/npm distribution because upstream Node 25 SEA executables
 [segfault on x64 macOS](https://github.com/nodejs/node/issues/62893).
 
@@ -289,15 +294,36 @@ an explicit override. Add `--semantic` to `setup` to download and verify the pin
 embedding model. The binary already contains the integrity-pinned ONNX/WASM
 runtime, so no separate inference package is installed.
 
-The generated project files are:
+The complete adapters and their truthful recall modes are:
 
-| Client | Managed project file |
-|---|---|
-| Codex | `.codex/config.toml` managed block |
-| Claude Code | `.mcp.json` → `mcpServers.continuitydb` |
-| OpenCode | `opencode.json` → `mcp.continuitydb` |
-| Cursor | `.cursor/mcp.json` → `mcpServers.continuitydb` |
-| VS Code Copilot | `.vscode/mcp.json` → `servers.continuitydb` |
+| Client | Managed project assets | Recall behavior |
+|---|---|---|
+| Codex | `.codex/config.toml`, shared `AGENTS.md` | **policy-led** first-task recall; Codex has no ContinuityDB native startup hook |
+| Claude Code | `.mcp.json`, `.claude/settings.json`, `CLAUDE.md` | **hook-enforced** startup/resume/compact recall |
+| OpenCode | `opencode.json`, `.opencode/plugins/continuitydb.js`, shared `AGENTS.md` | **plugin+policy**: plugin-enforced compaction recall; first-task recall is policy-led |
+| Cursor | `.cursor/mcp.json`, `.cursor/hooks.json`, `.cursor/rules/continuitydb.mdc` | **hook+policy**; the policy is the fallback for read-only cloud startup gaps |
+| VS Code Copilot | `.vscode/mcp.json`, `.github/copilot-instructions.md` | **policy-led** first-task recall; no native startup hook is claimed |
+
+Every mode requests one bounded, project-scoped context pack and treats it as
+untrusted evidence. Hooks and plugins enforce recall only at the lifecycle
+events their hosts provide; managed instructions lead first-task behavior where
+the host provides no native hook.
+
+Capture is always `explicit-governed`: generated adapters call
+`memory_capture` only when the user explicitly asks to remember, save, record,
+or update a durable fact. They never auto-capture an ordinary prompt, raw
+transcript, tool log, secret, hidden reasoning, or temporary task state. A
+genuine plan/read-only/sandbox/approval restriction is never bypassed. If a
+write is unavailable or denied, the truthful result is **`not saved`**.
+
+To expose only MCP tools without lifecycle or managed policy assets, opt in to
+the escape hatch explicitly:
+
+```bash
+continuitydb setup --agents all --project-dir "$PWD" --mcp-only --apply
+```
+
+`--mcp-only` does not provide automatic first-task or lifecycle recall.
 
 Single-client writes are atomic. Multi-client `setup` and `agents connect`
 operations use a two-phase batch: every selected JSON/TOML file, managed
@@ -308,6 +334,19 @@ paths are rejected, existing files are backed up privately below the vault, and
 rerunning setup is idempotent. Static secrets are never written: remote configs
 store only a token environment variable reference. Disconnect removes only the
 ContinuityDB-owned entry:
+
+Managed-file operations bind the project root and every existing target-parent
+component to its canonical real path plus filesystem device/inode/type identity.
+That chain is revalidated after preparation hooks, immediately before and after
+replacement or removal, during rollback and backup cleanup, and while reporting
+status. A changed or symlinked ancestor fails closed instead of being reported
+as verified. Stock Node.js does not expose a portable descriptor-relative
+`renameat`/`unlinkat` equivalent (or a Windows handle-relative replacement), so
+a same-UID process that can mutate these directories can still swap an ancestor
+in the final interval between validation and the pathname syscall. Post-operation
+validation reports that race but cannot guarantee the substituted tree was never
+briefly affected; stronger isolation requires OS permissions or a sandbox that
+prevents untrusted writers from modifying the project configuration directories.
 
 ```bash
 continuitydb agents disconnect codex --project-dir "$PWD"
@@ -394,10 +433,11 @@ continuitydb context "What is the release order?" \
 Working memory expires automatically. Durable decisions and unverified claims
 do not become active through this path without the required policy outcome.
 
-## Automatic capture policy
+## Governed capture policy
 
-The default policy promotes memory according to risk rather than requiring a
-human for every write:
+An agent adapter initiates capture only after explicit durable-memory intent.
+Once `memory_capture` is called, the server evaluates the compact proposed claim
+according to risk rather than allowing the client to choose its final state:
 
 | Capture type | Default disposition |
 |---|---|
@@ -502,9 +542,12 @@ validation. Reproduce them with `npm run test:clients`,
 
 ### Automatic session lifecycle adapters
 
-`continuitydb-hook` retrieves the latest structured handoff plus a context pack
-at session start. At stop/checkpoint it saves only the explicit structured JSON
-file; it never mines raw transcripts.
+Claude and Cursor hooks retrieve the latest structured handoff plus a bounded
+context pack at supported startup lifecycle events. The OpenCode plugin does the
+same during compaction. Codex, Copilot, and OpenCode first-task recall is led by
+an always-loaded managed policy, not a native hook. At stop/checkpoint, lifecycle
+automation reads only the explicit structured JSON handoff file; it never mines
+raw prompts or transcripts.
 
 Historical handoff records are excluded from the general context pack. Startup
 injects exactly one separately addressed checkpoint selected by shared owner,
@@ -540,11 +583,13 @@ Copy the relevant adapter shape for Claude Code, Cursor, or OpenCode:
 - [`examples/cursor-hooks.example.json`](examples/cursor-hooks.example.json)
 - [`examples/clients/opencode-continuitydb.js`](examples/clients/opencode-continuitydb.js)
 
-The examples follow the clients' lifecycle contracts: Claude Code receives
+The examples are validated against freshly generated adapters. They follow the
+clients' lifecycle contracts: Claude Code receives
 `hookSpecificOutput.additionalContext`, Cursor receives `additional_context`
 JSON, and OpenCode injects bounded context during compaction and saves an
-explicit checkpoint on `session.idle`. Cursor cloud agents currently do not run
-`sessionStart`; use its MCP surface or a self-hosted/local session there.
+explicit checkpoint on `session.idle`. Cursor read-only cloud sessions use the
+managed policy fallback when lifecycle hooks are unavailable; this fallback
+does not bypass read-only restrictions or authorize capture.
 
 Employers may disable custom MCP servers. Do not ingest employer repositories
 or context unless organizational policy explicitly permits it.
@@ -1009,7 +1054,7 @@ that close a documented limitation with tests and evidence are especially welcom
 | [v0.4 verification](docs/build-verification-2026-09-10-v0.4.md) | Central MCP, handoff, UI, provenance, branch, budget and audit gates |
 | [v0.5 verification](docs/build-verification-2026-09-10-v0.5.md) | Pinned local model, integrity, quality, footprint, and CLI backfill gates |
 | [v0.6 verification](docs/build-verification-2026-09-11-v0.6.md) | Remote MCP, OIDC, client contracts, lifecycle adapters, and interoperability evidence |
-| [v0.7 verification](docs/build-verification-2026-09-11-v0.7.md) | Standalone builds, setup/install transactions, native CI, checksums, and provenance |
+| [v0.7 verification](docs/v0.7-verification.md) | Complete agent adapters, standalone builds, local/native gates, checksums, and provenance |
 | [Competitive research](docs/competitive-research-2026-09-09.md) | Existing projects, capability consolidation, differentiation |
 | [Security policy](SECURITY.md) | Supported line and private reporting process |
 | [Support](SUPPORT.md) | Questions, bug reports, feature requests, and security-report routing |

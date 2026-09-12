@@ -12,5 +12,5 @@
       "timeout": 30000
     }
   },
-  "plugin": ["./examples/clients/opencode-continuitydb.js"]
+  "plugin": ["./.opencode/plugins/continuitydb.js"]
 }

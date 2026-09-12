@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import { hasPrivateDirectoryPermissions } from "./paths.js";
 
 const VALID_SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
 const VALID_SCOPES = new Set([
@@ -57,10 +58,12 @@ export function requireScope(identity, scope) {
   }
 }
 
-export function loadTokenPolicy(path) {
+export function loadTokenPolicy(path, { platform = process.platform } = {}) {
   if (!path) return [];
   const mode = statSync(path).mode & 0o777;
-  if ((mode & 0o077) !== 0) throw new Error("token policy file must not be readable or writable by group/other");
+  if (!hasPrivateDirectoryPermissions(mode, platform)) {
+    throw new Error("token policy file must not be readable or writable by group/other");
+  }
   const parsed = JSON.parse(readFileSync(path, "utf8"));
   if (!Array.isArray(parsed.tokens)) throw new Error("token policy must contain a tokens array");
   return parsed.tokens.map((entry) => {

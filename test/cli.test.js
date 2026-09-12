@@ -5,7 +5,11 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { parse as parseToml } from "smol-toml";
 import { BUILTIN_LOCAL_MODEL } from "../src/local-embeddings.js";
 import { ContextVault } from "../src/store.js";
 import { VERSION } from "../src/version.js";
@@ -42,7 +46,7 @@ function forceSetupConnectorFailure({ cli, home, project }) {
   writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
   writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
   return spawnSync(process.execPath, [
-    cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
   ], { encoding: "utf8" });
 }
 
@@ -89,10 +93,33 @@ function waitForChildMessage(child, type) {
   });
 }
 
+function setupArguments({ cli, home, project, agents = "codex" }) {
+  return [
+    cli, "setup", "--home", home, "--project-dir", project,
+    "--project", "cli-test", "--agents", agents, "--apply",
+  ];
+}
+
+function runSetupAtFailpoint({ cli, home, project, failpoint, agents }) {
+  return spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NODE_ENV: "test",
+      CONTINUITYDB_TEST_SETUP_FAILPOINT: failpoint,
+    },
+  });
+}
+
+function assertProjectRegisteredOnce(home, project) {
+  const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
+  assert.equal(config.projects.filter((item) => item.id === "cli-test" && item.root === project).length, 1);
+}
+
 test("CLI version matches the package version", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-version-"));
   try {
-    const cli = new URL("../src/cli.js", import.meta.url).pathname;
+    const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
     const result = spawnSync(process.execPath, [cli, "version"], { encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
     const value = JSON.parse(result.stdout);
@@ -110,25 +137,445 @@ test("CLI setup previews and applies all project agent connections idempotently"
   const project = join(root, "project");
   const home = join(root, "vault");
   mkdirSync(project);
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
-    const common = [cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--owner", "owner-a"];
+    const common = [cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--owner", "owner-a"];
     const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
     assert.equal(preview.status, 0, preview.stderr);
     const previewValue = JSON.parse(preview.stdout);
     assert.equal(previewValue.connections.length, 5);
+    assert.deepEqual(previewValue.project, {
+      id: "cli-test", root: project, source: "explicit", git_root: null,
+    });
+    assert.deepEqual(previewValue.agents.selected, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.deepEqual(previewValue.agents.planned, ["codex", "claude", "opencode", "cursor", "copilot"]);
+    assert.deepEqual(previewValue.agents.connected, []);
+    assert.equal(previewValue.agents.requested, "all");
+    assert.equal(previewValue.configuration_scope, "project");
     assert.deepEqual(previewValue.run, { command: "continuitydb", args: ["run", "--home", home] });
     assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
     assert.equal(existsSync(home), false, "setup preview must not initialize the vault");
     const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
     assert.equal(applied.status, 0, applied.stderr);
-    assert.equal(JSON.parse(applied.stdout).connections.every((item) => item.applied), true);
+    const appliedValue = JSON.parse(applied.stdout);
+    assert.equal(appliedValue.connections.every((item) => item.applied), true);
+    assert.deepEqual(appliedValue.project, previewValue.project);
+    assert.deepEqual(appliedValue.agents.selected, previewValue.agents.selected);
+    assert.deepEqual(appliedValue.agents.planned, []);
+    assert.deepEqual(appliedValue.agents.connected, previewValue.agents.selected);
+    assert.equal(appliedValue.configuration_scope, "project");
     const status = spawnSync(process.execPath, [cli, "agents", "status", "--home", home, "--project-dir", project], { encoding: "utf8" });
     assert.equal(status.status, 0, status.stderr);
     assert.equal(JSON.parse(status.stdout).agents.filter((item) => item.connected).length, 5);
     const repeated = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
     assert.equal(repeated.status, 0, repeated.stderr);
     assert.equal(JSON.parse(repeated.stdout).connections.every((item) => !item.changed), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup and connect expose truthful complete and MCP-only integration controls", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-agent-controls-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const bin = join(root, "bin");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(bin);
+    writeFileSync(join(bin, "claude"), "#!/bin/sh\nexit 99\n", { mode: 0o755 });
+    const environment = { ...process.env, PATH: bin };
+    const preview = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project,
+      "--agents", "detected", "--mcp-only",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(preview.status, 0, preview.stderr);
+    const previewValue = JSON.parse(preview.stdout);
+    assert.equal(previewValue.agent_setup.capture_mode, "explicit-governed");
+    assert.equal(previewValue.agent_setup.mcp_only, true);
+    assert.equal(previewValue.connections.length, 1);
+    assert.equal(previewValue.connections[0].client, "claude");
+    assert.equal(previewValue.connections[0].selected, true);
+    assert.equal(previewValue.connections[0].planned, true);
+    assert.equal(previewValue.connections[0].applied, false);
+    assert.equal(previewValue.connections[0].verified, false);
+    assert.equal(previewValue.connections[0].detected, true);
+    assert.equal(previewValue.connections[0].detected_executable, join(bin, "claude"));
+    assert.equal(previewValue.connections[0].recall_mode, "mcp-only");
+    assert.equal(previewValue.connections[0].assets.length, 1);
+    assert.equal(existsSync(join(project, ".mcp.json")), false);
+
+    const registration = spawnSync(process.execPath, [
+      cli, "projects", "add", "--home", home, "--project-dir", project,
+      "--project", "generic-repo", "--apply",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(registration.status, 0, registration.stderr);
+
+    const applied = spawnSync(process.execPath, [
+      cli, "agents", "connect", "claude", "--home", home, "--project-dir", project,
+      "--project", "generic-repo", "--mcp-only", "--apply",
+    ], { encoding: "utf8", env: environment });
+    assert.equal(applied.status, 0, applied.stderr);
+    const result = JSON.parse(applied.stdout).results[0];
+    assert.equal(result.selected, true);
+    assert.equal(result.planned, false);
+    assert.equal(result.applied, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.detected, true);
+    assert.equal(result.recall_mode, "mcp-only");
+    assert.match(result.limitations.join("\n"), /does not install automatic recall/i);
+    assert.equal(existsSync(join(project, "CLAUDE.md")), false);
+    assert.equal(existsSync(join(project, ".claude", "settings.json")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI agents connect refuses an unregistered project before writing", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-unregistered-agent-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const result = spawnSync(process.execPath, [
+      cli, "agents", "connect", "codex", "--home", home, "--project-dir", project, "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /project generic-repo is not registered/i);
+    assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI agents status reports per-asset drift without repairing it", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-status-drift-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const applied = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    const claudePolicy = join(project, "CLAUDE.md");
+    writeFileSync(claudePolicy, "drifted\n");
+    const status = spawnSync(process.execPath, [
+      cli, "agents", "status", "--home", home, "--project-dir", project,
+    ], { encoding: "utf8" });
+    assert.equal(status.status, 0, status.stderr);
+    const claude = JSON.parse(status.stdout).agents.find((item) => item.client === "claude");
+    assert.equal(claude.connected, true);
+    assert.equal(claude.verified, false);
+    assert.equal(claude.drifted, true);
+    assert.equal(claude.assets.find((asset) => asset.path === claudePolicy).changed, true);
+    assert.equal(readFileSync(claudePolicy, "utf8"), "drifted\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup reports a filesystem-detected OpenCode-only project connection", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-detected-summary-"));
+  const project = join(root, "billing-api");
+  const home = join(root, "vault");
+  const bin = join(root, "bin");
+  const userHome = join(root, "user-home");
+  const executionMarker = join(root, "opencode-executed");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(bin);
+    mkdirSync(userHome);
+    writeFileSync(join(bin, "opencode"), `#!/bin/sh\nprintf executed > ${executionMarker}\n`, { mode: 0o755 });
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "detected",
+    ], { encoding: "utf8", env: { ...process.env, PATH: bin, HOME: userHome, USERPROFILE: userHome } });
+    assert.equal(result.status, 0, result.stderr);
+    const value = JSON.parse(result.stdout);
+    assert.deepEqual(value.project, {
+      id: "billing-api", root: project, source: "git", git_root: project,
+    });
+    assert.deepEqual(value.agents, {
+      requested: "detected",
+      detected: ["opencode"],
+      selected: ["opencode"],
+      planned: ["opencode"],
+      connected: [],
+      supported_not_installed: ["codex", "claude", "cursor", "copilot"],
+    });
+    assert.equal(value.configuration_scope, "project");
+    assert.equal(value.connections.length, 1);
+    assert.equal(value.connections[0].client, "opencode");
+    assert.equal(value.connections[0].path, join(project, "opencode.json"));
+    assert.equal(existsSync(join(project, "opencode.json")), false);
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(executionMarker), false, "detected client binaries must never execute");
+    assert.deepEqual(readdirSync(userHome), [], "setup preview must not create global client configuration");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI reports an actionable limitation for every selected undetected executable", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-undetected-limitations-"));
+  const project = join(root, "generic-repo");
+  const home = join(root, "vault");
+  const emptyBin = join(root, "empty-bin");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(emptyBin);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all",
+    ], { encoding: "utf8", env: { ...process.env, PATH: emptyBin } });
+    assert.equal(result.status, 0, result.stderr);
+    const connections = JSON.parse(result.stdout).connections;
+    assert.equal(connections.length, 5);
+    for (const connection of connections) {
+      assert.equal(connection.detected, false);
+      assert.equal(connection.detected_executable, null);
+      assert.match(connection.limitations.join("\n"), /executable.*not detected.*PATH/i);
+    }
+    assert.match(connections.find((item) => item.client === "cursor").limitations.join("\n"), /read-only cloud/i);
+    assert.match(connections.find((item) => item.client === "opencode").limitations.join("\n"), /first-task recall is policy-led/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup derives one Git project identity and registers it on apply", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-git-setup-"));
+  const project = join(root, "git-project");
+  const nested = join(project, "packages", "worker");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    mkdirSync(nested, { recursive: true });
+    const common = [cli, "setup", "--home", home, "--project-dir", nested, "--agents", "codex"];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.deepEqual(JSON.parse(preview.stdout).registration, {
+      changed: true,
+      applied: false,
+      projects: [{ id: "git-project", root: project, source: "git" }],
+    });
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(join(nested, ".codex", "config.toml")), false);
+
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).registration.applied, true);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "git-project", root: project, source: "git" },
+    ]);
+    assert.match(readFileSync(join(nested, ".codex", "config.toml"), "utf8"), /CONTINUITYDB_ALLOWED_PROJECTS = "git-project"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup authorizes the exact AgentForge Git identity without a default fallback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-agentforge-"));
+  const project = join(root, "AgentForge");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  let client;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const setup = spawnSync(process.execPath, [
+      cli,
+      "setup",
+      "--home",
+      home,
+      "--project-dir",
+      project,
+      "--agents",
+      "codex",
+      "--binary",
+      cli,
+      "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(setup.status, 0, setup.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "AgentForge", root: project, source: "git" },
+    ]);
+
+    const connector = parseToml(readFileSync(join(project, ".codex", "config.toml"), "utf8"));
+    const server = connector.mcp_servers.continuitydb;
+    assert.equal(server.env.CONTINUITYDB_ALLOWED_PROJECTS, "AgentForge");
+    assert.equal(server.env.CONTINUITYDB_ALLOWED_PROJECTS.includes("default"), false);
+
+    client = new Client({ name: "agentforge-regression", version: "0.7.0" });
+    const ambientEnvironment = {
+      ...process.env,
+      CONTINUITYDB_ALLOWED_PROJECTS: "ambient-project",
+      CONTINUITYDB_ALLOWED_SENSITIVITIES: "restricted",
+      CONTINUITYDB_CAPTURE_POLICY_FILE: join(root, "hostile-ambient-policy.json"),
+      CONTINUITYDB_TENANT_ID: "ambient-tenant",
+      CONTINUITYDB_PRINCIPAL_ID: "ambient-principal",
+      CONTINUITYDB_OWNER_ID: "ambient-owner",
+      CONTINUITYDB_AGENT_ID: "ambient-agent",
+      CONTINUITYDB_MCP_SCOPES: "memory:read",
+      CONTINUITYDB_MCP_CAPTURE_BURST: "0",
+      CONTINUITYDB_MCP_CAPTURE_PER_SECOND: "0",
+      CONTINUITYDB_HTTP_URL: "https://ambient.invalid",
+      CONTEXT_VAULT_ALLOWED_PROJECTS: "legacy-ambient-project",
+    };
+    const isolatedEnvironment = Object.fromEntries(Object.entries(ambientEnvironment).filter(([key]) => (
+      !key.startsWith("CONTINUITYDB_") && !key.startsWith("CONTEXT_VAULT_")
+    )));
+    assert.equal(isolatedEnvironment.CONTINUITYDB_CAPTURE_POLICY_FILE, undefined);
+    assert.equal(isolatedEnvironment.CONTINUITYDB_MCP_SCOPES, undefined);
+    assert.equal(isolatedEnvironment.CONTINUITYDB_HTTP_URL, undefined);
+    assert.equal(isolatedEnvironment.CONTEXT_VAULT_ALLOWED_PROJECTS, undefined);
+    await client.connect(new StdioClientTransport({
+      command: server.command,
+      args: server.args,
+      env: { ...isolatedEnvironment, ...server.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" },
+    }));
+    const captured = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        project_id: "AgentForge",
+        memory_kind: "working",
+        body: "AgentForge keeps the platform architecture context in ContinuityDB.",
+      },
+    });
+    assert.equal(captured.structuredContent.disposition, "active");
+    assert.equal(captured.structuredContent.record.project_id, "AgentForge");
+    const forbidden = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        project_id: "unregistered-project",
+        memory_kind: "working",
+        body: "NeverAuthorizedScopeSentinel must not be captured.",
+      },
+    });
+    assert.equal(forbidden.isError, true);
+    assert.match(forbidden.content[0].text, /project unregistered-project is not allowed for this caller/i);
+    const omitted = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        memory_kind: "working",
+        body: "Omitting project_id must not fall back to default.",
+      },
+    });
+    assert.equal(omitted.isError, true);
+    assert.match(omitted.content[0].text, /project_id|required/i);
+    const searched = await client.callTool({
+      name: "memory_search",
+      arguments: { query: "NeverAuthorizedScopeSentinel", project_id: "AgentForge" },
+    });
+    assert.deepEqual(searched.structuredContent.results, []);
+  } finally {
+    await client?.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup outside Git refuses before mutating the vault or project", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-outside-git-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(project);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot infer a project identity.*--project <id>/i);
+    assert.equal(existsSync(home), false);
+    assert.equal(existsSync(join(project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup accepts and registers an explicit project outside Git", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-explicit-setup-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(project);
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "billing-api", "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "billing-api", root: project, source: "explicit" },
+    ]);
+    assert.match(readFileSync(join(project, ".codex", "config.toml"), "utf8"), /CONTINUITYDB_ALLOWED_PROJECTS = "billing-api"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI projects add previews, applies, lists, and repeats idempotently", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-projects-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(project);
+    const common = [cli, "projects", "add", "--home", home, "--project-dir", project, "--project", "billing-api"];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.deepEqual(JSON.parse(preview.stdout), {
+      project: { id: "billing-api", root: project, source: "explicit", git_root: null },
+      changed: true,
+      applied: false,
+      projects: [{ id: "billing-api", root: project, source: "explicit" }],
+    });
+    assert.equal(existsSync(home), false);
+
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).changed, true);
+    const repeated = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(repeated.status, 0, repeated.stderr);
+    assert.equal(JSON.parse(repeated.stdout).changed, false);
+    const listed = spawnSync(process.execPath, [cli, "projects", "list", "--home", home], { encoding: "utf8" });
+    assert.equal(listed.status, 0, listed.stderr);
+    assert.deepEqual(JSON.parse(listed.stdout), {
+      projects: [{ id: "billing-api", root: project, source: "explicit" }],
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup connector failure restores exact config bytes and registry state", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-registry-rollback-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(project);
+    const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
+    assert.equal(init.status, 0, init.stderr);
+    const configPath = join(home, "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf8"));
+    config.projects = [{ id: "existing", root: join(root, "existing"), source: "explicit" }];
+    config.unknown_extension = { preserve: true };
+    const before = Buffer.from(`${JSON.stringify(config, null, 4)}\n`);
+    writeFileSync(configPath, before);
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+
+    const result = spawnSync(process.execPath, [
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "new-project", "--agents", "codex", "--apply",
+    ], { encoding: "utf8" });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assert.equal(readFileSync(configPath).equals(before), true, "rollback must restore the exact prior config bytes");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -145,10 +592,10 @@ test("CLI setup --agents all fails before mutating any client when a later confi
   writeFileSync(claude, "{ malformed\n");
   const beforeCodex = readFileSync(codex, "utf8");
   const beforeClaude = readFileSync(claude, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.equal(readFileSync(codex, "utf8"), beforeCodex);
@@ -174,10 +621,10 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
   writeFileSync(blockingBackupParent, "pre-existing backup blocker\n");
   const beforeCodex = readFileSync(codex, "utf8");
   const beforeBlocker = readFileSync(blockingBackupParent, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /backup parent must be a real directory/);
@@ -195,11 +642,215 @@ test("CLI setup commit failure leaves no newly initialized vault artifacts", () 
   }
 });
 
+test("CLI connector failure preserves a partial vault when setup staging is destroyed", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-no-restore-source-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  const config = Buffer.from('{\n    "schema_version": 2,\n    "private_marker": "config-before"\n}\n');
+  const recordsMarker = Buffer.from([0, 1, 2, 3, 254, 255]);
+  const indexMarker = Buffer.from("index-before\n");
+  const modelMarker = Buffer.from("model-before\n");
+  try {
+    mkdirSync(join(home, "records", "nested"), { recursive: true });
+    mkdirSync(join(home, "index", "nested"), { recursive: true });
+    mkdirSync(join(home, "models", "private-cache"), { recursive: true });
+    mkdirSync(project);
+    writeFileSync(join(home, "config.json"), config);
+    writeFileSync(join(home, "records", "nested", "marker.bin"), recordsMarker);
+    writeFileSync(join(home, "index", "nested", "marker.txt"), indexMarker);
+    writeFileSync(join(home, "models", "private-cache", "marker.txt"), modelMarker);
+    writeFileSync(join(home, "unrelated.bin"), Buffer.from([9, 8, 7, 6]));
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    const before = snapshotTree(home);
+
+    const child = fork(cli, setupArguments({ cli, home, project }).slice(1), {
+      env: { ...process.env, NODE_ENV: "test", CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC: "1" },
+      silent: true,
+    });
+    const exit = waitForChildExit(child);
+    const staging = await waitForSetupSnapshot(child);
+    rmSync(staging.directory, { recursive: true, force: true });
+    child.send("continuitydb:resume-setup");
+
+    const result = await exit;
+    assert.notEqual(result.code, 0, result.stderr);
+    assert.deepEqual(snapshotTree(home), before);
+    assert.equal(readFileSync(join(home, "config.json")).equals(config), true);
+    assert.equal(readFileSync(join(home, "records", "nested", "marker.bin")).equals(recordsMarker), true);
+    assert.equal(readFileSync(join(home, "index", "nested", "marker.txt")).equals(indexMarker), true);
+    assert.equal(readFileSync(join(home, "models", "private-cache", "marker.txt")).equals(modelMarker), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup never passes a pre-existing canonical path to recursive removal", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-removal-trace-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const removalLog = join(root, "recursive-removals.jsonl");
+  const preload = join(root, "trace-removals.cjs");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(home, "records", "nested"), { recursive: true });
+    mkdirSync(join(home, "index", "nested"), { recursive: true });
+    mkdirSync(join(home, "models", "private-cache"), { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(home, "config.json"), '{"schema_version":2,"marker":"before"}\n');
+    writeFileSync(join(home, "records", "nested", "marker.txt"), "records-before\n");
+    writeFileSync(join(home, "index", "nested", "marker.txt"), "index-before\n");
+    writeFileSync(join(home, "models", "private-cache", "marker.txt"), "model-before\n");
+    writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    writeFileSync(preload, [
+      '"use strict";',
+      'const fs = require("node:fs");',
+      'const { syncBuiltinESMExports } = require("node:module");',
+      'const originalRmSync = fs.rmSync;',
+      'fs.rmSync = function continuitydbTracedRmSync(path, options) {',
+      '  if (options && options.recursive) fs.appendFileSync(process.env.CONTINUITYDB_TEST_RM_LOG, `${JSON.stringify(String(path))}\\n`);',
+      '  return originalRmSync(path, options);',
+      '};',
+      'syncBuiltinESMExports();',
+      '',
+    ].join("\n"));
+
+    const result = spawnSync(process.execPath, setupArguments({ cli, home, project }), {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CONTINUITYDB_TEST_RM_LOG: removalLog,
+        NODE_OPTIONS: [process.env.NODE_OPTIONS, "--require", preload].filter(Boolean).join(" "),
+      },
+    });
+    assert.notEqual(result.status, 0, result.stderr);
+    const recursivelyRemoved = existsSync(removalLog)
+      ? readFileSync(removalLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)
+      : [];
+    const protectedPaths = [
+      join(home, "config.json"),
+      join(home, "records"),
+      join(home, "index"),
+      join(home, "models"),
+    ];
+    assert.deepEqual(
+      recursivelyRemoved.filter((path) => protectedPaths.includes(path)),
+      [],
+      `pre-existing canonical setup paths were recursively removed: ${JSON.stringify(recursivelyRemoved)}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI existing-home promotion failures roll connectors back and retry without duplicate registration", async (t) => {
+  const scenarios = [
+    {
+      name: "missing records and index",
+      failpoints: ["before-records", "after-records", "before-index", "after-index", "before-config", "after-config"],
+      seed(home) {
+        mkdirSync(home, { recursive: true });
+      },
+    },
+    {
+      name: "missing database in an existing index",
+      failpoints: ["before-database", "after-database", "before-config", "after-config"],
+      seed(home) {
+        mkdirSync(join(home, "records", "nested"), { recursive: true });
+        mkdirSync(join(home, "index", "nested"), { recursive: true });
+        writeFileSync(join(home, "records", "nested", "marker.txt"), "records-before\n");
+        writeFileSync(join(home, "index", "nested", "marker.txt"), "index-before\n");
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    for (const failpoint of scenario.failpoints) {
+      await t.test(`${scenario.name}: ${failpoint}`, () => {
+        const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-promotion-failure-"));
+        const project = join(root, "project");
+        const home = join(root, "vault");
+        const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+        const config = Buffer.from('{\n    "schema_version": 2,\n    "extension": { "preserve": true }\n}\n');
+        const connector = Buffer.from('model = "gpt-5"\n');
+        try {
+          scenario.seed(home);
+          mkdirSync(join(project, ".codex"), { recursive: true });
+          writeFileSync(join(home, "config.json"), config);
+          writeFileSync(join(home, "unrelated.bin"), Buffer.from([5, 4, 3, 2, 1]));
+          writeFileSync(join(project, ".codex", "config.toml"), connector);
+
+          const agents = scenario.name === "missing records and index" && failpoint === "before-config" ? "all" : "codex";
+          const failed = runSetupAtFailpoint({ cli, home, project, failpoint, agents });
+          assert.notEqual(failed.status, 0, `${failpoint} unexpectedly succeeded`);
+          assert.match(failed.stderr, new RegExp(`injected setup failure at ${failpoint}`));
+          assert.equal(readFileSync(join(home, "config.json")).equals(config), true, "pre-existing config bytes changed");
+          assert.equal(readFileSync(join(home, "unrelated.bin")).equals(Buffer.from([5, 4, 3, 2, 1])), true);
+          assert.equal(readFileSync(join(project, ".codex", "config.toml")).equals(connector), true, "connector was not rolled back");
+          if (agents === "all") {
+            assert.equal(existsSync(join(project, ".mcp.json")), false);
+            assert.equal(existsSync(join(project, "opencode.json")), false);
+            assert.equal(existsSync(join(project, ".cursor", "mcp.json")), false);
+            assert.equal(existsSync(join(project, ".vscode", "mcp.json")), false);
+          }
+          if (scenario.name.includes("existing index")) {
+            assert.equal(readFileSync(join(home, "records", "nested", "marker.txt"), "utf8"), "records-before\n");
+            assert.equal(readFileSync(join(home, "index", "nested", "marker.txt"), "utf8"), "index-before\n");
+          }
+
+          const retry = spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), { encoding: "utf8" });
+          assert.equal(retry.status, 0, retry.stderr);
+          assertProjectRegisteredOnce(home, project);
+          const repeated = spawnSync(process.execPath, setupArguments({ cli, home, project, agents }), { encoding: "utf8" });
+          assert.equal(repeated.status, 0, repeated.stderr);
+          assertProjectRegisteredOnce(home, project);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
+test("CLI fresh-home promotion failures are atomic and retry idempotently", async (t) => {
+  for (const failpoint of ["before-home", "after-home"]) {
+    await t.test(failpoint, () => {
+      const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-fresh-promotion-"));
+      const project = join(root, "project");
+      const home = join(root, "vault");
+      const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+      const connector = Buffer.from('model = "gpt-5"\n');
+      try {
+        mkdirSync(join(project, ".codex"), { recursive: true });
+        writeFileSync(join(project, ".codex", "config.toml"), connector);
+
+        const failed = runSetupAtFailpoint({ cli, home, project, failpoint });
+        assert.notEqual(failed.status, 0, `${failpoint} unexpectedly succeeded`);
+        assert.match(failed.stderr, new RegExp(`injected setup failure at ${failpoint}`));
+        assert.equal(readFileSync(join(project, ".codex", "config.toml")).equals(connector), true);
+        if (failpoint === "before-home") assert.equal(existsSync(home), false);
+
+        const retry = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+        assert.equal(retry.status, 0, retry.stderr);
+        assertProjectRegisteredOnce(home, project);
+        const repeated = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+        assert.equal(repeated.status, 0, repeated.stderr);
+        assertProjectRegisteredOnce(home, project);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("CLI failed setup restores a pre-existing empty index directory byte-for-byte", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-empty-index-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(join(home, "index"), { recursive: true });
     mkdirSync(project);
@@ -208,7 +859,7 @@ test("CLI failed setup restores a pre-existing empty index directory byte-for-by
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /backup parent must be a real directory/);
@@ -222,7 +873,7 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-valid-db-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     mkdirSync(project);
     const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
@@ -232,7 +883,7 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.deepEqual(snapshotTree(home), before);
@@ -241,11 +892,34 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
   }
 });
 
-test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { skip: process.platform === "win32" }, () => {
+test("CLI setup refuses to place a new database beside pre-existing WAL or SHM state", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-orphan-sidecars-"));
+  const project = join(root, "project");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  try {
+    mkdirSync(join(home, "index"), { recursive: true });
+    mkdirSync(join(project, ".codex"), { recursive: true });
+    writeFileSync(join(home, "index", "context-vault.db-wal"), Buffer.from([1, 3, 3, 7]));
+    writeFileSync(join(home, "index", "context-vault.db-shm"), Buffer.from([9, 2, 5, 6]));
+    writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
+    const before = snapshotTree(home);
+
+    const result = spawnSync(process.execPath, setupArguments({ cli, home, project }), { encoding: "utf8" });
+    assert.notEqual(result.status, 0, result.stderr);
+    assert.match(result.stderr, /sidecar.*without.*database/i);
+    assert.deepEqual(snapshotTree(home), before);
+    assert.equal(readFileSync(join(project, ".codex", "config.toml"), "utf8"), 'model = "gpt-5"\n');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI failed setup preserves live SQLite WAL and SHM state across restart", { skip: process.platform === "win32" }, () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-wal-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   let database;
   try {
     mkdirSync(project);
@@ -260,10 +934,13 @@ test("CLI failed setup restores live SQLite WAL and SHM sidecars on POSIX", { sk
     mkdirSync(join(project, ".codex"), { recursive: true });
     writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.deepEqual(snapshotTree(home), before);
+    database.close();
+    database = new DatabaseSync(join(home, "index", "context-vault.db"));
+    assert.equal(database.prepare("SELECT value FROM rollback_probe").get().value, "before");
   } finally {
     database?.close();
     rmSync(root, { recursive: true, force: true });
@@ -274,7 +951,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-concurrent-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   let reopened;
   let writer;
   try {
@@ -285,7 +962,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
     writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
 
     const child = fork(cli, [
-      "setup", "--home", home, "--project-dir", project, "--agents", "codex", "--apply",
+      "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], {
       env: { ...process.env, NODE_ENV: "test", CONTINUITYDB_TEST_SETUP_SNAPSHOT_SYNC: "1" },
       silent: true,
@@ -294,7 +971,7 @@ test("CLI failed setup serializes a concurrent first-open commit and preserves i
     const snapshot = await waitForSetupSnapshot(child);
     assert.equal(existsSync(snapshot.directory), true);
 
-    const worker = new URL("../test-support/concurrent-first-commit.mjs", import.meta.url).pathname;
+    const worker = fileURLToPath(new URL("../test-support/concurrent-first-commit.mjs", import.meta.url));
     writer = fork(worker, [], { silent: true });
     await waitForChildMessage(writer, "ready");
     const starting = waitForChildMessage(writer, "starting");
@@ -330,10 +1007,10 @@ test("CLI setup vault failure occurs before agent commit and removes new setup a
   writeFileSync(codex, 'model = "gpt-5"\n');
   writeFileSync(blocker, "pre-existing index blocker\n");
   const beforeCodex = readFileSync(codex, "utf8");
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
-      cli, "setup", "--home", home, "--project-dir", project, "--agents", "all", "--apply",
+      cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "all", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     assert.equal(readFileSync(codex, "utf8"), beforeCodex);
@@ -361,10 +1038,10 @@ test("CLI agents connect all fails before mutating any client when a later names
   writeFileSync(claude, '{"keep":true}\n');
   writeFileSync(opencode, '{"mcp":"invalid"}\n');
   const before = new Map([codex, claude, opencode].map((path) => [path, readFileSync(path, "utf8")]));
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   try {
     const result = spawnSync(process.execPath, [
-      cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--apply",
+      cli, "agents", "connect", "all", "--home", home, "--project-dir", project, "--project", "cli-test", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
     for (const [path, content] of before) assert.equal(readFileSync(path, "utf8"), content);
@@ -388,7 +1065,7 @@ test("CLI --home overrides environment home for local embedding cache resolution
   vault.commit(proposal.record.id);
   vault.close();
   try {
-    const cli = new URL("../src/cli.js", import.meta.url).pathname;
+    const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
     const result = spawnSync(process.execPath, [cli, "embeddings-index", "--home", cliHome], {
       encoding: "utf8",
       env: {
@@ -426,7 +1103,7 @@ test("CLI handoff-save quarantines a checkpoint without latest-checkpoint lineag
     current_state: "API first",
     branch: "main",
   }));
-  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
   const env = {
     ...process.env,
     CONTINUITYDB_ALLOWED_PROJECTS: "api",

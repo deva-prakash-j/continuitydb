@@ -6,6 +6,7 @@ import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { REVIEW_UI } from "./review-ui.js";
 import { ContinuityMcpHttpEndpoint } from "./mcp-http.js";
 import { VERSION } from "./version.js";
+import { isDirectEntrypoint } from "./direct-entry.js";
 import {
   isLoopback,
   loadTokenPolicy,
@@ -506,7 +507,7 @@ export function createContinuityServer({
   };
 }
 
-if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && import.meta.url === `file://${process.argv[1]}`) {
+if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && isDirectEntrypoint(import.meta.url)) {
   const service = createContinuityServer();
   const address = await service.listen();
   process.stderr.write(`ContinuityDB listening on ${typeof address === "string" ? address : `${address.address}:${address.port}`}\n`);

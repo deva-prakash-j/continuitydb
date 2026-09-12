@@ -4,6 +4,11 @@ import { join } from "node:path";
 
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
+const CHECKPOINT_FIELDS = new Set([
+  "project_id", "task_id", "goal", "current_state", "completed_work",
+  "unresolved_questions", "next_actions", "relevant_files", "state", "branch",
+  "git_commit", "checkpoint_id", "previous_checkpoint_id", "sensitivity",
+]);
 
 function requiredEnv(name) {
   const value = process.env[name];
@@ -12,22 +17,27 @@ function requiredEnv(name) {
 }
 
 function authHeaders() {
-  const tokenName = process.env.CONTINUITYDB_HTTP_TOKEN_ENV
-    || (process.env.CONTINUITYDB_MCP_TOKEN ? "CONTINUITYDB_MCP_TOKEN" : "CONTINUITYDB_HTTP_TOKEN");
+  const tokenName = requiredEnv("CONTINUITYDB_HTTP_TOKEN_ENV");
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(tokenName)) throw new Error("invalid ContinuityDB token environment name");
   const token = process.env[tokenName];
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
-async function request(path, { method = "GET", body = null } = {}) {
+async function request(path, { method = "GET", body = null, idempotencyKey = null } = {}) {
   const base = new URL(requiredEnv("CONTINUITYDB_HTTP_URL"));
   if (base.username || base.password || base.search || base.hash) throw new Error("ContinuityDB URL must not contain credentials");
   if (base.protocol !== "https:" && !["127.0.0.1", "::1", "localhost"].includes(base.hostname)) {
     throw new Error("remote ContinuityDB URL must use HTTPS");
   }
+  if (base.pathname.endsWith("/mcp")) base.pathname = base.pathname.slice(0, -3);
   const response = await fetch(new URL(path, base.href.endsWith("/") ? base : `${base.href}/`), {
     method,
-    headers: { accept: "application/json", ...(body ? { "content-type": "application/json" } : {}), ...authHeaders() },
+    headers: {
+      accept: "application/json",
+      ...(body ? { "content-type": "application/json" } : {}),
+      ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+      ...authHeaders(),
+    },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(15_000),
   });
@@ -58,24 +68,52 @@ async function request(path, { method = "GET", body = null } = {}) {
 function taskScope() {
   return {
     project_id: requiredEnv("CONTINUITYDB_PROJECT_ID"),
-    task_id: requiredEnv("CONTINUITYDB_TASK_ID"),
+    task_id: process.env.CONTINUITYDB_TASK_ID || null,
     branch: process.env.CONTINUITYDB_BRANCH || undefined,
   };
 }
 
 async function readCheckpoint(path) {
-  const before = await lstat(path);
+  const before = await lstat(path, { bigint: true });
   if (before.isSymbolicLink() || !before.isFile()) throw new Error("handoff checkpoint must be a regular file, not a symlink");
   const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
   try {
-    const opened = await handle.stat();
+    const opened = await handle.stat({ bigint: true });
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino) {
       throw new Error("handoff checkpoint changed during secure open");
     }
-    if (opened.size > MAX_CHECKPOINT_BYTES) throw new Error("handoff checkpoint file is too large");
-    const value = JSON.parse(await handle.readFile("utf8"));
+    if (opened.size > BigInt(MAX_CHECKPOINT_BYTES)) throw new Error("handoff checkpoint file is too large");
+    const readBounded = async () => {
+      const chunks = [];
+      let size = 0;
+      while (size <= MAX_CHECKPOINT_BYTES) {
+        const buffer = Buffer.allocUnsafe(Math.min(16 * 1024, MAX_CHECKPOINT_BYTES + 1 - size));
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, size);
+        if (bytesRead === 0) break;
+        chunks.push(buffer.subarray(0, bytesRead));
+        size += bytesRead;
+      }
+      return Buffer.concat(chunks, size);
+    };
+    const first = await readBounded();
+    const middle = await handle.stat({ bigint: true });
+    const second = await readBounded();
+    const after = await handle.stat({ bigint: true });
+    if (first.byteLength > MAX_CHECKPOINT_BYTES || !first.equals(second)
+      || middle.size !== opened.size || after.size !== opened.size
+      || middle.mtimeNs !== opened.mtimeNs || after.mtimeNs !== opened.mtimeNs
+      || middle.ctimeNs !== opened.ctimeNs || after.ctimeNs !== opened.ctimeNs) {
+      throw new Error("handoff checkpoint changed during secure read");
+    }
+    const value = JSON.parse(second.toString("utf8"));
     if (!value || Array.isArray(value) || typeof value !== "object") {
       throw new Error("handoff checkpoint must be a JSON object");
+    }
+    for (const key of Object.keys(value)) {
+      if (!CHECKPOINT_FIELDS.has(key)) throw new Error(`handoff checkpoint contains unsupported field: ${key}`);
+    }
+    if (value.project_id !== requiredEnv("CONTINUITYDB_PROJECT_ID")) {
+      throw new Error(`checkpoint project ${value.project_id || "<missing>"} does not match configured project`);
     }
     return value;
   } finally {
@@ -83,20 +121,65 @@ async function readCheckpoint(path) {
   }
 }
 
+async function saveCheckpoint(checkpoint) {
+  const value = { ...checkpoint };
+  if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
+    const query = new URLSearchParams({
+      project_id: value.project_id,
+      task_id: value.task_id,
+      ...(value.branch ? { branch: value.branch } : {}),
+    });
+    try {
+      const latest = await request(`v1/handoffs/latest?${query}`);
+      if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      } else if (latest.handoff.previous_checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
+      }
+    } catch (error) {
+      if (error.statusCode !== 404) throw new Error(`not saved: ${error.message}`);
+    }
+  }
+  let result;
+  try {
+    result = await request("v1/handoffs", {
+      method: "POST", body: value, idempotencyKey: value.checkpoint_id,
+    });
+  } catch (error) {
+    throw new Error(`not saved: ${error.message}`);
+  }
+  if (result.disposition !== "active" || result.record?.status !== "active") {
+    throw new Error(`not saved: ContinuityDB handoff disposition=${result.disposition || "missing"} status=${result.record?.status || "missing"}`);
+  }
+  if (typeof result.record.id !== "string" || !result.handoff
+    || result.handoff.checkpoint_id !== value.checkpoint_id) {
+    throw new Error("not saved: ContinuityDB returned an invalid handoff save response");
+  }
+  return {
+    saved: true,
+    duplicate: Boolean(result.duplicate),
+    memory_id: result.record.id,
+    checkpoint_id: result.handoff.checkpoint_id,
+  };
+}
+
 export const ContinuityDBPlugin = async ({ directory }) => ({
   "experimental.session.compacting": async (_input, output) => {
     const scope = taskScope();
-    const query = new URLSearchParams(scope);
     let handoff = null;
-    try { handoff = await request(`v1/handoffs/latest?${query}`); }
-    catch (error) { if (error.statusCode !== 404) throw error; }
+    if (scope.task_id) {
+      const query = new URLSearchParams(Object.fromEntries(Object.entries(scope).filter(([, value]) => value)));
+      try { handoff = await request(`v1/handoffs/latest?${query}`); }
+      catch (error) { if (error.statusCode !== 404) throw error; }
+    }
     const context = await request("v1/context-packs", {
       method: "POST",
       body: {
-        task: process.env.CONTINUITYDB_TASK || `Continue task ${scope.task_id}`,
+        task: process.env.CONTINUITYDB_TASK || `Continue work in project ${scope.project_id}`,
         project_id: scope.project_id,
         branch: scope.branch,
         token_budget: Number(process.env.CONTINUITYDB_TOKEN_BUDGET || 1200),
+        dependency_depth: 2,
         exclude_types: ["handoff"],
       },
     });
@@ -113,6 +196,6 @@ export const ContinuityDBPlugin = async ({ directory }) => ({
     let checkpoint;
     try { checkpoint = await readCheckpoint(path); }
     catch (error) { if (error.code === "ENOENT") return; throw error; }
-    await request("v1/handoffs", { method: "POST", body: checkpoint });
+    return saveCheckpoint(checkpoint);
   },
 });

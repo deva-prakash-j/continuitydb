@@ -14,7 +14,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, delimiter, dirname, join, parse, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, parse, relative, resolve, sep } from "node:path";
 import { defaultInstallPrefix } from "./agent-connectors.js";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { acquireFileLock } from "./file-lock.js";
@@ -139,6 +139,32 @@ function removeCreatedDirectories(directories) {
   }
 }
 
+function shellSingleQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function sameCanonicalPath(left, right, platform) {
+  return platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function installGuidance({ binDirectory, pathConfigured, platform }) {
+  const nextSteps = [];
+  if (!pathConfigured) {
+    nextSteps.push(platform === "win32"
+      ? `Add "${binDirectory}" to your user PATH in Windows Environment Variables.`
+      : `export PATH=${shellSingleQuote(binDirectory)}:$PATH`);
+  }
+  nextSteps.push("continuitydb version");
+  return {
+    shell_profile_modified: false,
+    path_configured: pathConfigured,
+    path_entry: binDirectory,
+    next_steps: nextSteps,
+  };
+}
+
 export function installStandaloneBinary({
   source = process.execPath,
   prefix = defaultInstallPrefix(),
@@ -160,9 +186,16 @@ export function installStandaloneBinary({
   const versionedBinary = join(versionDirectory, executableName);
   const binDirectory = join(installationPrefix, "bin");
   const launcher = join(binDirectory, executableName);
-  const pathConfigured = pathValue.split(delimiter)
-    .some((item) => canonicalInstallPrefix(item || ".", platform) === binDirectory);
-  const plan = { prefix: installationPrefix, source: sourcePath, versioned_binary: versionedBinary, launcher, path_configured: pathConfigured };
+  const pathDelimiter = platform === "win32" ? ";" : ":";
+  const pathConfigured = pathValue.split(pathDelimiter)
+    .some((item) => sameCanonicalPath(canonicalInstallPrefix(item || ".", platform), binDirectory, platform));
+  const plan = {
+    prefix: installationPrefix,
+    source: sourcePath,
+    versioned_binary: versionedBinary,
+    launcher,
+    ...installGuidance({ binDirectory, pathConfigured, platform }),
+  };
   if (!apply) return { installed: false, preview: true, ...plan };
 
   const releaseInstallLock = acquireFileLock(
