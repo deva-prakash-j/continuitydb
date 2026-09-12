@@ -20,7 +20,7 @@ import { parse as parseToml } from "smol-toml";
 import { isStandaloneBinary } from "./binary-runtime.js";
 import { defaultDataHome } from "./paths.js";
 import { acquireFileLock, acquireFileLocks } from "./file-lock.js";
-import { resolveProjectIdentity } from "./project-identity.js";
+import { resolveProjectIdentity, validateProjectId } from "./project-identity.js";
 
 export const SUPPORTED_AGENTS = Object.freeze(["codex", "claude", "opencode", "cursor", "copilot"]);
 const MAX_CONFIG_BYTES = 1024 * 1024;
@@ -381,29 +381,18 @@ function disconnectedJson(client, current, path) {
 }
 
 function connectorIdentity(projectDir, options) {
-  const explicitProject = options.explicitProject ?? options.project;
-  if (explicitProject !== undefined) {
-    return resolveProjectIdentity({ projectDir, explicitProject });
-  }
-  try {
-    return resolveProjectIdentity({ projectDir });
-  } catch (error) {
-    // `projects` was the pre-0.7 connector option. Keep one-way compatibility
-    // for callers that supplied an explicit legacy allowlist, while ensuring
-    // Git identity always wins when it is available.
-    if (!options.projects?.length || !/cannot infer a project identity/i.test(error.message)) throw error;
-    return resolveProjectIdentity({ projectDir, explicitProject: String(options.projects[0]) });
-  }
+  return options.projectId === undefined
+    ? resolveProjectIdentity({ projectDir })
+    : resolveProjectIdentity({ projectDir, explicitProject: options.projectId });
 }
 
-function normalizeOptions(options = {}, { resolveIdentity = false } = {}) {
+function normalizeOptions(options = {}, { identity = null } = {}) {
   const projectDir = resolve(options.projectDir || process.cwd());
   const home = resolve(options.home || defaultDataHome());
-  const identity = resolveIdentity ? connectorIdentity(projectDir, options) : null;
   const projects = identity
     ? [identity.id]
     : [...new Set((options.projects?.length ? options.projects : [basename(projectDir)]).map(String))];
-  if (!projects.every((value) => /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(value))) throw new Error("invalid project identifier");
+  projects.forEach(validateProjectId);
   const tokenEnv = options.tokenEnv || "CONTINUITYDB_MCP_TOKEN";
   if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(tokenEnv)) throw new Error("invalid token environment variable name");
   return {
@@ -421,9 +410,9 @@ function normalizeOptions(options = {}, { resolveIdentity = false } = {}) {
   };
 }
 
-function prepareAgentChange(client, rawOptions, action) {
+function prepareAgentChange(client, rawOptions, action, identity = null) {
   if (!SUPPORTED_AGENTS.includes(client)) throw new Error(`unsupported agent: ${client}`);
-  const options = normalizeOptions(rawOptions, { resolveIdentity: action === "connect" });
+  const options = normalizeOptions(rawOptions, { identity });
   let path;
   let content;
   if (client === "codex") {
@@ -522,9 +511,11 @@ function applyAgentPlans(plans) {
 function batch(clients, rawOptions, action) {
   const unique = [...new Set(clients)];
   if (!unique.length) return [];
+  const projectDir = resolve(rawOptions.projectDir || process.cwd());
+  const identity = action === "connect" ? connectorIdentity(projectDir, rawOptions) : null;
   // Phase 1 is deliberately side-effect free. Every parser, namespace, marker,
   // path and rendered output must validate before the first client file changes.
-  const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action));
+  const plans = unique.map((client) => prepareAgentChange(client, rawOptions, action, identity));
   return applyAgentPlans(plans);
 }
 

@@ -56,9 +56,57 @@ function options(value, apply = true) {
     binary: "/opt/continuitydb/bin/continuitydb",
     ownerId: "owner-a",
     tenantId: "tenant-a",
-    projects: ["service-a", "schema-a"],
+    projectId: "service-a",
   };
 }
+
+function gitFixture() {
+  const value = fixture();
+  mkdirSync(join(value.project, ".git"));
+  return value;
+}
+
+test("nested Git paths use the Git-root basename in connector allowlists", () => {
+  const value = gitFixture();
+  const nested = join(value.project, "packages", "worker");
+  try {
+    mkdirSync(nested, { recursive: true });
+    const result = connectAgent("codex", {
+      ...options({ ...value, project: nested }),
+      projectId: undefined,
+    });
+    const text = readFileSync(result.path, "utf8");
+    assert.match(text, /CONTINUITYDB_ALLOWED_PROJECTS = "project"/);
+    assert.doesNotMatch(text, /CONTINUITYDB_ALLOWED_PROJECTS = "(?:service-a|worker)"/);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("outside Git connect rejects legacy project allowlists before mutation", () => {
+  const value = fixture();
+  try {
+    assert.throws(
+      () => connectAgent("codex", { ...options(value), projectId: undefined, projects: ["legacy-project"] }),
+      /cannot infer a project identity.*--project <id>/i,
+    );
+    assert.equal(existsSync(join(value.project, ".codex", "config.toml")), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("singular explicit project identity overrides the Git identity", () => {
+  const value = gitFixture();
+  try {
+    const result = connectAgent("codex", { ...options(value), projectId: "explicit-project" });
+    const text = readFileSync(result.path, "utf8");
+    assert.match(text, /CONTINUITYDB_ALLOWED_PROJECTS = "explicit-project"/);
+    assert.doesNotMatch(text, /CONTINUITYDB_ALLOWED_PROJECTS = "project"/);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
 
 test("agent connectors preview without writing, then apply all clients idempotently", () => {
   const value = fixture();
