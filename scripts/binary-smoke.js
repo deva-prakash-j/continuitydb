@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -14,7 +14,10 @@ const extension = process.platform === "win32" ? ".exe" : "";
 const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
   || join("dist", `continuitydb-${process.platform}-${process.arch}${extension}`));
 if (process.platform !== "win32") chmodSync(binary, 0o755);
-const root = mkdtempSync(join(tmpdir(), "continuitydb-binary-smoke-"));
+// `os.tmpdir()` may be exposed through an OS-managed alias such as
+// `/var` -> `/private/var` on macOS. Canonicalize only this smoke-test-owned
+// root before exercising strict production rejection of user project symlinks.
+const root = realpathSync(mkdtempSync(join(tmpdir(), "continuitydb-binary-smoke-")));
 const project = join(root, "generic-repo");
 const home = join(root, "vault");
 const prefix = join(root, "prefix");

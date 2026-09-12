@@ -164,10 +164,30 @@ export function validateGeneratedAdapterTree(projectDir, { home, projectId }) {
 }
 
 function normalizeGeneratedValue(value, projectDir, home) {
-  const text = JSON.stringify(value)
-    .replaceAll(projectDir, "/workspace/inventory-service")
-    .replaceAll(home, "/absolute/private/path/continuitydb-data");
-  return JSON.parse(text);
+  if (typeof value === "string") {
+    const shellWord = (item) => /^[A-Za-z0-9_./:=@+-]+$/.test(item)
+      ? item
+      : `'${item.replaceAll("'", `'"'"'`)}'`;
+    let normalized = value;
+    for (const [source, target] of [
+      [join(projectDir, ".continuitydb-handoff.json"), "/workspace/inventory-service/.continuitydb-handoff.json"],
+      [projectDir, "/workspace/inventory-service"],
+      [home, "/absolute/private/path/continuitydb-data"],
+    ]) {
+      normalized = normalized
+        .replaceAll(shellWord(source), shellWord(target))
+        .replaceAll(source, target);
+    }
+    return normalized;
+  }
+  if (Array.isArray(value)) return value.map((item) => normalizeGeneratedValue(item, projectDir, home));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+      key,
+      normalizeGeneratedValue(item, projectDir, home),
+    ]));
+  }
+  return value;
 }
 
 function validateGeneratedExamples(projectDir, home) {

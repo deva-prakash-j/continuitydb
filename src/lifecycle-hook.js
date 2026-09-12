@@ -2,6 +2,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "node:fs";
 import { loadLifecycleContext, saveLifecycleCheckpoint } from "./lifecycle-context.js";
 import { checkpointSaveOutcome } from "./lifecycle-lineage.js";
+import { isDirectEntrypoint } from "./direct-entry.js";
 
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
 const CHECKPOINT_FIELDS = new Set([
@@ -178,6 +179,6 @@ export async function runLifecycleHook(argv = process.argv.slice(2), io = proces
   }
 }
 
-if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && import.meta.url === `file://${process.argv[1]}`) {
+if (typeof __CONTINUITYDB_BUNDLE__ === "undefined" && isDirectEntrypoint(import.meta.url)) {
   runLifecycleHook().then((code) => { process.exitCode = code; });
 }

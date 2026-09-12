@@ -48,6 +48,23 @@ test("client validator canonicalizes its own temporary root across a platform sy
   }
 });
 
+test("client validator normalizes generated paths structurally when its temporary root contains backslashes", {
+  skip: process.platform === "win32" ? "backslash is a path separator on Windows" : false,
+}, () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-client-validator-backslash-\\"));
+  const script = fileURLToPath(new URL("../scripts/validate-client-adapters.js", import.meta.url));
+  try {
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      env: { ...process.env, TMPDIR: root, TMP: root, TEMP: root },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).valid, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("client validator rejects drift in every shipped generated hook example", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-client-example-drift-"));
   const examples = join(root, "examples");
