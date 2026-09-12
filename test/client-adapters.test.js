@@ -24,6 +24,7 @@ test("versioned client configuration examples pass contract validation", () => {
     "examples/clients/codex.AGENTS.md",
   ]);
   assert.equal(value.shipped_examples, 12);
+  assert.equal(value.semantically_validated_examples, 12);
   assert.equal(value.standalone_tree_validator, true);
 });
 
@@ -40,6 +41,40 @@ test("client validator rejects drift in every shipped generated hook example", (
     const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
     assert.notEqual(result.status, 0, "drifted shipped Claude hook example was ignored");
     assert.match(result.stderr, /claude-code\.hooks\.json|generated hook example/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator rejects a stale OpenCode plugin reference", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-example-drift-"));
+  const examples = join(root, "examples");
+  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "opencode.json");
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    value.plugin = ["./missing-stale-plugin.js"];
+    writeFileSync(path, `${JSON.stringify(value, null, 2)}\n`);
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, "stale OpenCode plugin reference was accepted");
+    assert.match(result.stderr, /opencode.*plugin/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("client validator rejects a stale Codex stdio executable", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-codex-example-drift-"));
+  const examples = join(root, "examples");
+  const script = new URL("../scripts/validate-client-adapters.js", import.meta.url).pathname;
+  try {
+    cpSync(new URL("../examples", import.meta.url), examples, { recursive: true });
+    const path = join(examples, "clients", "codex.stdio.config.toml");
+    writeFileSync(path, readFileSync(path, "utf8").replace('command = "continuitydb"', 'command = "definitely-stale-command"'));
+    const result = spawnSync(process.execPath, [script, "--examples-root", examples], { encoding: "utf8" });
+    assert.notEqual(result.status, 0, "stale Codex executable was accepted");
+    assert.match(result.stderr, /codex.*command|command.*continuitydb/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

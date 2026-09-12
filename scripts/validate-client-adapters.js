@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve } from "node:path";
@@ -46,6 +47,11 @@ const GENERATED_EXAMPLES = Object.freeze([
   "examples/clients/claude-code.hooks.json",
   "examples/clients/codex.AGENTS.md",
 ]);
+const ALL_TOOLS = Object.freeze([
+  "memory_search", "memory_context_pack", "memory_capture", "memory_feedback",
+  "handoff_checkpoint", "handoff_latest",
+]);
+const READ_TOOLS = Object.freeze(["memory_search", "memory_context_pack", "handoff_latest"]);
 
 function invariant(condition, message) {
   if (!condition) throw new Error(`client adapter invariant failed: ${message}`);
@@ -181,41 +187,81 @@ function validateGeneratedExamples(projectDir, home) {
   return [...GENERATED_EXAMPLES];
 }
 
-function validateVersionedRemoteExamples() {
+function validateCodexExample(path, transport) {
+  const document = parseToml(readRepositoryFile(path));
+  const server = document.mcp_servers?.continuitydb;
+  invariant(server?.required === true, `${path} must require the ContinuityDB server`);
+  assert.deepEqual(server.enabled_tools, ALL_TOOLS, `${path} has a stale tool allowlist`);
+  invariant(server.default_tools_approval_mode === "writes", `${path} must retain write approvals`);
+  invariant(server.startup_timeout_sec === 10 && server.tool_timeout_sec === 30,
+    `${path} has stale timeout settings`);
+  if (transport === "remote") {
+    invariant(server.url === "https://continuitydb.example/mcp",
+      "Codex remote URL must match the documented ContinuityDB endpoint");
+    invariant(server.bearer_token_env_var === "CONTINUITYDB_MCP_TOKEN",
+      "Codex remote token environment reference is stale");
+    assert.deepEqual(server.tools, {
+      memory_search: { approval_mode: "auto" },
+      memory_context_pack: { approval_mode: "auto" },
+      handoff_latest: { approval_mode: "auto" },
+    }, `${path} has stale read-tool approval modes`);
+  } else {
+    invariant(server.command === "continuitydb", "Codex stdio command must be continuitydb");
+    assert.deepEqual(server.args, ["mcp", "--home", "/absolute/private/path/continuitydb-data"],
+      "Codex stdio arguments are stale");
+    assert.deepEqual(server.env, {
+      CONTINUITYDB_TENANT_ID: "example-org",
+      CONTINUITYDB_PRINCIPAL_ID: "codex-agent-1",
+      CONTINUITYDB_OWNER_ID: "example-user",
+      CONTINUITYDB_AGENT_ID: "codex",
+      CONTINUITYDB_ALLOWED_PROJECTS: "service-a,schema-a",
+      CONTINUITYDB_ALLOWED_SENSITIVITIES: "public,private",
+    }, "Codex stdio identity or concrete project scope is stale");
+  }
+}
+
+function validateVersionedExamples() {
   const validated = [];
   const copilot = JSON.parse(readRepositoryFile("examples/clients/copilot.repository-mcp.json"));
   validated.push("examples/clients/copilot.repository-mcp.json");
   const copilotServer = copilot.mcpServers.continuitydb;
-  invariant(copilotServer.type === "http" && /\/mcp$/.test(copilotServer.url), "Copilot remote schema is invalid");
-  assert.deepEqual([...copilotServer.tools].sort(), ["handoff_latest", "memory_context_pack", "memory_search"]);
+  invariant(copilotServer.type === "http" && copilotServer.url === "https://continuitydb.example/mcp",
+    "Copilot remote schema or endpoint is invalid");
+  assert.deepEqual(copilotServer.tools, READ_TOOLS, "Copilot read-only tool allowlist is stale");
   invariant(copilotServer.headers.Authorization === "Bearer $COPILOT_MCP_CONTINUITYDB_TOKEN",
     "Copilot example must contain only a token placeholder");
 
   const claude = JSON.parse(readRepositoryFile("examples/clients/claude-code.mcp.json")).mcpServers.continuitydb;
   validated.push("examples/clients/claude-code.mcp.json");
-  invariant(claude.type === "http" && /\/mcp$/.test(claude.url), "Claude remote schema is invalid");
+  invariant(claude.type === "http" && claude.url === "https://continuitydb.example/mcp",
+    "Claude remote schema or endpoint is invalid");
   invariant(claude.headers.Authorization === "Bearer ${CONTINUITYDB_MCP_TOKEN}",
     "Claude example must contain only a token placeholder");
 
   const opencode = JSON.parse(readRepositoryFile("examples/clients/opencode.json"));
   validated.push("examples/clients/opencode.json");
-  invariant(opencode.mcp.continuitydb.type === "remote" && /\/mcp$/.test(opencode.mcp.continuitydb.url),
-    "OpenCode remote schema is invalid");
-  invariant(opencode.mcp.continuitydb.oauth === false &&
+  invariant(opencode.$schema === "https://opencode.ai/config.json",
+    "OpenCode example schema reference is stale");
+  invariant(opencode.mcp.continuitydb.type === "remote"
+    && opencode.mcp.continuitydb.url === "https://continuitydb.example/mcp",
+  "OpenCode remote schema or endpoint is invalid");
+  invariant(opencode.mcp.continuitydb.enabled === true && opencode.mcp.continuitydb.oauth === false
+    && opencode.mcp.continuitydb.timeout === 30_000 &&
     opencode.mcp.continuitydb.headers.Authorization === "Bearer {env:CONTINUITYDB_MCP_TOKEN}",
   "OpenCode example must use its environment placeholder");
+  assert.deepEqual(opencode.plugin, ["./.opencode/plugins/continuitydb.js"],
+    "OpenCode plugin reference must point to the generated project plugin");
 
-  for (const path of ["examples/clients/codex.remote.config.toml", "examples/clients/codex.stdio.config.toml"]) {
-    const value = readRepositoryFile(path);
-    validated.push(path);
-    invariant(/\[mcp_servers\.continuitydb\]/.test(value) && /required = true/.test(value), `${path} is incomplete`);
-    invariant(/default_tools_approval_mode = "writes"/.test(value), `${path} omits write approval mode`);
-  }
-  invariant(/bearer_token_env_var = "CONTINUITYDB_MCP_TOKEN"/.test(
-    readRepositoryFile("examples/clients/codex.remote.config.toml")), "Codex remote example omits token reference");
+  validateCodexExample("examples/clients/codex.remote.config.toml", "remote");
+  validated.push("examples/clients/codex.remote.config.toml");
+  validateCodexExample("examples/clients/codex.stdio.config.toml", "stdio");
+  validated.push("examples/clients/codex.stdio.config.toml");
 
   const opencodePlugin = readRepositoryFile("examples/clients/opencode-continuitydb.js");
   validated.push("examples/clients/opencode-continuitydb.js");
+  const pluginCheck = spawnSync(process.execPath, ["--check", join(examplesRoot, "clients", "opencode-continuitydb.js")],
+    { encoding: "utf8" });
+  invariant(pluginCheck.status === 0, `OpenCode shipped plugin syntax is invalid: ${pluginCheck.stderr}`);
   invariant(opencodePlugin.includes("experimental.session.compacting") && opencodePlugin.includes("session.idle"),
     "OpenCode shipped plugin example omits lifecycle handlers");
   invariant(opencodePlugin.includes("CONTINUITYDB_PROJECT_ID") && opencodePlugin.includes("not saved"),
@@ -226,13 +272,31 @@ function validateVersionedRemoteExamples() {
   const vscode = JSON.parse(readRepositoryFile("examples/mcp.vscode.example.json"));
   validated.push("examples/mcp.vscode.example.json");
   const vscodeServer = vscode.servers?.continuitydb;
-  invariant(vscodeServer?.type === "stdio" && vscodeServer.env?.CONTINUITYDB_ALLOWED_PROJECTS === "service-a,schema-a",
-    "VS Code stdio example schema or concrete project scope is invalid");
+  invariant(vscodeServer?.type === "stdio" && vscodeServer.command === "continuitydb",
+    "VS Code stdio example schema or command is invalid");
+  assert.deepEqual(vscodeServer.args, ["mcp", "--home", "/absolute/private/path/continuitydb-data"],
+    "VS Code stdio example arguments are stale");
+  assert.deepEqual(vscodeServer.env, {
+    CONTINUITYDB_TENANT_ID: "example-org",
+    CONTINUITYDB_PRINCIPAL_ID: "copilot-agent-1",
+    CONTINUITYDB_OWNER_ID: "example-user",
+    CONTINUITYDB_AGENT_ID: "copilot",
+    CONTINUITYDB_ALLOWED_PROJECTS: "service-a,schema-a",
+    CONTINUITYDB_ALLOWED_SENSITIVITIES: "public,private",
+    CONTINUITYDB_CAPTURE_POLICY_FILE: "/absolute/private/path/capture-policy.json",
+  }, "VS Code stdio identity or concrete project scope is stale");
   const remoteVscode = JSON.parse(readRepositoryFile("examples/mcp.remote.vscode.example.json"));
   validated.push("examples/mcp.remote.vscode.example.json");
-  invariant(remoteVscode.servers?.continuitydb?.type === "stdio"
-    && remoteVscode.servers.continuitydb.env?.CONTINUITYDB_HTTP_URL === "http://127.0.0.1:7331",
-  "VS Code remote thin-stdio example schema is invalid");
+  assert.deepEqual(remoteVscode, {
+    servers: {
+      continuitydb: {
+        type: "stdio",
+        command: "continuitydb",
+        args: ["mcp"],
+        env: { CONTINUITYDB_HTTP_URL: "http://127.0.0.1:7331" },
+      },
+    },
+  }, "VS Code remote thin-stdio example schema is stale");
   const exampleText = [
     JSON.stringify(copilot),
     JSON.stringify(claude),
@@ -240,6 +304,9 @@ function validateVersionedRemoteExamples() {
     ...GENERATED_EXAMPLES.map(readRepositoryFile),
     readRepositoryFile("examples/clients/codex.remote.config.toml"),
     readRepositoryFile("examples/clients/codex.stdio.config.toml"),
+    opencodePlugin,
+    JSON.stringify(vscode),
+    JSON.stringify(remoteVscode),
   ].join("\n");
   invariant(!/Bearer\s+(?!\$|\{env:)[A-Za-z0-9._-]{24,}/.test(exampleText),
     "client examples must not contain a bearer-token value");
@@ -267,7 +334,7 @@ function validateRepositoryAdapters() {
     const result = validateGeneratedAdapterTree(projectDir, { home, projectId });
     const validatedExamples = [
       ...validateGeneratedExamples(projectDir, home),
-      ...validateVersionedRemoteExamples(),
+      ...validateVersionedExamples(),
     ].sort();
     const shippedExamples = discoverClientExamples();
     assert.deepEqual(validatedExamples, shippedExamples,
@@ -276,6 +343,7 @@ function validateRepositoryAdapters() {
       ...result,
       generated_examples: [...GENERATED_EXAMPLES],
       shipped_examples: shippedExamples.length,
+      semantically_validated_examples: validatedExamples.length,
       standalone_tree_validator: true,
     };
   } finally {
