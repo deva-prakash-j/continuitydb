@@ -44,6 +44,24 @@ function requireRemoteStableTagResolver(command, message) {
   invariant(command.includes('[[ "$object_type" == "commit" ]]'), message);
 }
 
+function requireFreshStableStateVerifier(command, message) {
+  const match = command.match(/verify_stable_release_state\(\)\s*\{([\s\S]*?)\n\s*\}/);
+  invariant(match, message);
+  const body = match[1];
+  invariant(body.includes("package.json") &&
+    body.includes('[[ "$GITHUB_REF_NAME" == "v${package_version}" ]]') &&
+    body.includes('[[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]'), message);
+  invariant(body.includes(
+    'git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"'), message);
+  invariant(body.includes(
+    'git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main'), message);
+  invariant(body.includes(
+    'local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"') &&
+    body.includes('[[ "$local_tag_sha" == "$GITHUB_SHA" ]]'), message);
+  invariant(body.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
+    body.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'), message);
+}
+
 export function validateReleaseWorkflow(document) {
   invariant(document?.on?.pull_request !== undefined,
     "pull_request trigger is required so native release gates run before merge");
@@ -130,6 +148,10 @@ export function validateReleaseWorkflow(document) {
   invariant(stableGateCommand.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
     stableGateCommand.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'),
   "remote stable tag must resolve to the exact workflow commit");
+  requireFreshStableStateVerifier(stableGateCommand,
+    "stable release eligibility requires the complete reusable stable-state verifier");
+  invariant(/\}\s+verify_stable_release_state\s*$/.test(stableGateCommand),
+    "stable release eligibility must invoke the reusable stable-state verifier");
   const downloadIndex = actionIndex(publishSteps, "actions/download-artifact@");
   const verifyIndex = publishSteps.findIndex((step) => String(step.name || "").includes("Verify complete native release set"));
   const attestIndex = actionIndex(publishSteps, "actions/attest-build-provenance@");
@@ -171,19 +193,21 @@ export function validateReleaseWorkflow(document) {
   requireBlockingStep(publishSteps[releaseIndex], "release publication must be blocking");
   requireRemoteStableTagResolver(releaseCommand,
     "stable tag target must be resolved through the Git tag API before release mutation");
+  requireFreshStableStateVerifier(releaseCommand,
+    "stable tag target and fresh ancestry checks are required before release mutation");
   invariant(releaseCommand.includes('if [[ "$RELEASE_PRERELEASE" == "false" ]]; then'),
     "stable tag target condition must run before release mutation");
-  const stablePreMutationCheck = releaseCommand.indexOf('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]');
-  const firstReleaseMutation = Math.min(
-    ...["gh release upload", "gh release create"]
-      .map((needle) => releaseCommand.indexOf(needle))
-      .filter((index) => index >= 0),
-  );
-  invariant(releaseCommand.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
-    stablePreMutationCheck >= 0 && stablePreMutationCheck < firstReleaseMutation,
-  "stable tag target must match the exact workflow commit before release mutation");
+  invariant(
+    /if \[\[ "\$RELEASE_PRERELEASE" == "false" \]\]; then\s+verify_stable_release_state\s+fi\s+gh release upload/.test(releaseCommand),
+    "fresh ancestry and tag checks must run immediately before stable upload");
+  invariant(
+    /else\s+verify_stable_release_state\s+gh release create "\$RELEASE_TAG" release\/\*/.test(releaseCommand),
+    "fresh ancestry and tag checks must run immediately before stable create");
   invariant(releaseCommand.includes('[[ "$existing_prerelease" == "false" ]]'),
     "an existing stable release must remain a non-prerelease before refresh");
+  invariant(releaseCommand.includes('--json isDraft --jq \'\.isDraft\'') &&
+    releaseCommand.includes('[[ "$existing_draft" == "false" ]]'),
+  "an existing release must not be a draft before refresh");
 
   const publishedVerifyCommand = String(publishSteps[publishedVerifyIndex]?.run || "");
   const publishedVerifyEnvironment = publishSteps[publishedVerifyIndex]?.env || {};
@@ -208,14 +232,21 @@ export function validateReleaseWorkflow(document) {
     "post-publication release verification must be blocking");
   requireRemoteStableTagResolver(publishedVerifyCommand,
     "stable tag target must be resolved through the Git tag API after publication");
+  requireFreshStableStateVerifier(publishedVerifyCommand,
+    "stable tag target and fresh ancestry checks are required after publication");
   invariant(publishedVerifyCommand.includes('if [[ "$RELEASE_PRERELEASE" == "true" ]]; then'),
     "stable tag target condition must run after publication");
+  invariant(/else\s+published_tag=[\s\S]*?\[\[ "\$published_prerelease" == "false" \]\]\s+verify_stable_release_state\s+fi/.test(publishedVerifyCommand),
+    "fresh ancestry and tag checks must run after stable release metadata inspection and publication");
   invariant(publishedVerifyCommand.includes('published_tag="$(gh release view "$RELEASE_TAG"') &&
     publishedVerifyCommand.includes('[[ "$published_tag" == "$GITHUB_REF_NAME" ]]'),
   "published stable release must retain the exact pushed tag name");
   invariant(publishedVerifyCommand.includes('stable_tag_sha="$(resolve_remote_tag_commit)"') &&
     publishedVerifyCommand.includes('[[ "$stable_tag_sha" == "$GITHUB_SHA" ]]'),
   "stable tag target must match the exact workflow commit after publication");
+  invariant(publishedVerifyCommand.includes('--json isDraft --jq \'\.isDraft\'') &&
+    publishedVerifyCommand.includes('[[ "$published_draft" == "false" ]]'),
+  "the published release must not be a draft");
   return { valid: true, native_targets: [...names].sort(), client_adapters_verified: true };
 }
 

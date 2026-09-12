@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -351,6 +352,91 @@ test("stable release mutation and post-publication verification recheck exact re
   assert.throws(() => validateReleaseWorkflow(wrongPostCondition), /stable tag target condition.*after publication/i);
 });
 
+test("stable mutation branches freshly recheck main ancestry and tag immediately before mutation", () => {
+  const publish = workflow.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  const verify = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+
+  assert.match(publish.run, /verify_stable_release_state\(\)/);
+  assert.match(
+    publish.run,
+    /if \[\[ "\$RELEASE_PRERELEASE" == "false" \]\]; then\s+verify_stable_release_state\s+fi\s+gh release upload/,
+  );
+  assert.match(
+    publish.run,
+    /else\s+verify_stable_release_state\s+gh release create "\$RELEASE_TAG" release\/\*/,
+  );
+  assert.match(verify.run, /verify_stable_release_state\(\)/);
+  assert.match(
+    verify.run,
+    /else\s+published_tag=[\s\S]*?\[\[ "\$published_prerelease" == "false" \]\]\s+verify_stable_release_state\s+fi/,
+  );
+
+  const staleUploadAncestry = structuredClone(workflow);
+  staleUploadAncestry.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    .run = publish.run.replace(
+      /if \[\[ "\$RELEASE_PRERELEASE" == "false" \]\]; then\s+verify_stable_release_state\s+fi\s+gh release upload/,
+      'if [[ "$RELEASE_PRERELEASE" == "false" ]]; then\n              resolve_remote_tag_commit >/dev/null\n            fi\n            gh release upload',
+    );
+  assert.throws(() => validateReleaseWorkflow(staleUploadAncestry), /fresh ancestry and tag checks.*stable upload/i);
+
+  const staleCreateAncestry = structuredClone(workflow);
+  staleCreateAncestry.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    .run = publish.run.replace(
+      /else\s+verify_stable_release_state\s+gh release create "\$RELEASE_TAG" release\/\*/,
+      'else\n            resolve_remote_tag_commit >/dev/null\n            gh release create "$RELEASE_TAG" release/*',
+    );
+  assert.throws(() => validateReleaseWorkflow(staleCreateAncestry), /fresh ancestry and tag checks.*stable create/i);
+
+  const stalePostAncestry = structuredClone(workflow);
+  stalePostAncestry.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"))
+    .run = verify.run.replace(
+      /\[\[ "\$published_prerelease" == "false" \]\]\s+verify_stable_release_state/,
+      '[[ "$published_prerelease" == "false" ]]',
+    );
+  assert.throws(() => validateReleaseWorkflow(stalePostAncestry), /fresh ancestry and tag checks.*after stable release metadata/i);
+
+  for (const [name, mutate] of [
+    ["package identity", (run) => run.replace('[[ "$GITHUB_REF_NAME" == "v${package_version}" ]]', "true")],
+    ["local tag identity", (run) => run.replace('[[ "$local_tag_sha" == "$GITHUB_SHA" ]]', "true")],
+  ]) {
+    const incomplete = structuredClone(workflow);
+    const step = incomplete.jobs.publish.steps.find((candidate) => String(candidate.run || "").includes("gh release create"));
+    step.run = mutate(step.run);
+    assert.throws(
+      () => validateReleaseWorkflow(incomplete),
+      /stable tag target and fresh ancestry checks.*before release mutation/i,
+      name,
+    );
+  }
+});
+
+test("existing and published releases must be non-draft", () => {
+  const publish = workflow.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  const verify = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+
+  assert.match(publish.run, /--json isDraft --jq '\.isDraft'/);
+  assert.match(publish.run, /\[\[ "\$existing_draft" == "false" \]\]/);
+  assert.match(verify.run, /--json isDraft --jq '\.isDraft'/);
+  assert.match(verify.run, /\[\[ "\$published_draft" == "false" \]\]/);
+
+  const noExistingDraftGate = structuredClone(workflow);
+  noExistingDraftGate.jobs.publish.steps
+    .find((step) => String(step.run || "").includes("gh release create"))
+    .run = publish.run.replace('[[ "$existing_draft" == "false" ]]', "true");
+  assert.throws(() => validateReleaseWorkflow(noExistingDraftGate), /existing release must not be a draft/i);
+
+  const noPublishedDraftGate = structuredClone(workflow);
+  noPublishedDraftGate.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"))
+    .run = verify.run.replace('[[ "$published_draft" == "false" ]]', "true");
+  assert.throws(() => validateReleaseWorkflow(noPublishedDraftGate), /published release must not be a draft/i);
+});
+
 function runStableShell({
   refName = "v0.7.0",
   sha,
@@ -358,6 +444,11 @@ function runStableShell({
   remoteTagSha = sha,
   mutationRemoteTagSha = remoteTagSha,
   existing = false,
+  draft = false,
+  prerelease = false,
+  target = sha,
+  moveTagDuringReleaseLookup = "",
+  moveMainDuringReleaseLookup = "",
 }) {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-stable-release-"));
   const bin = join(root, "bin");
@@ -365,15 +456,19 @@ function runStableShell({
   mkdirSync(bin);
   mkdirSync(join(root, "release"));
   writeFileSync(calls, "", "utf8");
+  const tagState = join(root, "remote-tag-state");
+  const mainState = join(root, "main-state");
+  writeFileSync(tagState, remoteTagSha, "utf8");
+  writeFileSync(mainState, String(mainAncestor), "utf8");
   writeFileSync(join(root, "package.json"), JSON.stringify({ version: "0.7.0" }), "utf8");
   writeFileSync(join(root, "release", "continuitydb-linux-x64"), "fixture", "utf8");
 
   const fakeGit = join(bin, "git");
-  writeFileSync(fakeGit, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'git %s\\n' "$*" >> "$CALL_LOG"\ncase "$1" in\n  fetch) exit 0 ;;\n  merge-base) [[ "$MAIN_ANCESTOR" == true ]] ;;\n  rev-parse) printf '%s\\n' "$REMOTE_TAG_SHA" ;;\n  *) exit 2 ;;\nesac\n`, "utf8");
+  writeFileSync(fakeGit, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'git %s\\n' "$*" >> "$CALL_LOG"\ncase "$1" in\n  fetch) exit 0 ;;\n  merge-base) [[ "$(cat "$MAIN_STATE")" == true ]] ;;\n  rev-parse) printf '%s\\n' "$REMOTE_TAG_SHA" ;;\n  *) exit 2 ;;\nesac\n`, "utf8");
   chmodSync(fakeGit, 0o755);
 
   const fakeGh = join(bin, "gh");
-  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else printf '%s\\n' "$REMOTE_TAG_SHA"; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  [[ "$RELEASE_EXISTS" == true ]] || exit 1\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'false\\n'; fi\n  exit 0\nfi\nexit 0\n`, "utf8");
+  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else cat "$TAG_STATE"; printf '\\n'; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  if [[ -n "$MOVE_TAG_DURING_RELEASE_LOOKUP" ]]; then printf '%s' "$MOVE_TAG_DURING_RELEASE_LOOKUP" > "$TAG_STATE"; fi\n  if [[ -n "$MOVE_MAIN_DURING_RELEASE_LOOKUP" ]]; then printf '%s' "$MOVE_MAIN_DURING_RELEASE_LOOKUP" > "$MAIN_STATE"; fi\n  [[ "$RELEASE_EXISTS" == true ]] || exit 1\n  if [[ "$*" == *"isPrerelease"* ]]; then printf '%s\\n' "$RELEASE_PRERELEASE_STATE"; fi\n  if [[ "$*" == *"isDraft"* ]]; then printf '%s\\n' "$RELEASE_DRAFT"; fi\n  if [[ "$*" == *"targetCommitish"* ]]; then printf '%s\\n' "$RELEASE_TARGET"; fi\n  exit 0\nfi\nexit 0\n`, "utf8");
   chmodSync(fakeGh, 0o755);
 
   const stableGate = workflow.jobs.publish.steps
@@ -384,8 +479,15 @@ function runStableShell({
     PATH: `${bin}:${process.env.PATH}`,
     CALL_LOG: calls,
     MAIN_ANCESTOR: String(mainAncestor),
+    MAIN_STATE: mainState,
     REMOTE_TAG_SHA: remoteTagSha,
+    TAG_STATE: tagState,
     RELEASE_EXISTS: String(existing),
+    RELEASE_DRAFT: String(draft),
+    RELEASE_PRERELEASE_STATE: String(prerelease),
+    RELEASE_TARGET: target,
+    MOVE_TAG_DURING_RELEASE_LOOKUP: moveTagDuringReleaseLookup,
+    MOVE_MAIN_DURING_RELEASE_LOOKUP: moveMainDuringReleaseLookup,
     GITHUB_REF: `refs/tags/${refName}`,
     GITHUB_REF_NAME: refName,
     GITHUB_SHA: sha,
@@ -404,6 +506,8 @@ function runStableShell({
   });
   let mutation = null;
   if (eligibility.status === 0) {
+    writeFileSync(tagState, mutationRemoteTagSha, "utf8");
+    writeFileSync(mainState, String(mainAncestor), "utf8");
     mutation = spawnSync("bash", ["-c", `${fakeCommands}${publish.run}`], {
       cwd: root,
       env: { ...commonEnv, REMOTE_TAG_SHA: mutationRemoteTagSha },
@@ -446,6 +550,146 @@ test("stable execution gate fails before release mutation and accepts only the e
   assert.equal(existing.eligibility.status, 0, existing.eligibility.stderr);
   assert.equal(existing.mutation.status, 0, existing.mutation.stderr);
   assert.match(existing.calls, /gh release upload v0\.7\.0/);
+});
+
+test("stable execution rechecks lookup-time tag and main movement and rejects draft uploads", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+
+  const tagMovedDuringLookup = runStableShell({
+    sha,
+    existing: true,
+    moveTagDuringReleaseLookup: "e".repeat(40),
+  });
+  assert.equal(tagMovedDuringLookup.eligibility.status, 0, tagMovedDuringLookup.eligibility.stderr);
+  assert.notEqual(tagMovedDuringLookup.mutation.status, 0);
+  assert.doesNotMatch(tagMovedDuringLookup.calls, /gh release upload v0\.7\.0/);
+
+  const tagMovedDuringMissingLookup = runStableShell({
+    sha,
+    moveTagDuringReleaseLookup: "d".repeat(40),
+  });
+  assert.equal(tagMovedDuringMissingLookup.eligibility.status, 0, tagMovedDuringMissingLookup.eligibility.stderr);
+  assert.notEqual(tagMovedDuringMissingLookup.mutation.status, 0);
+  assert.doesNotMatch(tagMovedDuringMissingLookup.calls, /gh release create v0\.7\.0/);
+
+  const mainMovedDuringLookup = runStableShell({
+    sha,
+    existing: true,
+    moveMainDuringReleaseLookup: "false",
+  });
+  assert.equal(mainMovedDuringLookup.eligibility.status, 0, mainMovedDuringLookup.eligibility.stderr);
+  assert.notEqual(mainMovedDuringLookup.mutation.status, 0);
+  assert.doesNotMatch(mainMovedDuringLookup.calls, /gh release upload v0\.7\.0/);
+
+  const stableDraft = runStableShell({ sha, existing: true, draft: true });
+  assert.equal(stableDraft.eligibility.status, 0, stableDraft.eligibility.stderr);
+  assert.notEqual(stableDraft.mutation.status, 0);
+  assert.doesNotMatch(stableDraft.calls, /gh release upload v0\.7\.0/);
+});
+
+test("existing main prerelease rejects draft state before refresh", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-main-draft-"));
+  const bin = join(root, "bin");
+  const calls = join(root, "calls");
+  mkdirSync(bin);
+  mkdirSync(join(root, "release"));
+  writeFileSync(calls, "", "utf8");
+  writeFileSync(join(root, "release", "continuitydb-linux-x64"), "fixture", "utf8");
+  const fakeGh = join(bin, "gh");
+  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "release view" ]]; then\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'true\\n'; fi\n  if [[ "$*" == *"isDraft"* ]]; then printf 'true\\n'; fi\n  if [[ "$*" == *"targetCommitish"* ]]; then printf '%s\\n' "$GITHUB_SHA"; fi\n  exit 0\nfi\nexit 0\n`, "utf8");
+  chmodSync(fakeGh, 0o755);
+  const publish = workflow.jobs.publish.steps.find((step) => String(step.run || "").includes("gh release create"));
+  const result = spawnSync("bash", ["-c", `gh() { "$FAKE_GH" "$@"; }\n${publish.run}`], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      CALL_LOG: calls,
+      FAKE_GH: fakeGh,
+      GH_REPO: "test/repo",
+      GITHUB_REF: "refs/heads/main",
+      GITHUB_SHA: sha,
+      RELEASE_TAG: `main-${sha}`,
+      RELEASE_TITLE: `ContinuityDB main build ${sha.slice(0, 12)}`,
+      RELEASE_PRERELEASE: "true",
+    },
+    encoding: "utf8",
+  });
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(readFileSync(calls, "utf8"), /gh release upload/);
+});
+
+function runPublishedStableShell({ sha, draft = false, mainAncestor = true, remoteTagSha = sha }) {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-published-stable-"));
+  const bin = join(root, "bin");
+  const calls = join(root, "calls");
+  const release = join(root, "release");
+  const mainState = join(root, "main-state");
+  const tagState = join(root, "tag-state");
+  mkdirSync(bin);
+  mkdirSync(release);
+  writeFileSync(calls, "", "utf8");
+  writeFileSync(mainState, String(mainAncestor), "utf8");
+  writeFileSync(tagState, remoteTagSha, "utf8");
+  writeFileSync(join(root, "package.json"), JSON.stringify({ version: "0.7.0" }), "utf8");
+  for (const name of ["continuitydb-linux-x64", "continuitydb-darwin-arm64", "continuitydb-win32-x64.exe"]) {
+    const body = `fixture:${name}`;
+    writeFileSync(join(release, name), body, "utf8");
+    const digest = createHash("sha256").update(body).digest("hex");
+    writeFileSync(join(release, `${name}.sha256`), `${digest}  ${name}\n`, "utf8");
+  }
+
+  const fakeGit = join(bin, "git");
+  writeFileSync(fakeGit, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'git %s\\n' "$*" >> "$CALL_LOG"\ncase "$1" in\n  fetch) exit 0 ;;\n  merge-base) [[ "$(cat "$MAIN_STATE")" == true ]] ;;\n  rev-parse) printf '%s\\n' "$GITHUB_SHA" ;;\n  *) exit 2 ;;\nesac\n`, "utf8");
+  chmodSync(fakeGit, 0o755);
+  const fakeGh = join(bin, "gh");
+  writeFileSync(fakeGh, `#!/usr/bin/env bash\nset -euo pipefail\nprintf 'gh %s\\n' "$*" >> "$CALL_LOG"\nif [[ "$1 $2" == "api repos/test/repo/git/ref/tags/$GITHUB_REF_NAME" ]]; then\n  if [[ "$*" == *".object.type"* ]]; then printf 'commit\\n'; else cat "$TAG_STATE"; printf '\\n'; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release view" ]]; then\n  if [[ "$*" == *"isPrerelease"* ]]; then printf 'false\\n'; fi\n  if [[ "$*" == *"isDraft"* ]]; then printf '%s\\n' "$RELEASE_DRAFT"; fi\n  if [[ "$*" == *"tagName"* ]]; then printf '%s\\n' "$GITHUB_REF_NAME"; fi\n  exit 0\nfi\nif [[ "$1 $2" == "release download" ]]; then\n  destination=''\n  while (( $# > 0 )); do\n    if [[ "$1" == "--dir" ]]; then destination="$2"; break; fi\n    shift\n  done\n  cp "$SOURCE_RELEASE_DIR"/* "$destination"/\n  exit 0\nfi\nif [[ "$1 $2" == "attestation verify" ]]; then exit 0; fi\nexit 2\n`, "utf8");
+  chmodSync(fakeGh, 0o755);
+  const verify = workflow.jobs.publish.steps
+    .find((step) => String(step.name || "").includes("Verify published release assets"));
+  const result = spawnSync("bash", ["-c", `git() { "$FAKE_GIT" "$@"; }\ngh() { "$FAKE_GH" "$@"; }\n${verify.run}`], {
+    cwd: root,
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      CALL_LOG: calls,
+      FAKE_GIT: fakeGit,
+      FAKE_GH: fakeGh,
+      MAIN_STATE: mainState,
+      TAG_STATE: tagState,
+      SOURCE_RELEASE_DIR: release,
+      RELEASE_DRAFT: String(draft),
+      GH_REPO: "test/repo",
+      GITHUB_REF: "refs/tags/v0.7.0",
+      GITHUB_REF_NAME: "v0.7.0",
+      GITHUB_SHA: sha,
+      RELEASE_TAG: "v0.7.0",
+      RELEASE_PRERELEASE: "false",
+    },
+    encoding: "utf8",
+  });
+  return { result, calls: readFileSync(calls, "utf8") };
+}
+
+test("post-publication execution requires non-draft state and fresh stable identity", () => {
+  const sha = "0123456789abcdef0123456789abcdef01234567";
+
+  const valid = runPublishedStableShell({ sha });
+  assert.equal(valid.result.status, 0, `${valid.result.stderr}\n${valid.calls}`);
+  assert.match(valid.calls, /gh release download v0\.7\.0/);
+
+  const draft = runPublishedStableShell({ sha, draft: true });
+  assert.notEqual(draft.result.status, 0);
+  assert.doesNotMatch(draft.calls, /gh release download/);
+
+  const unmerged = runPublishedStableShell({ sha, mainAncestor: false });
+  assert.notEqual(unmerged.result.status, 0);
+  assert.doesNotMatch(unmerged.calls, /gh release download/);
+
+  const movedTag = runPublishedStableShell({ sha, remoteTagSha: "f".repeat(40) });
+  assert.notEqual(movedTag.result.status, 0);
+  assert.doesNotMatch(movedTag.calls, /gh release download/);
 });
 
 test("release check builds the standalone binary before the generated Codex config probe", () => {

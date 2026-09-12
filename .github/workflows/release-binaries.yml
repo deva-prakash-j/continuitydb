@@ -88,17 +88,19 @@ jobs:
             printf '%s\n' "$object_sha"
           }
 
-          package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
-          [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
-          [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
+            stable_tag_sha="$(resolve_remote_tag_commit)"
+            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          }
 
-          git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
-          git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
-
-          local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
-          [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
-          stable_tag_sha="$(resolve_remote_tag_commit)"
-          [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          verify_stable_release_state
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           pattern: continuitydb-*
@@ -164,19 +166,31 @@ jobs:
             printf '%s\n' "$object_sha"
           }
 
-          if [[ "$RELEASE_PRERELEASE" == "false" ]]; then
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
             stable_tag_sha="$(resolve_remote_tag_commit)"
             [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
-          fi
+          }
 
           if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
             existing_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+            existing_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq '.isDraft')"
+            [[ "$existing_draft" == "false" ]]
             if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
               existing_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
               [[ "$existing_target" == "$GITHUB_SHA" ]]
               [[ "$existing_prerelease" == "true" ]]
             else
               [[ "$existing_prerelease" == "false" ]]
+            fi
+            if [[ "$RELEASE_PRERELEASE" == "false" ]]; then
+              verify_stable_release_state
             fi
             gh release upload "$RELEASE_TAG" release/* --clobber --repo "$GH_REPO"
           elif [[ "$RELEASE_PRERELEASE" == "true" ]]; then
@@ -187,6 +201,7 @@ jobs:
               --generate-notes \
               --prerelease
           else
+            verify_stable_release_state
             gh release create "$RELEASE_TAG" release/* \
               --repo "$GH_REPO" \
               --verify-tag \
@@ -214,7 +229,21 @@ jobs:
             printf '%s\n' "$object_sha"
           }
 
+          verify_stable_release_state() {
+            package_version="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).version")"
+            [[ "$GITHUB_REF_NAME" == "v${package_version}" ]]
+            [[ "$GITHUB_REF" == "refs/tags/${GITHUB_REF_NAME}" ]]
+            git fetch --force --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main
+            local_tag_sha="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{commit}")"
+            [[ "$local_tag_sha" == "$GITHUB_SHA" ]]
+            stable_tag_sha="$(resolve_remote_tag_commit)"
+            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
+          }
+
           published_prerelease="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')"
+          published_draft="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json isDraft --jq '.isDraft')"
+          [[ "$published_draft" == "false" ]]
           if [[ "$RELEASE_PRERELEASE" == "true" ]]; then
             published_target="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json targetCommitish --jq '.targetCommitish')"
             [[ "$published_target" == "$GITHUB_SHA" ]]
@@ -222,9 +251,8 @@ jobs:
           else
             published_tag="$(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json tagName --jq '.tagName')"
             [[ "$published_tag" == "$GITHUB_REF_NAME" ]]
-            stable_tag_sha="$(resolve_remote_tag_commit)"
-            [[ "$stable_tag_sha" == "$GITHUB_SHA" ]]
             [[ "$published_prerelease" == "false" ]]
+            verify_stable_release_state
           fi
 
           verify_dir="$(mktemp -d)"
