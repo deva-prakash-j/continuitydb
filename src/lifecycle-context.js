@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { ContinuityApiClient, validateTokenEnvironmentName } from "./http-client.js";
+import { linkCheckpointToLatest } from "./lifecycle-lineage.js";
 import { validateProjectId } from "./project-identity.js";
 import { listRegisteredProjects } from "./project-registry.js";
 import { normalizeIdentity, requiredIdentifier } from "./security.js";
@@ -148,7 +149,7 @@ export async function saveLifecycleCheckpoint({
   if (checkpoint.project_id !== fixedProjectId) {
     throw new Error(`checkpoint project ${checkpoint.project_id || "<missing>"} does not match configured project ${fixedProjectId}`);
   }
-  const value = { ...checkpoint };
+  let value = { ...checkpoint };
   if (remoteUrl) {
     const client = remoteClient({ remoteUrl, tokenEnv, env });
     if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
@@ -158,11 +159,7 @@ export async function saveLifecycleCheckpoint({
           task_id: value.task_id,
           branch: value.branch || null,
         });
-        if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
-          value.previous_checkpoint_id = latest.handoff.checkpoint_id;
-        } else if (latest.handoff.previous_checkpoint_id) {
-          value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
-        }
+        value = linkCheckpointToLatest(value, latest);
       } catch (error) {
         if (error.statusCode !== 404) throw error;
       }
@@ -191,11 +188,7 @@ export async function saveLifecycleCheckpoint({
         branch: value.branch || null,
         allowed_sensitivities: identity.allowed_sensitivities,
       });
-      if (latest && latest.handoff.checkpoint_id !== value.checkpoint_id) {
-        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
-      } else if (latest?.handoff.previous_checkpoint_id) {
-        value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
-      }
+      value = linkCheckpointToLatest(value, latest);
     }
     const input = {
       ...value,

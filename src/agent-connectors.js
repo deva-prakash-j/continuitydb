@@ -1057,6 +1057,7 @@ function prepareOpenCodeChanges(rawOptions, action, identity) {
       home: options.home,
       url: options.url,
       tokenEnv: options.tokenEnv,
+      executable: executable(options),
       tenantId: options.tenantId,
       ownerId: options.ownerId,
       sensitivities: options.sensitivities,

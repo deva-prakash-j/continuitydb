@@ -19,14 +19,21 @@ async function importGenerated(root, options) {
 }
 
 function installHookWrapper(root) {
-  const bin = join(root, "bin");
+  return installHookExecutable(root).bin;
+}
+
+function installHookExecutable(root, {
+  directory = "bin",
+  name = "continuitydb",
+} = {}) {
+  const bin = join(root, directory);
   mkdirSync(bin);
-  const path = join(bin, "continuitydb");
-  const module = join(bin, "hook-wrapper.mjs");
+  const path = join(bin, name);
+  const module = join(root, `hook-wrapper-${crypto.randomUUID()}.mjs`);
   writeFileSync(module, `import { runLifecycleHook } from ${JSON.stringify(pathToFileURL(SOURCE_HOOK).href)};\nif (process.argv[2] === "hook") process.argv.splice(2, 1);\nprocess.exitCode = await runLifecycleHook();\n`);
   writeFileSync(path, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(module)} "$@"\n`);
   chmodSync(path, 0o700);
-  return bin;
+  return { bin, path };
 }
 
 function seedLocal(root, projectId) {
@@ -116,6 +123,46 @@ test("optional OpenCode task id skips latest handoff but still recalls bounded c
   }
 });
 
+test("generated local plugin uses the exact configured executable without PATH lookup", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-executable-"));
+  try {
+    const { home, project } = seedLocal(root, "inventory.v2");
+    const executable = installHookExecutable(root, {
+      directory: "custom bin 'quoted' \\path",
+      name: "continuity db 'hook' \\binary",
+    }).path;
+    const module = await importGenerated(root, {
+      projectId: "inventory.v2", transport: "stdio", home, executable,
+      tenantId: "tenant-a", ownerId: "owner-a", sensitivities: ["private"],
+    });
+    const handoff = join(project, ".continuitydb-handoff.json");
+    writeFileSync(handoff, JSON.stringify({
+      project_id: "inventory.v2", task_id: "custom-binary-task", goal: "Use fixed executable",
+      current_state: "CUSTOM_BINARY_CHECKPOINT", checkpoint_id: "custom-binary-checkpoint-1",
+    }));
+    await withEnvironment({
+      PATH: "/usr/bin:/bin",
+      CONTINUITYDB_TASK: "Find LOCAL_OPENCODE_RECALL_MARKER",
+      CONTINUITYDB_TASK_ID: "",
+    }, async () => {
+      const plugin = await module.ContinuityDBPlugin({ directory: project });
+      const output = { context: [] };
+      await plugin["experimental.session.compacting"]({}, output);
+      assert.match(output.context[0], /LOCAL_OPENCODE_RECALL_MARKER/);
+      const result = await plugin.event({ event: { type: "session.idle" } });
+      assert.equal(result.saved, true);
+      const vault = new ContextVault(home);
+      assert.equal(vault.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "custom-binary-task",
+        allowed_sensitivities: ["private"],
+      }).handoff.current_state, "CUSTOM_BINARY_CHECKPOINT");
+      vault.close();
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("renderer validates remote transport and embeds only the token environment reference", () => {
   assert.throws(() => renderOpenCodePlugin({
     projectId: "inventory.v2", transport: "http", url: "http://memory.example/mcp", tokenEnv: "VAULT_TOKEN",
@@ -146,7 +193,7 @@ test("generated remote plugin uses loopback HTTP with an environment token refer
     vault, host: "127.0.0.1", port: 0,
     localIdentity: {
       tenant_id: "tenant-a", principal_id: "opencode-agent", owner_id: "owner-a", agent_id: "opencode",
-      scopes: ["memory:read", "memory:capture"], allowed_projects: ["inventory.v2"], allowed_sensitivities: ["private"],
+      scopes: ["memory:read", "memory:capture"], allowed_projects: ["inventory.v2"], allowed_sensitivities: ["private", "restricted"],
     },
   });
   try {
@@ -163,7 +210,7 @@ test("generated remote plugin uses loopback HTTP with an environment token refer
     const handoff = join(root, "handoff.json");
     writeFileSync(handoff, JSON.stringify({
       project_id: "inventory.v2", task_id: "remote-task", goal: "Continue remotely",
-      current_state: "REMOTE_STRUCTURED_HANDOFF", checkpoint_id: "remote-checkpoint-1",
+      current_state: "REMOTE_STRUCTURED_HANDOFF", checkpoint_id: "remote-checkpoint-1", branch: "main",
     }));
     await withEnvironment({
       OPENCODE_TEST_TOKEN: "test-token-value",
@@ -175,17 +222,96 @@ test("generated remote plugin uses loopback HTTP with an environment token refer
       const output = { context: [] };
       await plugin["experimental.session.compacting"]({}, output);
       assert.match(output.context[0], /REMOTE_OPENCODE_RECALL_MARKER/);
-      await plugin.event({ event: { type: "session.idle" } });
+      const first = await plugin.event({ event: { type: "session.idle" } });
+      assert.equal(first.saved, true);
+      assert.equal(first.duplicate, false);
       assert.equal(vault.latestHandoff({
         tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "remote-task",
+        branch: "main",
         allowed_sensitivities: ["private"],
       }).handoff.current_state, "REMOTE_STRUCTURED_HANDOFF");
+
+      const otherBranch = await fetch(`http://127.0.0.1:${address.port}/v1/handoffs`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          project_id: "inventory.v2", task_id: "remote-task", goal: "Other branch",
+          current_state: "OTHER_BRANCH_HANDOFF", checkpoint_id: "other-branch-checkpoint", branch: "feature",
+        }),
+      });
+      assert.equal(otherBranch.status, 201);
+
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "remote-task", goal: "Continue remotely",
+        current_state: "REMOTE_SUCCESSOR_HANDOFF", checkpoint_id: "remote-checkpoint-2", branch: "main",
+      }));
+      const successor = await plugin.event({ event: { type: "session.idle" } });
+      const retry = await plugin.event({ event: { type: "session.idle" } });
+      assert.equal(successor.saved, true);
+      assert.equal(successor.duplicate, false);
+      assert.equal(retry.saved, true);
+      assert.equal(retry.duplicate, true);
+      assert.equal(retry.memory_id, successor.memory_id);
+      const latest = vault.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "remote-task",
+        branch: "main",
+        allowed_sensitivities: ["private"],
+      });
+      assert.equal(latest.handoff.previous_checkpoint_id, "remote-checkpoint-1");
+      assert.equal(latest.handoff.current_state, "REMOTE_SUCCESSOR_HANDOFF");
+
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "remote-task", goal: "Continue remotely",
+        current_state: "CHANGED_REUSE_MUST_FAIL", checkpoint_id: "remote-checkpoint-2", branch: "main",
+      }));
+      await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /not saved/i);
+      assert.equal(vault.latestHandoff({
+        tenant_id: "tenant-a", owner_id: "owner-a", project_id: "inventory.v2", task_id: "remote-task",
+        branch: "main",
+        allowed_sensitivities: ["private"],
+      }).handoff.current_state, "REMOTE_SUCCESSOR_HANDOFF");
+
+      writeFileSync(handoff, JSON.stringify({
+        project_id: "inventory.v2", task_id: "restricted-task", goal: "Held checkpoint",
+        current_state: "RESTRICTED_HANDOFF", checkpoint_id: "restricted-checkpoint-1", sensitivity: "restricted",
+      }));
+      await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /not saved.*quarantined/i);
 
       writeFileSync(handoff, JSON.stringify({
         project_id: "inventory.v2", task_id: "remote-task", goal: "Reject extra data",
         current_state: "not saved", checkpoint_id: "remote-checkpoint-2", messages: ["forbidden"],
       }));
       await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /unsupported field: messages/);
+    });
+  } finally {
+    await service.close().catch(() => vault.close());
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("generated remote plugin reports denied handoff capture as not saved", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-denied-"));
+  const vault = new ContextVault(join(root, "vault"));
+  const service = createContinuityServer({
+    vault, host: "127.0.0.1", port: 0,
+    localIdentity: {
+      tenant_id: "tenant-a", principal_id: "read-only-agent", owner_id: "owner-a", agent_id: "opencode",
+      scopes: ["memory:read"], allowed_projects: ["inventory.v2"], allowed_sensitivities: ["private"],
+    },
+  });
+  try {
+    const address = await service.listen();
+    const module = await importGenerated(root, {
+      projectId: "inventory.v2", transport: "http",
+      url: `http://127.0.0.1:${address.port}/mcp`, tokenEnv: "OPENCODE_DENIED_TEST_TOKEN",
+    });
+    const handoff = join(root, "handoff.json");
+    writeFileSync(handoff, JSON.stringify({
+      project_id: "inventory.v2", task_id: "denied-task", goal: "Must not bypass read-only",
+      current_state: "DENIED_HANDOFF", checkpoint_id: "denied-checkpoint-1",
+    }));
+    await withEnvironment({ CONTINUITYDB_HANDOFF_FILE: handoff }, async () => {
+      const plugin = await module.ContinuityDBPlugin({ directory: root });
+      await assert.rejects(plugin.event({ event: { type: "session.idle" } }), /not saved.*scope.*memory:capture/i);
     });
   } finally {
     await service.close().catch(() => vault.close());

@@ -244,6 +244,20 @@ test("OpenCode installs complete plugin+policy assets transactionally and idempo
   }
 });
 
+test("OpenCode generated local plugin embeds the exact custom executable path", () => {
+  const value = fixture();
+  const binary = join(value.root, "custom bin 'quoted' \\path", "continuity db 'hook' \\binary");
+  try {
+    const result = connectAgent("opencode", { ...options(value), binary });
+    const plugin = result.assets.find((asset) => asset.kind === "plugin");
+    const source = readFileSync(plugin.path, "utf8");
+    assert.match(source, new RegExp(JSON.stringify(binary).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(source, /execFile\("continuitydb"/);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("OpenCode plugin write failure rolls back config and leaves policy untouched", () => {
   const value = fixture();
   const config = join(value.project, "opencode.json");

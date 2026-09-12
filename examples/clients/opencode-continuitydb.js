@@ -23,7 +23,7 @@ function authHeaders() {
   return token ? { authorization: `Bearer ${token}` } : {};
 }
 
-async function request(path, { method = "GET", body = null } = {}) {
+async function request(path, { method = "GET", body = null, idempotencyKey = null } = {}) {
   const base = new URL(requiredEnv("CONTINUITYDB_HTTP_URL"));
   if (base.username || base.password || base.search || base.hash) throw new Error("ContinuityDB URL must not contain credentials");
   if (base.protocol !== "https:" && !["127.0.0.1", "::1", "localhost"].includes(base.hostname)) {
@@ -32,7 +32,12 @@ async function request(path, { method = "GET", body = null } = {}) {
   if (base.pathname.endsWith("/mcp")) base.pathname = base.pathname.slice(0, -3);
   const response = await fetch(new URL(path, base.href.endsWith("/") ? base : `${base.href}/`), {
     method,
-    headers: { accept: "application/json", ...(body ? { "content-type": "application/json" } : {}), ...authHeaders() },
+    headers: {
+      accept: "application/json",
+      ...(body ? { "content-type": "application/json" } : {}),
+      ...(idempotencyKey ? { "idempotency-key": idempotencyKey } : {}),
+      ...authHeaders(),
+    },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(15_000),
   });
@@ -116,6 +121,48 @@ async function readCheckpoint(path) {
   }
 }
 
+async function saveCheckpoint(checkpoint) {
+  const value = { ...checkpoint };
+  if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
+    const query = new URLSearchParams({
+      project_id: value.project_id,
+      task_id: value.task_id,
+      ...(value.branch ? { branch: value.branch } : {}),
+    });
+    try {
+      const latest = await request(`v1/handoffs/latest?${query}`);
+      if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.checkpoint_id;
+      } else if (latest.handoff.previous_checkpoint_id) {
+        value.previous_checkpoint_id = latest.handoff.previous_checkpoint_id;
+      }
+    } catch (error) {
+      if (error.statusCode !== 404) throw new Error(`not saved: ${error.message}`);
+    }
+  }
+  let result;
+  try {
+    result = await request("v1/handoffs", {
+      method: "POST", body: value, idempotencyKey: value.checkpoint_id,
+    });
+  } catch (error) {
+    throw new Error(`not saved: ${error.message}`);
+  }
+  if (result.disposition !== "active" || result.record?.status !== "active") {
+    throw new Error(`not saved: ContinuityDB handoff disposition=${result.disposition || "missing"} status=${result.record?.status || "missing"}`);
+  }
+  if (typeof result.record.id !== "string" || !result.handoff
+    || result.handoff.checkpoint_id !== value.checkpoint_id) {
+    throw new Error("not saved: ContinuityDB returned an invalid handoff save response");
+  }
+  return {
+    saved: true,
+    duplicate: Boolean(result.duplicate),
+    memory_id: result.record.id,
+    checkpoint_id: result.handoff.checkpoint_id,
+  };
+}
+
 export const ContinuityDBPlugin = async ({ directory }) => ({
   "experimental.session.compacting": async (_input, output) => {
     const scope = taskScope();
@@ -149,6 +196,6 @@ export const ContinuityDBPlugin = async ({ directory }) => ({
     let checkpoint;
     try { checkpoint = await readCheckpoint(path); }
     catch (error) { if (error.code === "ENOENT") return; throw error; }
-    await request("v1/handoffs", { method: "POST", body: checkpoint });
+    return saveCheckpoint(checkpoint);
   },
 });
