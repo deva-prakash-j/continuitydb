@@ -307,6 +307,79 @@ test("Copilot policy markers and unmanaged MCP conflicts fail closed before any 
   }
 });
 
+test("Copilot never infers MCP ownership from a generated-looking server shape", () => {
+  const value = fixture();
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  const original = '{\r\n  "servers": {\r\n    "continuitydb": {\r\n      "type": "stdio",\r\n      "command": "/user/continuitydb",\r\n      "args": ["mcp", "--home", "/user/vault"],\r\n      "env": {\r\n        "CONTINUITYDB_AGENT_ID": "copilot",\r\n        "CONTINUITYDB_ALLOWED_PROJECTS": "service-a"\r\n      }\r\n    }\r\n  },\r\n  "keep": "user-owned"\r\n}\r\n';
+  try {
+    mkdirSync(join(value.project, ".vscode"));
+    writeFileSync(mcp, original);
+    assert.throws(() => connectAgent("copilot", options(value)), /unmanaged Copilot continuitydb server/);
+    assert.equal(readFileSync(mcp, "utf8"), original);
+    assert.equal(existsSync(join(value.project, ".github", "copilot-instructions.md")), false);
+    assert.throws(() => disconnectAgent("copilot", options(value)), /unmanaged Copilot continuitydb server/);
+    assert.equal(readFileSync(mcp, "utf8"), original);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("connector revalidates committed assets and preserves a direct writer between asset commits", () => {
+  const value = fixture();
+  const previousNodeEnv = process.env.NODE_ENV;
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  const policy = join(value.project, ".github", "copilot-instructions.md");
+  const external = '{"external":"writer-wins"}\n';
+  try {
+    process.env.NODE_ENV = "test";
+    assert.throws(() => connectAgent("copilot", {
+      ...options(value),
+      _testAfterCommit: ({ committed }) => {
+        if (committed === 1) writeFileSync(mcp, external, { mode: 0o600 });
+      },
+    }), /(changed after commit verification|rollback was incomplete)/);
+    assert.equal(readFileSync(mcp, "utf8"), external);
+    assert.equal(existsSync(policy), false);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("Copilot JSON connect and disconnect are byte-reversible and remove connector-created containers", () => {
+  const originals = [
+    '{\r\n  "keep" : "spacing",\r\n  "servers" : {\r\n    "other" : { "command" : "other" }\r\n  }\r\n}\r\n',
+    '{\r\n\t"keep": true\r\n}\r\n',
+    '{\r\n  "servers" : {  },\r\n  "keep": true\r\n}\r\n',
+  ];
+  for (const original of originals) {
+    const value = fixture();
+    const mcp = join(value.project, ".vscode", "mcp.json");
+    try {
+      mkdirSync(join(value.project, ".vscode"));
+      writeFileSync(mcp, original);
+      connectAgent("copilot", options(value));
+      assert.notEqual(readFileSync(mcp, "utf8"), original);
+      disconnectAgent("copilot", options(value));
+      assert.equal(readFileSync(mcp, "utf8"), original);
+    } finally {
+      rmSync(value.root, { recursive: true, force: true });
+    }
+  }
+
+  const value = fixture();
+  const mcp = join(value.project, ".vscode", "mcp.json");
+  try {
+    connectAgent("copilot", options(value));
+    assert.equal(existsSync(mcp), true);
+    disconnectAgent("copilot", options(value));
+    assert.equal(existsSync(mcp), false);
+  } finally {
+    rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
 test("Copilot adapter rejects cross-project policy replacement and rolls back MCP on policy races", () => {
   const value = fixture();
   const previousNodeEnv = process.env.NODE_ENV;

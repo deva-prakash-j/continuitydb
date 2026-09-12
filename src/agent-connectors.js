@@ -236,11 +236,71 @@ function atomicWrite(path, content, { root, home, backupHome, client, apply, exp
       path,
       changed: true,
       applied: true,
-      verified: true,
+      verified: false,
       backup: backupArtifacts?.path || null,
       backupArtifacts,
       createdDirectories,
       written: currentSnapshot(path),
+    };
+  } finally {
+    releaseLock();
+  }
+}
+
+function atomicRemove(path, { root, home, backupHome, client, apply, expected, beforeReplace }) {
+  const createdDirectories = ensureSafeParents(root, path, false);
+  if (!apply) {
+    const beforeState = currentSnapshot(path);
+    if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
+    return {
+      path,
+      changed: beforeState.existed,
+      applied: false,
+      verified: !beforeState.existed,
+      backup: null,
+      createdDirectories,
+    };
+  }
+
+  const lockPath = configurationLockPath(path);
+  const releaseLock = acquireFileLock(lockPath);
+  try {
+    const beforeState = currentSnapshot(path);
+    if (expected && !sameSnapshot(beforeState, expected)) throw new Error(`configuration changed after preflight: ${path}`);
+    if (!beforeState.existed) {
+      return { path, changed: false, applied: true, verified: false, backup: null, createdDirectories };
+    }
+    const backupArtifacts = backupExisting(path, join(backupHome || home, "backups"), client);
+    if (backupArtifacts && backupHome && resolve(backupHome) !== resolve(home)) {
+      backupArtifacts.relocatedPath = join(home, relative(backupHome, backupArtifacts.path));
+      backupArtifacts.relocatedCreatedDirectories = backupArtifacts.createdDirectories
+        .map((directory) => join(home, relative(backupHome, directory)));
+      backupArtifacts.publicPath = backupArtifacts.relocatedPath;
+    }
+    try {
+      if (beforeReplace) {
+        if (process.env.NODE_ENV !== "test") throw new Error("connector replace test hook is available only in tests");
+        beforeReplace({ path, lockPath });
+      }
+      if (!sameSnapshot(currentSnapshot(path), beforeState)) {
+        const error = new Error(`configuration changed before atomic removal: ${path}`);
+        error.continuitydbNoWrite = true;
+        throw error;
+      }
+      rmSync(path);
+    } catch (error) {
+      cleanupBackupArtifacts(backupArtifacts);
+      throw error;
+    }
+    return {
+      path,
+      changed: true,
+      applied: true,
+      verified: false,
+      backup: backupArtifacts?.path || null,
+      backupArtifacts,
+      createdDirectories,
+      written: { existed: false, content: null, mode: null },
     };
   } finally {
     releaseLock();
@@ -297,6 +357,16 @@ function publicResult(plan, result) {
     owner: plan.owner,
     ...value,
   };
+}
+
+function verifyCommittedAgentPlans(committed) {
+  for (const { plan, result } of committed) {
+    const expected = result.written || plan.original;
+    if (!sameSnapshot(currentSnapshot(plan.path), expected)) {
+      throw new Error(`configuration changed after commit verification: ${plan.path}`);
+    }
+    result.verified = true;
+  }
 }
 
 function envFor(client, options) {
@@ -395,13 +465,6 @@ function connectedJson(client, current, options) {
   if (client === "opencode") {
     value.$schema ||= "https://opencode.ai/config.json";
     managedJsonNamespace(value, "mcp", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
-  } else if (client === "copilot") {
-    const path = jsonTarget(client, options.projectDir);
-    const servers = managedJsonNamespace(value, "servers", path);
-    if (Object.hasOwn(servers, "continuitydb") && !isManagedCopilotServer(servers.continuitydb)) {
-      throw new Error("an unmanaged Copilot continuitydb server already exists; remove or rename it before connecting");
-    }
-    servers.continuitydb = connection(client, options);
   } else {
     managedJsonNamespace(value, "mcpServers", jsonTarget(client, options.projectDir)).continuitydb = connection(client, options);
   }
@@ -410,37 +473,176 @@ function connectedJson(client, current, options) {
 
 function disconnectedJson(client, current, path) {
   const value = structuredClone(current);
-  const key = client === "opencode" ? "mcp" : client === "copilot" ? "servers" : "mcpServers";
+  const key = client === "opencode" ? "mcp" : "mcpServers";
   if (value[key] !== undefined) {
     const namespace = managedJsonNamespace(value, key, path);
-    if (client === "copilot" && Object.hasOwn(namespace, "continuitydb")
-      && !isManagedCopilotServer(namespace.continuitydb)) {
-      throw new Error("an unmanaged Copilot continuitydb server already exists; refusing to disconnect it");
-    }
     delete namespace.continuitydb;
   }
   return value;
 }
 
-function isManagedCopilotServer(value) {
-  if (!isPlainObject(value)) return false;
-  if (value.type === "stdio") {
-    return typeof value.command === "string"
-      && Array.isArray(value.args)
-      && value.args.length === 3
-      && value.args[0] === "mcp"
-      && value.args[1] === "--home"
-      && typeof value.args[2] === "string"
-      && isPlainObject(value.env)
-      && value.env.CONTINUITYDB_AGENT_ID === "copilot"
-      && typeof value.env.CONTINUITYDB_ALLOWED_PROJECTS === "string"
-      && value.env.CONTINUITYDB_ALLOWED_PROJECTS !== "default";
+function skipJsonWhitespace(text, offset) {
+  let position = offset;
+  while (position < text.length && /\s/.test(text[position])) position += 1;
+  return position;
+}
+
+function scanJsonString(text, offset) {
+  let position = offset + 1;
+  while (position < text.length) {
+    if (text[position] === "\\") {
+      position += 2;
+    } else if (text[position] === '"') {
+      return position + 1;
+    } else {
+      position += 1;
+    }
   }
-  return value.type === "http"
-    && typeof value.url === "string"
-    && isPlainObject(value.headers)
-    && typeof value.headers.Authorization === "string"
-    && /^Bearer \$\{env:[A-Z][A-Z0-9_]{0,127}\}$/.test(value.headers.Authorization);
+  throw new Error("unterminated JSON string");
+}
+
+function scanJsonValue(text, offset) {
+  const start = skipJsonWhitespace(text, offset);
+  if (text[start] === '"') return { type: "scalar", start, end: scanJsonString(text, start) };
+  if (text[start] === "{") return scanJsonObject(text, start);
+  if (text[start] === "[") {
+    let position = start + 1;
+    while (true) {
+      position = skipJsonWhitespace(text, position);
+      if (text[position] === "]") return { type: "array", start, end: position + 1 };
+      const item = scanJsonValue(text, position);
+      position = skipJsonWhitespace(text, item.end);
+      if (text[position] === "]") return { type: "array", start, end: position + 1 };
+      position += 1;
+    }
+  }
+  let end = start;
+  while (end < text.length && !/[\s,}\]]/.test(text[end])) end += 1;
+  return { type: "scalar", start, end };
+}
+
+function scanJsonObject(text, start) {
+  const properties = [];
+  let position = start + 1;
+  let precedingComma = null;
+  while (true) {
+    position = skipJsonWhitespace(text, position);
+    if (text[position] === "}") return { type: "object", start, end: position + 1, properties };
+    const keyStart = position;
+    const keyEnd = scanJsonString(text, keyStart);
+    const key = JSON.parse(text.slice(keyStart, keyEnd));
+    position = skipJsonWhitespace(text, keyEnd) + 1;
+    const value = scanJsonValue(text, position);
+    position = skipJsonWhitespace(text, value.end);
+    const commaAfter = text[position] === "," ? position : null;
+    properties.push({ key, keyStart, value, commaBefore: precedingComma, commaAfter });
+    if (commaAfter === null) {
+      position = skipJsonWhitespace(text, position);
+    } else {
+      precedingComma = commaAfter;
+      position = commaAfter + 1;
+    }
+  }
+}
+
+function parseJsonLayout(text, path) {
+  if (!text.trim()) return { value: {}, root: null };
+  const value = JSON.parse(text);
+  if (!isPlainObject(value)) throw new Error(`configuration root must be a JSON object: ${path}`);
+  const root = scanJsonValue(text, 0);
+  if (root.type !== "object") throw new Error(`configuration root must be a JSON object: ${path}`);
+  return { value, root };
+}
+
+function propertyNamed(object, key) {
+  const matches = object?.properties.filter((property) => property.key === key) || [];
+  if (matches.length > 1) throw new Error(`duplicate JSON property is not supported: ${key}`);
+  return matches[0] || null;
+}
+
+function insertJsonProperty(text, object, key, value) {
+  const insertion = object.end - 1;
+  const prefix = object.properties.length ? "," : "";
+  return `${text.slice(0, insertion)}${prefix}${JSON.stringify(key)}:${JSON.stringify(value)}${text.slice(insertion)}`;
+}
+
+function removeJsonProperty(text, object, property) {
+  let start = property.keyStart;
+  let end = property.value.end;
+  if (property.commaAfter !== null) {
+    end = property.commaAfter + 1;
+  } else if (property.commaBefore !== null) {
+    start = property.commaBefore;
+  }
+  return `${text.slice(0, start)}${text.slice(end)}`;
+}
+
+function replaceJsonValue(text, property, value) {
+  return `${text.slice(0, property.value.start)}${JSON.stringify(value)}${text.slice(property.value.end)}`;
+}
+
+function connectCopilotJson(current, path, server, owned) {
+  const layout = parseJsonLayout(current, path);
+  if (layout.root === null) {
+    return {
+      content: `${current}${JSON.stringify({ servers: { continuitydb: server } })}`,
+      ownership: {
+        document: existsSync(path) ? "empty" : "missing",
+        namespace: "created",
+      },
+    };
+  }
+  const servers = propertyNamed(layout.root, "servers");
+  if (servers && servers.value.type !== "object") {
+    throw new Error(`configuration namespace servers must be a JSON object: ${path}`);
+  }
+  const continuitydb = propertyNamed(servers?.value, "continuitydb");
+  if (continuitydb && !owned) {
+    throw new Error("an unmanaged Copilot continuitydb server already exists; remove or rename it before connecting");
+  }
+  if (continuitydb) {
+    return { content: replaceJsonValue(current, continuitydb, server), ownership: owned };
+  }
+  if (servers) {
+    return {
+      content: insertJsonProperty(current, servers.value, "continuitydb", server),
+      ownership: owned || { document: "existing", namespace: "existing" },
+    };
+  }
+  return {
+    content: insertJsonProperty(current, layout.root, "servers", { continuitydb: server }),
+    ownership: owned || { document: "existing", namespace: "created" },
+  };
+}
+
+function disconnectCopilotJson(current, path, ownership) {
+  const layout = parseJsonLayout(current, path);
+  if (layout.root === null) return { content: current, deleteTarget: false };
+  const servers = propertyNamed(layout.root, "servers");
+  if (servers && servers.value.type !== "object") {
+    throw new Error(`configuration namespace servers must be a JSON object: ${path}`);
+  }
+  const continuitydb = propertyNamed(servers?.value, "continuitydb");
+  if (!continuitydb) return { content: current, deleteTarget: false };
+  if (!ownership) {
+    throw new Error("an unmanaged Copilot continuitydb server already exists; refusing to disconnect it");
+  }
+
+  const onlyManagedServer = servers.value.properties.length === 1;
+  const onlyManagedRoot = layout.root.properties.length === 1;
+  if (ownership.namespace === "created" && onlyManagedServer) {
+    if (ownership.document === "missing" && onlyManagedRoot) {
+      return { content: "", deleteTarget: true };
+    }
+    if (ownership.document === "empty" && onlyManagedRoot) {
+      return {
+        content: `${current.slice(0, layout.root.start)}${current.slice(layout.root.end)}`,
+        deleteTarget: false,
+      };
+    }
+    return { content: removeJsonProperty(current, layout.root, servers), deleteTarget: false };
+  }
+  return { content: removeJsonProperty(current, servers.value, continuitydb), deleteTarget: false };
 }
 
 function connectorIdentity(projectDir, options) {
@@ -509,45 +711,72 @@ function prepareMcpAgentChange(client, rawOptions, action, identity = null) {
   };
 }
 
-function prepareDedicatedPolicyChange(client, rawOptions, action, identity) {
-  if (client !== "copilot") return null;
+function copilotPolicyContent(body, ownership) {
+  const firstLineEnd = body.indexOf("\n");
+  const metadata = `<!-- continuitydb managed mcp ownership: document=${ownership.document}; namespace=${ownership.namespace} -->`;
+  return `${body.slice(0, firstLineEnd)}\n${metadata}${body.slice(firstLineEnd)}`;
+}
+
+function prepareCopilotChanges(rawOptions, action, identity) {
+  const client = "copilot";
   const options = normalizeOptions(rawOptions, { identity });
-  const path = join(options.projectDir, ".github", "copilot-instructions.md");
-  const current = readText(path);
-  const metadata = dedicatedPolicyMetadata(current, client);
+  const policyPath = join(options.projectDir, ".github", "copilot-instructions.md");
+  const policyCurrent = readText(policyPath);
+  const metadata = dedicatedPolicyMetadata(policyCurrent, client);
   if (action === "connect" && metadata && metadata.projectId !== identity.id) {
     throw new Error(`ContinuityDB managed Copilot policy belongs to project ${metadata.projectId}, not ${identity.id}`);
   }
-  let content;
-  let owner = "continuitydb-copilot-policy";
+
+  const mcpPath = jsonTarget(client, options.projectDir);
+  const mcpCurrent = readText(mcpPath);
+  const mcpLayout = parseJsonLayout(mcpCurrent, mcpPath);
+  const servers = propertyNamed(mcpLayout.root, "servers");
+  if (servers && servers.value.type !== "object") {
+    throw new Error(`configuration namespace servers must be a JSON object: ${mcpPath}`);
+  }
+  const existingServer = propertyNamed(servers?.value, "continuitydb");
+  if (existingServer && !metadata) {
+    const suffix = action === "connect"
+      ? "remove or rename it before connecting"
+      : "refusing to disconnect it";
+    throw new Error(`an unmanaged Copilot continuitydb server already exists; ${suffix}`);
+  }
+
+  let mcpContent;
+  let ownership = metadata?.ownership || null;
+  let deleteTarget = false;
+  let policyContent;
   if (action === "connect") {
+    const connected = connectCopilotJson(mcpCurrent, mcpPath, connection(client, options), ownership);
+    mcpContent = connected.content;
+    ownership = connected.ownership;
     const descriptor = policyAssetDescriptors(client, {
       projectDir: options.projectDir,
       projectId: identity.id,
       consumers: [client],
     })[0];
-    owner = descriptor.owner;
-    content = mergeManagedText(current, {
+    policyContent = mergeManagedText(policyCurrent, {
       startMarker: POLICY_START,
       endMarker: POLICY_END,
-      body: descriptor.content,
+      body: copilotPolicyContent(descriptor.content, ownership),
     });
   } else {
-    content = removeManagedText(current, { startMarker: POLICY_START, endMarker: POLICY_END });
+    const disconnected = disconnectCopilotJson(mcpCurrent, mcpPath, ownership);
+    mcpContent = disconnected.content;
+    deleteTarget = disconnected.deleteTarget;
+    policyContent = removeManagedText(policyCurrent, { startMarker: POLICY_START, endMarker: POLICY_END });
   }
-  ensureSafeParents(options.projectDir, path, false);
-  return {
-    client,
-    action,
-    options,
-    path,
-    content,
-    original: snapshot(path),
-    kind: "policy",
-    owner,
-    assetClients: [client],
-    noOp: action === "disconnect" && !existsSync(path),
-  };
+  ensureSafeParents(options.projectDir, mcpPath, false);
+  ensureSafeParents(options.projectDir, policyPath, false);
+  return [{
+    client, action, options, path: mcpPath, content: mcpContent, original: snapshot(mcpPath),
+    kind: "mcp", owner: "continuitydb-mcp", assetClients: [client], deleteTarget,
+    noOp: action === "disconnect" && !existsSync(mcpPath),
+  }, {
+    client, action, options, path: policyPath, content: policyContent, original: snapshot(policyPath),
+    kind: "policy", owner: "continuitydb-copilot-policy", assetClients: [client],
+    noOp: action === "disconnect" && !existsSync(policyPath),
+  }];
 }
 
 function dedicatedPolicyMetadata(current, client) {
@@ -561,18 +790,23 @@ function dedicatedPolicyMetadata(current, client) {
   if (firstLine !== `${POLICY_START} consumers: ${client}`) {
     throw new Error(`invalid ContinuityDB managed ${client} policy metadata`);
   }
+  const ownershipMatches = [...block.matchAll(/<!-- continuitydb managed mcp ownership: document=(missing|empty|existing); namespace=(created|existing) -->/g)];
+  if (ownershipMatches.length !== 1) {
+    throw new Error(`invalid ContinuityDB managed ${client} MCP ownership metadata`);
+  }
   const projectMatches = [...block.matchAll(/Project scope: `([^`]+)`\./g)];
   if (projectMatches.length !== 1) {
     throw new Error(`invalid ContinuityDB managed ${client} policy project scope`);
   }
-  return { projectId: validateProjectId(projectMatches[0][1]) };
+  return {
+    projectId: validateProjectId(projectMatches[0][1]),
+    ownership: { document: ownershipMatches[0][1], namespace: ownershipMatches[0][2] },
+  };
 }
 
 function prepareAgentChanges(client, rawOptions, action, identity = null) {
-  const plans = [prepareMcpAgentChange(client, rawOptions, action, identity)];
-  const policy = prepareDedicatedPolicyChange(client, rawOptions, action, identity);
-  if (policy) plans.push(policy);
-  return plans;
+  if (client === "copilot") return prepareCopilotChanges(rawOptions, action, identity);
+  return [prepareMcpAgentChange(client, rawOptions, action, identity)];
 }
 
 function sharedPolicyMetadata(current) {
@@ -653,14 +887,21 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
   }
   if (!plans.every((plan) => plan.options.apply === apply)) throw new Error("agent batch must use one apply mode");
   if (!apply) {
-    return plans.map((plan) => plan.noOp
-      ? publicResult(plan, {
-        path: plan.path, changed: false, applied: false, verified: true, backup: null, createdDirectories: [],
-      })
-      : publicResult(plan, atomicWrite(plan.path, plan.content, {
+    return plans.map((plan) => {
+      if (plan.noOp) {
+        return publicResult(plan, {
+          path: plan.path, changed: false, applied: false, verified: true, backup: null, createdDirectories: [],
+        });
+      }
+      const operationOptions = {
         root: plan.options.projectDir, home: plan.options.home, backupHome: plan.options.backupHome,
         client: plan.client, apply: false, expected: plan.original,
-      })));
+      };
+      const result = plan.deleteTarget
+        ? atomicRemove(plan.path, operationOptions)
+        : atomicWrite(plan.path, plan.content, operationOptions);
+      return publicResult(plan, result);
+    });
   }
 
   const releaseBatchLocks = acquireFileLocks(plans.map((plan) => configurationLockPath(plan.path)));
@@ -679,11 +920,14 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
       const createdDirectories = ensureSafeParents(plan.options.projectDir, plan.path, true);
       let result;
       try {
-        result = atomicWrite(plan.path, plan.content, {
+        const operationOptions = {
           root: plan.options.projectDir, home: plan.options.home, backupHome: plan.options.backupHome,
           client: plan.client, apply: true, expected: plan.original,
           beforeReplace: plan.options._testBeforeReplace,
-        });
+        };
+        result = plan.deleteTarget
+          ? atomicRemove(plan.path, operationOptions)
+          : atomicWrite(plan.path, plan.content, operationOptions);
         result.createdDirectories = createdDirectories;
       } catch (error) {
         try {
@@ -708,8 +952,10 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
         if (process.env.NODE_ENV !== "test") throw new Error("agent commit test hook is available only in tests");
         plan.options._testAfterCommit({ plan, result, committed: committed.length });
       }
+      verifyCommittedAgentPlans(committed);
     }
     if (finalize) finalize({ committed });
+    verifyCommittedAgentPlans(committed);
     return committed.map(({ plan, result }) => publicResult(plan, result));
   } catch (error) {
     const rollbackErrors = [];
