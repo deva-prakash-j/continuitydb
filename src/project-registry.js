@@ -54,10 +54,18 @@ function readConfig(home) {
   if (config.projects !== undefined && !Array.isArray(config.projects)) {
     throw new Error("vault config projects must be an array");
   }
+  const projects = (config.projects || []).map(normalizeProject);
+  const projectIds = new Set();
+  for (const project of projects) {
+    if (projectIds.has(project.id)) {
+      throw new Error(`project ${project.id} is registered more than once`);
+    }
+    projectIds.add(project.id);
+  }
   return {
     path,
     config,
-    projects: (config.projects || []).map(normalizeProject),
+    projects,
   };
 }
 

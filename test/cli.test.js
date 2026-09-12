@@ -6,6 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { parse as parseToml } from "smol-toml";
 import { BUILTIN_LOCAL_MODEL } from "../src/local-embeddings.js";
 import { ContextVault } from "../src/store.js";
 import { VERSION } from "../src/version.js";
@@ -162,6 +165,83 @@ test("CLI setup derives one Git project identity and registers it on apply", () 
     ]);
     assert.match(readFileSync(join(nested, ".codex", "config.toml"), "utf8"), /CONTINUITYDB_ALLOWED_PROJECTS = "git-project"/);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("CLI setup authorizes the exact AgentForge Git identity without a default fallback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-agentforge-"));
+  const project = join(root, "AgentForge");
+  const home = join(root, "vault");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname;
+  let client;
+  try {
+    mkdirSync(join(project, ".git"), { recursive: true });
+    const setup = spawnSync(process.execPath, [
+      cli,
+      "setup",
+      "--home",
+      home,
+      "--project-dir",
+      project,
+      "--agents",
+      "codex",
+      "--binary",
+      cli,
+      "--apply",
+    ], { encoding: "utf8" });
+    assert.equal(setup.status, 0, setup.stderr);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "config.json"), "utf8")).projects, [
+      { id: "AgentForge", root: project, source: "git" },
+    ]);
+
+    const connector = parseToml(readFileSync(join(project, ".codex", "config.toml"), "utf8"));
+    const server = connector.mcp_servers.continuitydb;
+    assert.equal(server.env.CONTINUITYDB_ALLOWED_PROJECTS, "AgentForge");
+    assert.equal(server.env.CONTINUITYDB_ALLOWED_PROJECTS.includes("default"), false);
+
+    client = new Client({ name: "agentforge-regression", version: "0.7.0" });
+    await client.connect(new StdioClientTransport({
+      command: server.command,
+      args: server.args,
+      env: { ...process.env, ...server.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" },
+    }));
+    const captured = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        project_id: "AgentForge",
+        memory_kind: "working",
+        body: "AgentForge keeps the platform architecture context in ContinuityDB.",
+      },
+    });
+    assert.equal(captured.structuredContent.disposition, "active");
+    assert.equal(captured.structuredContent.record.project_id, "AgentForge");
+    const forbidden = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        project_id: "unregistered-project",
+        memory_kind: "working",
+        body: "NeverAuthorizedScopeSentinel must not be captured.",
+      },
+    });
+    assert.equal(forbidden.isError, true);
+    assert.match(forbidden.content[0].text, /project unregistered-project is not allowed for this caller/i);
+    const omitted = await client.callTool({
+      name: "memory_capture",
+      arguments: {
+        memory_kind: "working",
+        body: "Omitting project_id must not fall back to default.",
+      },
+    });
+    assert.equal(omitted.isError, true);
+    assert.match(omitted.content[0].text, /project_id|required/i);
+    const searched = await client.callTool({
+      name: "memory_search",
+      arguments: { query: "NeverAuthorizedScopeSentinel", project_id: "AgentForge" },
+    });
+    assert.deepEqual(searched.structuredContent.results, []);
+  } finally {
+    await client?.close().catch(() => {});
     rmSync(root, { recursive: true, force: true });
   }
 });

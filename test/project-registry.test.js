@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -79,6 +79,22 @@ test("listing a missing registry is read-only and invalid registries fail closed
     registerProject(home, { id: "valid", root: join(root, "valid"), source: "explicit" }, { apply: true });
     writeFileSync(join(home, "config.json"), '{"projects":"all"}\n');
     assert.throws(() => listRegisteredProjects(home), /projects.*array/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a stored project ID registered at two roots fails closed", () => {
+  const { root, home } = fixture();
+  try {
+    mkdirSync(home);
+    writeFileSync(join(home, "config.json"), `${JSON.stringify({
+      projects: [
+        { id: "AgentForge", root: join(root, "AgentForge"), source: "git" },
+        { id: "AgentForge", root: join(root, "other-AgentForge"), source: "explicit" },
+      ],
+    })}\n`, { mode: 0o600 });
+    assert.throws(() => listRegisteredProjects(home), /project AgentForge.*more than once|duplicate.*AgentForge/i);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
