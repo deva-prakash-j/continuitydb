@@ -99,6 +99,7 @@
     "onnxruntime-web": "1.29.0"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "1.18.30",
     "esbuild": "0.28.2",
     "yaml": "2.9.0"
   }
