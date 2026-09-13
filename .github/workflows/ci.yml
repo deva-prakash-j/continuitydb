@@ -69,6 +69,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run validate:clients
       - run: npm run test:binary
+      - run: npm run test:opencode-global
       - run: npm run smoke:binary:semantic
       - run: npm run checksum:binaries
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

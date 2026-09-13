@@ -101,6 +101,7 @@ Usage:
   continuitydb projects list [--home PATH]
   continuitydb projects add --project-dir PATH [--project ID] [--home PATH] [--apply]
   continuitydb opencode install --workspace-root PATH [--workspace-root PATH ...] [--opencode-config-dir PATH] [--home PATH] [--apply]
+  continuitydb opencode ensure --project-dir PATH --workspace-root PATH [--workspace-root PATH ...] [--home PATH] --apply
   continuitydb opencode status [--opencode-config-dir PATH]
   continuitydb opencode uninstall [--opencode-config-dir PATH] [--apply]
   continuitydb mcp [--home PATH]

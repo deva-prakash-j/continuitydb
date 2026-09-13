@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ContinuityDB API
-  version: 0.7.0
+  version: 0.8.0
   description: Versioned REST and Streamable HTTP MCP API for governed, portable agent memory and context packs.
 servers:
   - url: http://127.0.0.1:7331

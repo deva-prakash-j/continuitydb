@@ -35,7 +35,8 @@ fingerprint still matches and never deletes registered memory.
   network URLs, wildcard roots, and repositories outside trusted roots fail
   closed.
 - The plugin never accepts a `project_id` from the model. It derives identity
-  from OpenCode's `worktree`/`directory` context and asks the host CLI to
+  from OpenCode's current `directory` context (with `worktree` only as a
+  fallback) and asks the host CLI to
   atomically ensure that exact Git root.
 - Project registration remains local host administration. No project-admin
   MCP tool is exposed.
