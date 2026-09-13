@@ -103,6 +103,9 @@ test("global plugin tools are fixed to the derived project and governed capture"
       body: "Use billing-api naming for public routes.", kind: "decision", sensitivity: "private",
     }, context);
     assert.match(saved, /memory-1/);
+    await hooks.tool.continuitydb_remember.execute({
+      body: "Use billing-api naming for public routes.", kind: "decision", sensitivity: "private",
+    }, context);
     await assert.rejects(
       hooks.tool.continuitydb_remember.execute({
         body: "SECRET=must-not-store", kind: "decision", sensitivity: "private",
@@ -114,6 +117,13 @@ test("global plugin tools are fixed to the derived project and governed capture"
     for (const call of calls.filter((args) => args[0] === "search" || args[0] === "capture")) {
       assert.equal(call[call.indexOf("--project") + 1], "service");
     }
+    const captures = calls.filter((args) => args[0] === "capture" && args.includes("Use billing-api naming for public routes."));
+    assert.equal(captures.length, 2);
+    assert.match(captures[0][captures[0].indexOf("--idempotency-key") + 1], /^[a-f0-9]{64}$/);
+    assert.equal(
+      captures[0][captures[0].indexOf("--idempotency-key") + 1],
+      captures[1][captures[1].indexOf("--idempotency-key") + 1],
+    );
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

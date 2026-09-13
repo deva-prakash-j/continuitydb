@@ -1547,6 +1547,16 @@ function prepareOpenCodeChanges(rawOptions, action, identity) {
   }];
 }
 
+export function managedOpenCodeProject(projectDir) {
+  const fixedProjectDir = resolve(projectDir);
+  const pluginPath = join(fixedProjectDir, ".opencode", "plugins", "continuitydb.js");
+  if (!existsSync(pluginPath)) return null;
+  ensureSafeParents(fixedProjectDir, pluginPath, false);
+  const metadata = opencodePluginMetadata(readText(pluginPath));
+  if (!metadata) throw new Error(`unmanaged OpenCode plugin already exists: ${pluginPath}`);
+  return { projectDir: fixedProjectDir, projectId: metadata.projectId, plugin: pluginPath };
+}
+
 function copilotPolicyContent(body, ownership) {
   const firstLineEnd = body.indexOf("\n");
   const metadata = `<!-- continuitydb managed mcp ownership: document=${ownership.document}; namespace=${ownership.namespace}; entry_sha256=${ownership.entrySha256} -->`;
@@ -1929,6 +1939,7 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
 
   const releaseBatchLocks = acquireFileLocks(plans.map((plan) => configurationLockPath(plan.path)));
   const committed = [];
+  let finalization = null;
   try {
     for (const plan of plans) {
       if (plan.noOp) {
@@ -1983,7 +1994,7 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
       }
       verifyCommittedAgentPlans(committed);
     }
-    if (finalize) finalize({ committed });
+    if (finalize) finalization = finalize({ committed });
     verifyCommittedAgentPlans(committed);
     const values = committed.map(({ plan, result }) => publicResult(plan, result));
     // Remove only empty parents known not to predate the lifecycle adapter. A
@@ -2008,6 +2019,10 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
     return values;
   } catch (error) {
     const rollbackErrors = [];
+    if (finalization?.rollback) {
+      try { finalization.rollback(); }
+      catch (rollbackError) { rollbackErrors.push(`finalizer: ${rollbackError.message}`); }
+    }
     for (const item of committed.reverse()) {
       try { restoreSnapshot(item.plan, item.result); }
       catch (rollbackError) { rollbackErrors.push(`${item.plan.client}: ${rollbackError.message}`); }
@@ -2019,6 +2034,24 @@ function applyAgentPlans(plans, { finalize = null, apply = plans[0]?.options.app
   } finally {
     releaseBatchLocks();
   }
+}
+
+export function migrateManagedOpenCodeProjects(projects, rawOptions = {}) {
+  const unique = [...new Map(projects.map((project) => [resolve(project.projectDir), {
+    projectDir: resolve(project.projectDir), projectId: project.projectId,
+  }])).values()];
+  const plans = [];
+  for (const project of unique) {
+    const options = { ...rawOptions, ...project };
+    plans.push(...prepareOpenCodeChanges(options, "disconnect", null));
+    const policyPlan = prepareSharedPolicyChange(["opencode"], options, "disconnect", null);
+    if (policyPlan) plans.push(policyPlan);
+  }
+  const results = applyAgentPlans(plans, {
+    apply: Boolean(rawOptions.apply),
+    finalize: rawOptions._finalize || null,
+  });
+  return { projects: unique, assets: results };
 }
 
 function batch(clients, rawOptions, action) {

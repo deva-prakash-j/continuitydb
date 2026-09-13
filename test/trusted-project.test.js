@@ -105,3 +105,33 @@ test("root-derived collision IDs are deterministic after path normalization", ()
   assert.equal(first, second);
   assert.match(first, /^service-[a-f0-9]{12}$/);
 });
+
+test("root-derived IDs widen their hash when a truncated collision is already registered", () => {
+  const name = "a".repeat(205);
+  const preferred = name.slice(0, 200);
+  const target = resolve(`/other/${name}`);
+  const projects = [{ id: preferred, root: resolve(`/existing/${name}`), source: "git" }];
+  const twelve = projectIdForCanonicalRoot(target, projects);
+  const widened = projectIdForCanonicalRoot(target, [
+    ...projects,
+    { id: twelve, root: resolve(`/third/${name}`), source: "git" },
+  ]);
+  assert.match(widened, new RegExp(`^a{183}-[a-f0-9]{16}$`));
+});
+
+test("trusted project IDs safely derive from long and punctuation-heavy repository names", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-trusted-names-"));
+  const workspace = join(root, "workspace");
+  const longName = `.${"a".repeat(205)} repo!`;
+  const repo = repository(workspace, longName);
+  try {
+    const result = ensureTrustedProject(join(root, "vault"), {
+      directory: repo, workspaceRoots: [workspace], apply: true,
+    });
+    assert.match(result.project.id, /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/);
+    assert.ok(result.project.id.length <= 200);
+    assert.equal(ensureTrustedProject(join(root, "vault"), {
+      directory: repo, workspaceRoots: [workspace], apply: true,
+    }).project.id, result.project.id);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

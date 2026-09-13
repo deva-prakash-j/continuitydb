@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync } from "node:fs";
-import { basename, posix, resolve, win32 } from "node:path";
+import { posix, resolve, win32 } from "node:path";
 import { ensureRegisteredProject, projectIdForRegisteredRoot } from "./project-registry.js";
 import { findGitRoot } from "./project-identity.js";
 
@@ -46,8 +46,7 @@ export function ensureTrustedProject(home, {
     throw new Error(`project ${canonicalGitRoot} is outside trusted workspace roots`);
   }
   const result = ensureRegisteredProject(home, canonicalGitRoot, { apply, source: "git" });
-  if (result.project.id !== basename(canonicalGitRoot)
-    && !result.project.id.startsWith(`${basename(canonicalGitRoot).slice(0, 187)}-`)) {
+  if (projectIdForRegisteredRoot(canonicalGitRoot, result.projects) !== result.project.id) {
     throw new Error("registered project identity does not match its canonical Git root");
   }
   return result;
