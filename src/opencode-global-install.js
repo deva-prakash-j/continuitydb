@@ -42,6 +42,31 @@ function directoryMetadata(path) {
   return { dev: metadata.dev, ino: metadata.ino };
 }
 
+function bindDirectoryChain(path) {
+  const absolute = resolve(path);
+  const root = parse(absolute).root;
+  const paths = [root];
+  let current = root;
+  for (const part of absolute.slice(root.length).split(sep).filter(Boolean)) {
+    current = join(current, part);
+    paths.push(current);
+  }
+  return paths.map((directory) => {
+    const metadata = directoryMetadata(directory);
+    if (!metadata) throw new Error(`OpenCode plugin parent is missing: ${directory}`);
+    return { path: directory, ...metadata };
+  });
+}
+
+function verifyDirectoryChain(binding) {
+  for (const expected of binding) {
+    const current = directoryMetadata(expected.path);
+    if (!current || current.dev !== expected.dev || current.ino !== expected.ino) {
+      throw new Error(`OpenCode plugin parent or ancestor changed: ${expected.path}`);
+    }
+  }
+}
+
 function ensureDirectory(path, apply) {
   const absolute = resolve(path);
   const root = parse(absolute).root;
@@ -285,12 +310,18 @@ export function installGlobalOpenCode(rawOptions = {}) {
 export function uninstallGlobalOpenCode({ configDir = defaultOpenCodeConfigDir(), apply = false } = {}) {
   const fixedConfigDir = resolve(configDir);
   const plugin = join(fixedConfigDir, "plugins", "continuitydb.js");
+  if (!existsSync(plugin)) {
+    return { action: "uninstall", applied: Boolean(apply), changed: false, verified: true, plugin };
+  }
+  const parentBinding = bindDirectoryChain(dirname(plugin));
+  verifyDirectoryChain(parentBinding);
   const before = readPlugin(plugin);
   const owned = parseManagedPlugin(before);
   if (!owned) return { action: "uninstall", applied: Boolean(apply), changed: false, verified: true, plugin };
   if (!apply) return { action: "uninstall", applied: false, changed: true, verified: true, plugin };
   const rechecked = readPlugin(plugin);
   if (rechecked !== before) throw new Error("global OpenCode plugin changed after preflight");
+  verifyDirectoryChain(parentBinding);
   const tombstone = join(dirname(plugin), `.continuitydb.${process.pid}.${randomUUID()}.removed`);
   renameSync(plugin, tombstone);
   rmSync(tombstone, { force: true });

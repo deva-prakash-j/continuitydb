@@ -91,6 +91,34 @@ test("global OpenCode install refuses unmanaged, drifted, and symlinked targets"
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("global OpenCode uninstall refuses a substituted plugin parent and preserves outside bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-uninstall-parent-"));
+  const workspace = join(root, "workspace");
+  const configDir = join(root, "opencode");
+  const plugins = join(configDir, "plugins");
+  const plugin = join(plugins, "continuitydb.js");
+  const outside = join(root, "outside");
+  const outsidePlugin = join(outside, "continuitydb.js");
+  mkdirSync(workspace);
+  try {
+    installGlobalOpenCode({
+      home: join(root, "vault"), workspaceRoots: [workspace], configDir,
+      binary: process.execPath, apply: true,
+    });
+    const managed = readFileSync(plugin, "utf8");
+    mkdirSync(outside);
+    writeFileSync(outsidePlugin, managed);
+    rmSync(plugins, { recursive: true });
+    symlinkSync(outside, plugins, process.platform === "win32" ? "junction" : "dir");
+
+    assert.throws(
+      () => uninstallGlobalOpenCode({ configDir, apply: true }),
+      /parent|ancestor|symbolic link|directory/i,
+    );
+    assert.equal(readFileSync(outsidePlugin, "utf8"), managed);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("CLI installs once and automatically ensures arbitrary trusted repositories", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-cli-"));
   const workspaceOne = join(root, "workspace-one");
