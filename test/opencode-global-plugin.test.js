@@ -155,3 +155,26 @@ test("global plugin renderer rejects unsafe configuration", () => {
   assert.throws(() => renderGlobalOpenCodePlugin({ executable: "/bin/continuitydb", home: "/vault", workspaceRoots: [] }), /workspace root/i);
   assert.throws(() => renderGlobalOpenCodePlugin({ executable: "/bin/continuitydb", home: "/vault", workspaceRoots: [root], sensitivities: ["secret"] }), /sensitivity/i);
 });
+
+test("untrusted auxiliary OpenCode instances expose no memory hooks or tools", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-untrusted-"));
+  const cli = join(root, "rejecting-continuitydb");
+  writeFileSync(cli, `#!/usr/bin/env node
+process.stderr.write(JSON.stringify({ error: "project is outside trusted workspace roots" }));
+process.exit(1);
+`, { mode: 0o755 });
+  chmodSync(cli, 0o755);
+  try {
+    const module = await importGenerated(renderGlobalOpenCodePlugin({
+      executable: cli, home: join(root, "vault"), workspaceRoots: [join(root, "trusted")],
+    }));
+    const logs = [];
+    const hooks = await module.ContinuityDBGlobalPlugin({
+      directory: join(root, "untrusted"), worktree: "/",
+      client: { app: { log: async ({ body }) => logs.push(body) } },
+    });
+    assert.deepEqual(hooks, {});
+    assert.equal(logs.length, 1);
+    assert.match(logs[0].message, /outside trusted workspace roots/i);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

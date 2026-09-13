@@ -215,9 +215,12 @@ test("native and CI workflows cannot skip or ignore the real OpenCode global smo
 });
 
 test("real OpenCode smoke invokes remember and search through the installed plugin handlers", () => {
-  assert.match(openCodeSmoke, /ContinuityDBGlobalPlugin/);
-  assert.match(openCodeSmoke, /hooks\.tool\.continuitydb_remember\.execute/);
-  assert.match(openCodeSmoke, /hooks\.tool\.continuitydb_memory_search\.execute/);
+  assert.match(openCodeSmoke, /runAsync\(opencode,\s*\[\s*"run"/);
+  assert.match(openCodeSmoke, /@ai-sdk\/openai-compatible/);
+  assert.match(openCodeSmoke, /continuitydb_remember/);
+  assert.match(openCodeSmoke, /continuitydb_memory_search/);
+  assert.doesNotMatch(openCodeSmoke, /loadInstalledPlugin/);
+  assert.doesNotMatch(openCodeSmoke, /\.tool\.continuitydb_(?:remember|memory_search)\.execute/);
   assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"capture"/);
   assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"search"/);
 });

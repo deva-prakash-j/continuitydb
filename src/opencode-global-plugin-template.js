@@ -87,6 +87,7 @@ export function renderGlobalOpenCodePlugin({
     + `  let initialProject = null;\n`
     + `  try { initialProject = await ensureProject(initialPath); }\n`
     + `  catch (error) { await client.app.log({ body: { service: "continuitydb", level: "warn", message: error.message + " (project path: " + String(initialPath) + ")" } }).catch(() => {}); }\n`
+    + `  if (!initialProject) return {};\n`
     + `  async function projectFor(path = initialPath) {\n`
     + `    if (!initialProject) throw new Error("ContinuityDB is unavailable for this repository");\n`
     + `    const current = await ensureProject(path);\n`

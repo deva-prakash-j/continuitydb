@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
 
 const extension = process.platform === "win32" ? ".exe" : "";
 const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
@@ -71,20 +71,160 @@ function openRepository(repository) {
   });
 }
 
-async function loadInstalledPlugin() {
-  // OpenCode has already loaded and validated this exact global plugin. Make its
-  // pinned SDK dependency resolvable to Node so the smoke can invoke the same
-  // registered handler definitions without requiring a model/provider credential.
-  const packageTarget = join(configRoot, "node_modules", "@opencode-ai", "plugin");
-  mkdirSync(join(configRoot, "node_modules", "@opencode-ai"), { recursive: true });
-  cpSync(fileURLToPath(new URL("../node_modules/@opencode-ai/plugin/", import.meta.url)), packageTarget, {
-    recursive: true,
+function runAsync(command, args, options = {}) {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+      ...options,
+    });
+    let stdout = "";
+    let stderr = "";
+    const timeout = setTimeout(() => child.kill(), 60_000);
+    function append(name, chunk) {
+      if (name === "stdout") stdout += String(chunk);
+      else stderr += String(chunk);
+      if (stdout.length + stderr.length > 4 * 1024 * 1024) child.kill();
+    }
+    child.stdout.on("data", (chunk) => append("stdout", chunk));
+    child.stderr.on("data", (chunk) => append("stderr", chunk));
+    child.once("error", reject);
+    child.once("close", (status, signal) => {
+      clearTimeout(timeout);
+      resolveRun({ status, signal, stdout, stderr });
+    });
   });
-  writeFileSync(join(configDir, "package.json"), '{"type":"module"}\n', { mode: 0o600 });
-  const installedPlugin = join(configDir, "plugins", "continuitydb.js");
-  const module = await import(`${pathToFileURL(installedPlugin).href}?native-smoke=${Date.now()}`);
-  assert.equal(typeof module.ContinuityDBGlobalPlugin, "function");
-  return module.ContinuityDBGlobalPlugin;
+}
+
+function sendCompletion(response, delta, finishReason) {
+  response.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+  });
+  response.write(`data: ${JSON.stringify({
+    id: "continuitydb-open-code-smoke",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "memory-smoke",
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  })}\n\n`);
+  response.end("data: [DONE]\n\n");
+}
+
+async function startToolCallingProvider(marker) {
+  let toolRound = 0;
+  const requests = [];
+  const server = createServer((request, response) => {
+    if (request.method === "GET" && request.url === "/v1/models") {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ object: "list", data: [{ id: "memory-smoke", object: "model" }] }));
+      return;
+    }
+    if (request.method !== "POST" || request.url !== "/v1/chat/completions") {
+      response.writeHead(404).end();
+      return;
+    }
+    let body = "";
+    request.on("data", (chunk) => {
+      body += String(chunk);
+      if (body.length > 2 * 1024 * 1024) request.destroy();
+    });
+    request.on("end", () => {
+      const value = JSON.parse(body);
+      const tools = (value.tools || []).map((entry) => entry?.function?.name).filter(Boolean);
+      requests.push({ tools, messages: value.messages || [] });
+      if (tools.length === 0) {
+        sendCompletion(response, { role: "assistant", content: "ContinuityDB memory smoke" }, "stop");
+        return;
+      }
+      if (!tools.includes("continuitydb_remember") || !tools.includes("continuitydb_memory_search")) {
+        response.writeHead(400, { "content-type": "application/json" });
+        response.end(JSON.stringify({ error: { message: "ContinuityDB tools were not registered by OpenCode" } }));
+        return;
+      }
+      if (toolRound === 0) {
+        toolRound += 1;
+        sendCompletion(response, {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "remember-call",
+            type: "function",
+            function: {
+              name: "continuitydb_remember",
+              arguments: JSON.stringify({ body: `${marker} is active.`, kind: "working", sensitivity: "private" }),
+            },
+          }],
+        }, "tool_calls");
+        return;
+      }
+      if (toolRound === 1) {
+        toolRound += 1;
+        sendCompletion(response, {
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: "search-call",
+            type: "function",
+            function: { name: "continuitydb_memory_search", arguments: JSON.stringify({ query: marker }) },
+          }],
+        }, "tool_calls");
+        return;
+      }
+      sendCompletion(response, { role: "assistant", content: "ContinuityDB tool smoke complete." }, "stop");
+    });
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  return {
+    baseURL: `http://127.0.0.1:${server.address().port}/v1`,
+    requests,
+    close: () => new Promise((resolveClose, reject) => server.close((error) => error ? reject(error) : resolveClose())),
+  };
+}
+
+function toolMessageText(message) {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return "";
+  return message.content.map((part) => typeof part === "string" ? part : (part?.text || "")).join("");
+}
+
+async function invokeToolsThroughOpenCode(repository, projectId, marker) {
+  const provider = await startToolCallingProvider(marker);
+  try {
+    writeFileSync(join(configDir, "opencode.json"), `${JSON.stringify({
+      $schema: "https://opencode.ai/config.json",
+      provider: {
+        "continuity-smoke": {
+          npm: "@ai-sdk/openai-compatible@3.0.48",
+          name: "ContinuityDB local smoke provider",
+          options: { baseURL: provider.baseURL, apiKey: "local-smoke-placeholder" },
+          models: { "memory-smoke": { name: "ContinuityDB memory smoke" } },
+        },
+      },
+    }, null, 2)}\n`, { mode: 0o600 });
+    const completed = await runAsync(opencode, [
+      "run", "--print-logs", "--log-level", "DEBUG",
+      "--dir", repository,
+      "--model", "continuity-smoke/memory-smoke", "--format", "json",
+      "Use continuitydb_remember once, then continuitydb_memory_search once.",
+    ], { cwd: repository, env: opencodeEnvironment() });
+    assert.equal(completed.status, 0, `real OpenCode tool run failed: ${JSON.stringify(completed)}`);
+    const toolMessages = provider.requests.flatMap((request) => request.messages)
+      .filter((message) => message.role === "tool");
+    const remembered = toolMessages.find((message) => message.tool_call_id === "remember-call");
+    const searched = toolMessages.find((message) => message.tool_call_id === "search-call");
+    assert.ok(remembered, "OpenCode did not return the installed remember tool result to the model");
+    assert.ok(searched, "OpenCode did not return the installed search tool result to the model");
+    assert.match(toolMessageText(remembered), new RegExp(projectId), completed.stderr);
+    assert.match(toolMessageText(searched), new RegExp(projectId), completed.stderr);
+    assert.match(toolMessageText(searched), new RegExp(marker), completed.stderr);
+  } finally {
+    await provider.close();
+  }
 }
 
 try {
@@ -117,29 +257,9 @@ try {
   assert.match(projects[1].id, /^service-[a-f0-9]{12}$/);
   assert.equal(projects.some((project) => project.id === "default"), false);
 
-  const ContinuityDBGlobalPlugin = await loadInstalledPlugin();
   for (const [index, project] of projects.entries()) {
     const marker = `OpenCodeNativeMemory${index + 1}`;
-    const hooks = await ContinuityDBGlobalPlugin({
-      directory: project.root,
-      worktree: process.platform === "win32" ? "C:\\" : "/",
-      client: { app: { log: async () => ({}) } },
-    });
-    const context = {
-      directory: project.root,
-      worktree: process.platform === "win32" ? "C:\\" : "/",
-      sessionID: `native-smoke-${index + 1}`,
-    };
-    const captured = JSON.parse(await hooks.tool.continuitydb_remember.execute({
-      body: `${marker} is active.`,
-      kind: "working",
-      sensitivity: "private",
-    }, context));
-    assert.equal(captured.record.project_id, project.id);
-    const search = JSON.parse(await hooks.tool.continuitydb_memory_search.execute({ query: marker }, context));
-    assert.equal(search.results.length, 1);
-    assert.equal(search.results[0].project_id, project.id);
-    assert.match(search.results[0].body, new RegExp(marker));
+    await invokeToolsThroughOpenCode(project.root, project.id, marker);
   }
 
   const removed = succeed(binary, [
