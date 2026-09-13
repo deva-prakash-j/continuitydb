@@ -40,6 +40,7 @@ jobs:
       - run: npm run build:binary
       - if: runner.os == 'macOS'
         run: codesign --force --sign - dist/continuitydb-darwin-*
+      - run: npm run test:opencode-global
       - run: npm run smoke:binary
       - run: npm run smoke:binary:semantic
       - run: npm run checksum:binaries

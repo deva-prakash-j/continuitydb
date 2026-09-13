@@ -1,6 +1,6 @@
 {
   "name": "continuitydb",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": false,
   "description": "Git-grounded, provider-neutral context continuity for AI coding agents",
   "type": "module",
@@ -66,6 +66,7 @@
     "smoke:binary": "node scripts/binary-smoke.js",
     "smoke:binary:semantic": "node scripts/binary-semantic-smoke.js",
     "test:binary": "npm run build:binary && node scripts/binary-smoke.js",
+    "test:opencode-global": "node scripts/opencode-global-smoke.js",
     "test:binary:semantic": "npm run build:binary && node scripts/binary-semantic-smoke.js",
     "test:binary:reproducible": "node scripts/verify-binary-reproducibility.js",
     "start:mcp": "node src/mcp-server.js",
@@ -87,7 +88,7 @@
     "benchmark:hybrid": "node benchmarks/hybrid-quality-benchmark.js",
     "benchmark:local": "node benchmarks/local-quality-benchmark.js",
     "benchmark:local:performance": "node benchmarks/local-embedding-benchmark.js",
-    "release:check": "npm test && npm run validate:openapi && npm run validate:clients && npm run validate:release-workflow && npm run benchmark:quality && npm audit --omit=dev && npm run package:check && npm run test:codex-config"
+    "release:check": "npm test && npm run validate:openapi && npm run validate:clients && npm run validate:release-workflow && npm run benchmark:quality && npm audit --omit=dev && npm run package:check && npm run test:codex-config && npm run test:opencode-global"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
@@ -99,7 +100,9 @@
     "onnxruntime-web": "1.29.0"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "1.18.30",
     "esbuild": "0.28.2",
+    "opencode-ai": "1.18.30",
     "yaml": "2.9.0"
   }
 }

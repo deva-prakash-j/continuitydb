@@ -63,3 +63,9 @@ test("binary smoke canonicalizes only its validator-owned temporary root", () =>
   const source = readFileSync(join(scriptsRoot, "binary-smoke.js"), "utf8");
   assert.match(source, /const root = realpathSync\(mkdtempSync\(join\(tmpdir\(\), "continuitydb-binary-smoke-"\)\)\);/);
 });
+
+test("OpenCode smoke canonicalizes its validator-owned temporary root", () => {
+  const source = readFileSync(join(scriptsRoot, "opencode-global-smoke.js"), "utf8");
+  assert.match(source,
+    /const root = realpathSync\.native\(mkdtempSync\(join\(tmpdir\(\), "continuitydb-opencode-native-"\)\)\);/);
+});

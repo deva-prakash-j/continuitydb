@@ -5,6 +5,13 @@ after the first stable release.
 
 ## [Unreleased]
 
+- Added one-time global OpenCode integration for trusted workspace roots. New
+  Git repositories are registered automatically when opened, receive bounded
+  project-scoped recall, and expose governed project memory tools without
+  per-repository ContinuityDB setup or wildcard authorization.
+- Added collision-safe automatic project IDs, transactional migration of
+  ContinuityDB-owned legacy OpenCode adapters, real OpenCode 1.18.30 native
+  smoke coverage, and memory-preserving global uninstall.
 - Added one-command complete project adapters for Codex, Claude Code, OpenCode,
   Cursor, and VS Code Copilot, with truthful `policy-led`, `hook-enforced`,
   `plugin+policy`, and `hook+policy` recall labels plus an explicit `--mcp-only`

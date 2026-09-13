@@ -25,7 +25,7 @@ Evidence captured on 2026-09-12:
 | Codex CLI | 0.147.0 | Authenticated Streamable HTTP initialization and `tools/list` | **policy-led** first-task recall through managed `AGENTS.md`; no native startup hook claimed | **Transport verified** |
 | GitHub Copilot cloud agent / code review | Official repository MCP JSON contract current on 2026-09-12 | Remote HTTP with explicit three-tool allowlist; all listed tools carry `readOnlyHint: true` | **policy-led** through `.github/copilot-instructions.md`; no native startup hook claimed | **Contract tested**; real GitHub-hosted run pending |
 | Claude Code | Official MCP and hook contracts current on 2026-09-12 | Local stdio or remote HTTP | **hook-enforced** `SessionStart`; `Stop` reads only an explicit structured file | **Contract tested**; client binary unavailable on the test VM |
-| OpenCode | Official MCP/plugin contracts current on 2026-09-12 | Local stdio or remote HTTP | **plugin+policy**: compaction is plugin-enforced and first-task recall is policy-led | **Contract tested**; client binary unavailable on the test VM |
+| OpenCode | 1.18.30 plus official MCP/plugin contracts | Local stdio or remote HTTP | **global plugin**: auto-project registration, first-task/compaction recall, and governed project memory tools; project-local plugin+policy remains available | **Native smoke + contract tested** on the release matrix |
 | Cursor | Official MCP/hook contracts current on 2026-09-12 | Local stdio or remote HTTP | **hook+policy**; policy fallback covers read-only cloud startup gaps | **Contract tested**; real client run pending |
 
 All generated adapters use `capture_mode: explicit-governed`. Ordinary prompts,

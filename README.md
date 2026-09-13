@@ -271,6 +271,44 @@ atomically updates `~/.local/bin/continuitydb`. It does not edit shell profiles
 or replace an unmanaged launcher unless `--force` is explicit. Windows defaults
 to `%LOCALAPPDATA%\\ContinuityDB`.
 
+### One-time OpenCode setup for every repository
+
+If your repositories live below one or more parent directories, install the
+global OpenCode integration once:
+
+```bash
+continuitydb opencode install \
+  --workspace-root "$HOME/code" \
+  --workspace-root "$HOME/work" \
+  --apply
+
+continuitydb opencode status
+```
+
+After restarting OpenCode, opening any Git repository below those trusted
+roots automatically registers that repository and loads project-scoped memory.
+No per-repository `setup`, `opencode.json`, fixed `default` project, or wildcard
+project permission is used. Repositories with the same basename receive stable
+hash-suffixed IDs. OpenCode gets `continuitydb_memory_search`,
+`continuitydb_context`, and `continuitydb_remember`; those tools remain
+available to plan/read-only agents without enabling repository writes.
+
+The plugin injects one bounded context pack before work and at compaction. It
+also instructs OpenCode to save compact, reusable project facts and work state
+proactively through the governed capture policy. Raw prompts, transcripts,
+hidden reasoning, secrets, and tool logs are never stored. Working memory has a
+bounded TTL; durable decisions and sensitive claims retain their normal review
+or quarantine requirements.
+
+The installer migrates only fingerprint-valid ContinuityDB-owned project-local
+OpenCode adapters beneath the trusted roots. Unmanaged or drifted files stop the
+operation before mutation. To remove only the global plugin while retaining all
+registered projects and memory:
+
+```bash
+continuitydb opencode uninstall --apply
+```
+
 From a repository, initialize a private vault and connect every installed
 supported client. Both commands initialize the private vault; the first only
 previews client-config changes, while the second creates backups and applies
@@ -309,12 +347,14 @@ untrusted evidence. Hooks and plugins enforce recall only at the lifecycle
 events their hosts provide; managed instructions lead first-task behavior where
 the host provides no native hook.
 
-Capture is always `explicit-governed`: generated adapters call
+Project-local generated adapters use `explicit-governed` capture: they call
 `memory_capture` only when the user explicitly asks to remember, save, record,
-or update a durable fact. They never auto-capture an ordinary prompt, raw
-transcript, tool log, secret, hidden reasoning, or temporary task state. A
-genuine plan/read-only/sandbox/approval restriction is never bypassed. If a
-write is unavailable or denied, the truthful result is **`not saved`**.
+or update a durable fact. The opt-in global OpenCode plugin may proactively
+capture a compact project claim through the same policy, but never an ordinary
+prompt, raw transcript, tool log, secret, hidden reasoning, or temporary task
+state. Its memory-only tool is allowed in plan/read-only agents without
+enabling repository writes; host sandbox and filesystem restrictions remain
+unchanged. If a memory write is unavailable or denied, it fails truthfully.
 
 To expose only MCP tools without lifecycle or managed policy assets, opt in to
 the escape hatch explicitly:
@@ -632,6 +672,7 @@ Run `continuitydb help` for the concise built-in usage text.
 | `agents status` | Report project connection state for all supported clients |
 | `agents connect` | Preview/apply one or all project-scoped MCP configurations |
 | `agents disconnect` | Preview/remove only the ContinuityDB-managed configuration |
+| `opencode install/status/uninstall` | Manage one global trusted-root OpenCode auto-project integration |
 | `mcp` | Start the stdio MCP server |
 | `hook` | Run bundled Claude/Cursor lifecycle hook operations from the same binary |
 | `propose` | Create a memory that remains invisible to recall |

@@ -11,6 +11,7 @@ import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
 const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
 const packageDocument = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const openCodeSmoke = readFileSync(new URL("../scripts/opencode-global-smoke.js", import.meta.url), "utf8");
 
 test("release workflow blocks publication on post-sign native semantic verification", () => {
   assert.equal(validateReleaseWorkflow(workflow).valid, true);
@@ -174,6 +175,58 @@ test("release workflow validator rejects missing, skipped, or misordered semanti
   assert.throws(() => validateReleaseWorkflow(expressionProvenance), /continue-on-error/);
 });
 
+test("native and CI workflows cannot skip or ignore the real OpenCode global smoke", () => {
+  const missingNative = structuredClone(workflow);
+  missingNative.jobs.build.steps = missingNative.jobs.build.steps
+    .filter((step) => step.run !== "npm run test:opencode-global");
+  assert.throws(() => validateReleaseWorkflow(missingNative), /real OpenCode global integration smoke is missing/i);
+
+  const conditionalNative = structuredClone(workflow);
+  conditionalNative.jobs.build.steps
+    .find((step) => step.run === "npm run test:opencode-global").if = "runner.os == 'Linux'";
+  assert.throws(() => validateReleaseWorkflow(conditionalNative), /must run for every native matrix target/i);
+
+  const falseConditionalNative = structuredClone(workflow);
+  falseConditionalNative.jobs.build.steps
+    .find((step) => step.run === "npm run test:opencode-global").if = false;
+  assert.throws(() => validateReleaseWorkflow(falseConditionalNative), /must run for every native matrix target/i);
+
+  const falseConditionalNativeJob = structuredClone(workflow);
+  falseConditionalNativeJob.jobs.build.if = false;
+  assert.throws(() => validateReleaseWorkflow(falseConditionalNativeJob), /job must be unconditional/i);
+
+  const ignoredNativeJob = structuredClone(workflow);
+  ignoredNativeJob.jobs.build["continue-on-error"] = true;
+  assert.throws(() => validateReleaseWorkflow(ignoredNativeJob), /OpenCode integration gates.*continue-on-error/i);
+
+  const missingCi = structuredClone(ciWorkflow);
+  missingCi.jobs.binary.steps = missingCi.jobs.binary.steps
+    .filter((step) => step.run !== "npm run test:opencode-global");
+  assert.throws(() => validateCiWorkflow(missingCi), /real OpenCode global integration smoke is missing/i);
+
+  const skippedCiJob = structuredClone(ciWorkflow);
+  skippedCiJob.jobs.binary.if = "github.ref == 'refs/heads/main'";
+  assert.throws(() => validateCiWorkflow(skippedCiJob), /job must be unconditional/i);
+
+  const falseConditionalCi = structuredClone(ciWorkflow);
+  falseConditionalCi.jobs.binary.steps
+    .find((step) => step.run === "npm run test:opencode-global").if = false;
+  assert.throws(() => validateCiWorkflow(falseConditionalCi), /must be blocking/i);
+});
+
+test("real OpenCode smoke invokes remember and search through the installed plugin handlers", () => {
+  assert.match(openCodeSmoke, /runAsync\(opencode,\s*\[\s*"run"/);
+  assert.match(openCodeSmoke, /npm: "@ai-sdk\/openai-compatible"/);
+  assert.doesNotMatch(openCodeSmoke, /@ai-sdk\/openai-compatible@/,
+    "the native smoke must use OpenCode's bundled provider without a runtime package install");
+  assert.match(openCodeSmoke, /continuitydb_remember/);
+  assert.match(openCodeSmoke, /continuitydb_memory_search/);
+  assert.doesNotMatch(openCodeSmoke, /loadInstalledPlugin/);
+  assert.doesNotMatch(openCodeSmoke, /\.tool\.continuitydb_(?:remember|memory_search)\.execute/);
+  assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"capture"/);
+  assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"search"/);
+});
+
 test("release workflow rejects mutable action tags in privileged and build jobs", () => {
   for (const [job, action] of [["build", "actions/checkout@v5"], ["publish", "actions/download-artifact@v5"]]) {
     const mutable = structuredClone(workflow);
@@ -228,7 +281,7 @@ test("normal, container, Linux binary, and supported native jobs run complete cl
   assert.throws(() => validateReleaseWorkflow(missingNativeValidation), /native.*client adapter tests/i);
 });
 
-test("stable v0.7.0 publication waits for every native and provenance gate", () => {
+test("stable publication waits for every native and provenance gate", () => {
   assert.ok(workflow.on.push.tags.includes("v*"));
   assert.match(workflow.jobs.publish.if, /github\.event_name == 'push'/);
   assert.doesNotMatch(workflow.jobs.publish.if, /always\(\)/);
@@ -242,7 +295,7 @@ test("stable v0.7.0 publication waits for every native and provenance gate", () 
 
   const noStableTag = structuredClone(workflow);
   noStableTag.on.push.tags = ["main-*"];
-  assert.throws(() => validateReleaseWorkflow(noStableTag), /stable v0\.7\.0 tag path/i);
+  assert.throws(() => validateReleaseWorkflow(noStableTag), /stable version tag path/i);
 });
 
 test("stable publication requires exact package version, merged ancestry, and remote tag identity", () => {
@@ -715,11 +768,11 @@ test("post-publication execution requires non-draft state and fresh stable ident
   assert.doesNotMatch(mainMovedDuringMetadata.calls, /gh release download/);
 });
 
-test("release check builds the standalone binary before the generated Codex config probe", () => {
+test("release check builds once before generated Codex and real OpenCode integration probes", () => {
   assert.equal(packageDocument.scripts["test:codex-config"], "npm run test:codex-generated-config");
   assert.equal(
     packageDocument.scripts["test:codex-generated-config"],
     "npm run build:binary && node scripts/codex-generated-config-probe.js",
   );
-  assert.match(packageDocument.scripts["release:check"], /npm run test:codex-config$/);
+  assert.match(packageDocument.scripts["release:check"], /npm run test:codex-config && npm run test:opencode-global$/);
 });

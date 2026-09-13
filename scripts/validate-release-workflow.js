@@ -17,8 +17,14 @@ function actionIndex(steps, prefix) {
 }
 
 function requireBlockingStep(step, message) {
-  invariant(step && !step.if, `${message}; the step must be unconditional`);
+  invariant(step && !Object.hasOwn(step, "if"), `${message}; the step must be unconditional`);
   invariant(step["continue-on-error"] === undefined || step["continue-on-error"] === false,
+    `${message}; continue-on-error must be absent or the literal boolean false`);
+}
+
+function requireBlockingJob(job, message) {
+  invariant(job && !Object.hasOwn(job, "if"), `${message}; the job must be unconditional`);
+  invariant(job["continue-on-error"] === undefined || job["continue-on-error"] === false,
     `${message}; continue-on-error must be absent or the literal boolean false`);
 }
 
@@ -69,10 +75,11 @@ export function validateReleaseWorkflow(document) {
   invariant(Array.isArray(push?.branches) && push.branches.includes("main"),
     "every push to main must trigger the native release workflow");
   invariant(Array.isArray(push?.tags) && push.tags.includes("v*"),
-    "stable v0.7.0 tag path requires the version-tag release trigger v*");
+    "stable version tag path requires the version-tag release trigger v*");
   const build = document?.jobs?.build;
   const publish = document?.jobs?.publish;
   invariant(build && publish, "build and publish jobs are required");
+  requireBlockingJob(build, "native build and OpenCode integration gates must be blocking");
   invariant(build.strategy?.["fail-fast"] === false, "all native targets must complete even if one fails");
   const targets = build.strategy?.matrix?.include || [];
   const names = new Set(targets.map((target) => target.name));
@@ -91,17 +98,19 @@ export function validateReleaseWorkflow(document) {
   requireBlockingCommand(steps, "npm run test:clients", "native client adapter tests are missing");
   const buildIndex = runIndex(steps, "npm run build:binary");
   const signIndex = steps.findIndex((step) => String(step.run || "").includes("codesign --force --sign"));
+  const opencodeIndex = runIndex(steps, "npm run test:opencode-global");
   const smokeIndex = runIndex(steps, "npm run smoke:binary");
   const semanticIndex = runIndex(steps, "npm run smoke:binary:semantic");
   const checksumIndex = runIndex(steps, "npm run checksum:binaries");
   const uploadIndex = actionIndex(steps, "actions/upload-artifact@");
   invariant(buildIndex >= 0, "standalone binary build is missing");
   invariant(signIndex > buildIndex, "macOS signing must occur after build");
-  invariant(smokeIndex > signIndex, "post-sign binary smoke is missing or misordered");
+  invariant(opencodeIndex > signIndex, "post-sign real OpenCode global integration smoke is missing or misordered");
+  invariant(smokeIndex > opencodeIndex, "post-sign binary smoke is missing or misordered");
   invariant(semanticIndex > smokeIndex, "post-sign native semantic inference is missing or misordered");
   invariant(checksumIndex > semanticIndex, "checksums must be created only after semantic verification");
   invariant(uploadIndex > checksumIndex, "only post-verification bytes may be uploaded");
-  for (const index of [smokeIndex, semanticIndex, checksumIndex, uploadIndex]) {
+  for (const index of [opencodeIndex, smokeIndex, semanticIndex, checksumIndex, uploadIndex]) {
     requireBlockingStep(steps[index],
       "verification/checksum/upload gates must run for every native matrix target");
   }
@@ -266,15 +275,18 @@ export function validateCiWorkflow(document) {
   requireBlockingCommand(jobs.container.steps || [], "npm run test:clients",
     "container client adapter tests are missing");
   const steps = jobs.binary.steps || [];
+  requireBlockingJob(jobs.binary, "CI binary and OpenCode integration gates must be blocking");
   const functionalIndex = runIndex(steps, "npm run test:binary");
+  const opencodeIndex = runIndex(steps, "npm run test:opencode-global");
   const semanticIndex = runIndex(steps, "npm run smoke:binary:semantic");
   const checksumIndex = runIndex(steps, "npm run checksum:binaries");
   const uploadIndex = actionIndex(steps, "actions/upload-artifact@");
   invariant(functionalIndex >= 0, "CI standalone binary test is missing");
-  invariant(semanticIndex > functionalIndex, "CI native semantic inference is missing or misordered");
+  invariant(opencodeIndex > functionalIndex, "CI real OpenCode global integration smoke is missing or misordered");
+  invariant(semanticIndex > opencodeIndex, "CI native semantic inference is missing or misordered");
   invariant(checksumIndex > semanticIndex, "CI checksums must follow semantic verification");
   invariant(uploadIndex > checksumIndex, "CI may upload only post-verification bytes");
-  for (const index of [functionalIndex, semanticIndex, checksumIndex, uploadIndex]) {
+  for (const index of [functionalIndex, opencodeIndex, semanticIndex, checksumIndex, uploadIndex]) {
     requireBlockingStep(steps[index], "CI binary verification/checksum/upload gates must be blocking");
   }
   return { valid: true, binary_artifact_verified: true, client_adapters_verified: true };

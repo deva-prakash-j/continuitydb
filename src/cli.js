@@ -40,18 +40,28 @@ import { defaultDataHome, hasPrivateDirectoryPermissions } from "./paths.js";
 import { acquireVaultInitializationLock } from "./file-lock.js";
 import { resolveProjectIdentity } from "./project-identity.js";
 import { listRegisteredProjects, registerProject } from "./project-registry.js";
+import { ensureTrustedProject } from "./trusted-project.js";
+import {
+  globalOpenCodeStatus,
+  installGlobalOpenCode,
+  uninstallGlobalOpenCode,
+} from "./opencode-global-install.js";
 
 function parse(argv) {
   const positional = [];
   const flags = {};
+  const repeatable = new Set(["workspace_root"]);
   for (let index = 0; index < argv.length; index += 1) {
     const item = argv[index];
     if (!item.startsWith("--")) { positional.push(item); continue; }
     const [rawKey, inline] = item.slice(2).split("=", 2);
     const key = rawKey.replaceAll("-", "_");
-    if (inline !== undefined) flags[key] = inline;
-    else if (argv[index + 1] && !argv[index + 1].startsWith("--")) flags[key] = argv[++index];
-    else flags[key] = true;
+    let value;
+    if (inline !== undefined) value = inline;
+    else if (argv[index + 1] && !argv[index + 1].startsWith("--")) value = argv[++index];
+    else value = true;
+    if (flags[key] === undefined || !repeatable.has(key)) flags[key] = value;
+    else flags[key] = Array.isArray(flags[key]) ? [...flags[key], value] : [flags[key], value];
   }
   return { positional, flags };
 }
@@ -65,7 +75,9 @@ function numberFlag(value, fallback) {
 
 function listFlag(value) {
   if (!value) return [];
-  return String(value).split(",").map((item) => item.trim()).filter(Boolean);
+  return (Array.isArray(value) ? value : [value])
+    .flatMap((item) => String(item).split(","))
+    .map((item) => item.trim()).filter(Boolean);
 }
 
 function output(value, pretty = true) {
@@ -88,6 +100,10 @@ Usage:
   continuitydb agents disconnect AGENT|all [--project-dir PATH] [--mcp-only] --apply
   continuitydb projects list [--home PATH]
   continuitydb projects add --project-dir PATH [--project ID] [--home PATH] [--apply]
+  continuitydb opencode install --workspace-root PATH [--workspace-root PATH ...] [--opencode-config-dir PATH] [--home PATH] [--apply]
+  continuitydb opencode ensure --project-dir PATH --workspace-root PATH [--workspace-root PATH ...] [--home PATH] --apply
+  continuitydb opencode status [--opencode-config-dir PATH]
+  continuitydb opencode uninstall [--opencode-config-dir PATH] [--apply]
   continuitydb mcp [--home PATH]
   continuitydb hook session-start|checkpoint [HOOK OPTIONS]
   continuitydb propose --body TEXT [--project ID] [--title TEXT] [--idempotency-key KEY]
@@ -615,6 +631,31 @@ try {
       });
       output({ project: identity, ...registerProject(home, identity, { apply: Boolean(flags.apply) }) });
     } else throw new Error(`unknown projects action: ${action}`);
+  } else if (command === "opencode") {
+    const action = positional.shift() || "status";
+    const configDir = flags.opencode_config_dir ? resolve(flags.opencode_config_dir) : undefined;
+    if (action === "install") {
+      const binary = isStandaloneBinary() ? process.execPath : resolve(process.argv[1]);
+      output(installGlobalOpenCode({
+        configDir,
+        workspaceRoots: listFlag(flags.workspace_root),
+        home,
+        binary,
+        apply: Boolean(flags.apply),
+      }));
+    } else if (action === "ensure") {
+      if (!flags.project_dir) throw new Error("opencode ensure requires --project-dir PATH");
+      output(ensureTrustedProject(home, {
+        directory: resolve(flags.project_dir),
+        worktree: flags.worktree ? resolve(flags.worktree) : null,
+        workspaceRoots: listFlag(flags.workspace_root),
+        apply: Boolean(flags.apply),
+      }));
+    } else if (action === "status") {
+      output(globalOpenCodeStatus({ configDir }));
+    } else if (action === "uninstall") {
+      output(uninstallGlobalOpenCode({ configDir, apply: Boolean(flags.apply) }));
+    } else throw new Error(`unknown opencode action: ${action}`);
   } else if (command === "agents") {
     const action = positional.shift() || "status";
     if (action === "detect") output({ agents: detectAgents() });

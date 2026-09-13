@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -9,7 +9,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import { acquireVaultInitializationLock } from "./file-lock.js";
 import { validateProjectId } from "./project-identity.js";
 
@@ -56,17 +56,59 @@ function readConfig(home) {
   }
   const projects = (config.projects || []).map(normalizeProject);
   const projectIds = new Set();
+  const projectRoots = new Set();
   for (const project of projects) {
     if (projectIds.has(project.id)) {
       throw new Error(`project ${project.id} is registered more than once`);
     }
+    const key = rootKey(project.root);
+    if (projectRoots.has(key)) {
+      throw new Error(`project root ${project.root} is registered more than once`);
+    }
     projectIds.add(project.id);
+    projectRoots.add(key);
   }
   return {
     path,
     config,
     projects,
   };
+}
+
+function rootHash(root) {
+  const normalized = process.platform === "win32" ? root.toLowerCase() : root;
+  return createHash("sha256").update(normalized).digest("hex");
+}
+
+function rootKey(root) {
+  const fixed = resolve(root);
+  return process.platform === "win32" ? fixed.toLowerCase() : fixed;
+}
+
+function preferredProjectId(root) {
+  const digest = rootHash(root);
+  const cleaned = basename(root)
+    .normalize("NFKC")
+    .replace(/[^A-Za-z0-9._/-]+/g, "-")
+    .replace(/^[^A-Za-z0-9]+/, "")
+    .replace(/-+$/, "")
+    .slice(0, 200);
+  return validateProjectId(cleaned || `project-${digest.slice(0, 12)}`);
+}
+
+export function projectIdForRegisteredRoot(root, projects) {
+  const fixedRoot = resolve(root);
+  const existing = projects.find((project) => rootKey(project.root) === rootKey(fixedRoot));
+  if (existing) return existing.id;
+  const preferred = preferredProjectId(fixedRoot);
+  if (!projects.some((project) => project.id === preferred)) return preferred;
+  const digest = rootHash(fixedRoot);
+  for (const length of [12, 16, 24, 32, 64]) {
+    const availableBase = preferred.slice(0, 199 - length);
+    const candidate = validateProjectId(`${availableBase}-${digest.slice(0, length)}`);
+    if (!projects.some((project) => project.id === candidate)) return candidate;
+  }
+  throw new Error(`cannot derive a unique project identifier for ${fixedRoot}`);
 }
 
 function writeConfig(path, config) {
@@ -109,6 +151,31 @@ export function registerProject(home, identity, { apply = false } = {}) {
       writeConfig(path, { ...config, projects: updated });
     }
     return { changed, applied: Boolean(apply), projects: updated };
+  } finally {
+    releaseLock();
+  }
+}
+
+export function ensureRegisteredProject(home, root, { apply = false, source = "git" } = {}) {
+  const resolvedHome = resolve(home);
+  const fixedRoot = resolve(root);
+  const releaseLock = acquireVaultInitializationLock(resolvedHome);
+  try {
+    const { path, config, projects } = readConfig(resolvedHome);
+    const existing = projects.find((project) => rootKey(project.root) === rootKey(fixedRoot));
+    if (existing) return { project: existing, changed: false, applied: Boolean(apply), projects };
+    const project = normalizeProject({
+      id: projectIdForRegisteredRoot(fixedRoot, projects),
+      root: fixedRoot,
+      source,
+    });
+    const updated = [...projects, project];
+    if (apply) {
+      mkdirSync(resolvedHome, { recursive: true, mode: 0o700 });
+      assertHome(resolvedHome);
+      writeConfig(path, { ...config, projects: updated });
+    }
+    return { project, changed: true, applied: Boolean(apply), projects: updated };
   } finally {
     releaseLock();
   }
