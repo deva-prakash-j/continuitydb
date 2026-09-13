@@ -33,6 +33,14 @@ export function defaultOpenCodeConfigDir() {
   return resolve(homedir(), ".config", "opencode");
 }
 
+export function canonicalOpenCodeConfigDir(path, platform = process.platform) {
+  const absolute = resolve(String(path));
+  if (platform === "darwin" && (absolute === "/var" || absolute.startsWith("/var/"))) {
+    return `/private${absolute}`;
+  }
+  return absolute;
+}
+
 function directoryMetadata(path) {
   if (!existsSync(path)) return null;
   const metadata = lstatSync(path, { bigint: true });
@@ -220,7 +228,7 @@ function discoverLegacyAdapters(workspaceRoots, budget = DEFAULT_SCAN_BUDGET) {
 }
 
 function normalizedOptions({ configDir = defaultOpenCodeConfigDir(), workspaceRoots, home, binary } = {}) {
-  const fixedConfigDir = resolve(configDir);
+  const fixedConfigDir = canonicalOpenCodeConfigDir(configDir);
   if (!Array.isArray(workspaceRoots) || workspaceRoots.length < 1 || workspaceRoots.length > 64) {
     throw new Error("one to sixty-four workspace roots are required");
   }
@@ -246,7 +254,7 @@ function normalizedOptions({ configDir = defaultOpenCodeConfigDir(), workspaceRo
 }
 
 export function globalOpenCodeStatus({ configDir = defaultOpenCodeConfigDir() } = {}) {
-  const plugin = join(resolve(configDir), "plugins", "continuitydb.js");
+  const plugin = join(canonicalOpenCodeConfigDir(configDir), "plugins", "continuitydb.js");
   const content = readPlugin(plugin);
   if (content === null) return { installed: false, verified: false, drifted: false, plugin };
   try {
@@ -308,7 +316,7 @@ export function installGlobalOpenCode(rawOptions = {}) {
 }
 
 export function uninstallGlobalOpenCode({ configDir = defaultOpenCodeConfigDir(), apply = false } = {}) {
-  const fixedConfigDir = resolve(configDir);
+  const fixedConfigDir = canonicalOpenCodeConfigDir(configDir);
   const plugin = join(fixedConfigDir, "plugins", "continuitydb.js");
   if (!existsSync(plugin)) {
     return { action: "uninstall", applied: Boolean(apply), changed: false, verified: true, plugin };

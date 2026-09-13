@@ -9,12 +9,23 @@ import { connectAgent, migrateManagedOpenCodeProjects } from "../src/agent-conne
 import { registerProject } from "../src/project-registry.js";
 import { ensureTrustedProject } from "../src/trusted-project.js";
 import {
+  canonicalOpenCodeConfigDir,
   globalOpenCodeStatus,
   installGlobalOpenCode,
   uninstallGlobalOpenCode,
 } from "../src/opencode-global-install.js";
 
 const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+
+test("global OpenCode config canonicalizes only the trusted macOS /var alias", () => {
+  assert.equal(canonicalOpenCodeConfigDir("/var/folders/example/opencode", "darwin"),
+    "/private/var/folders/example/opencode");
+  assert.equal(canonicalOpenCodeConfigDir("/var", "darwin"), "/private/var");
+  assert.equal(canonicalOpenCodeConfigDir("/var/folders/example/opencode", "linux"),
+    "/var/folders/example/opencode");
+  assert.equal(canonicalOpenCodeConfigDir("/variable/opencode", "darwin"),
+    "/variable/opencode");
+});
 
 function repository(parent, name) {
   const repo = join(parent, name);

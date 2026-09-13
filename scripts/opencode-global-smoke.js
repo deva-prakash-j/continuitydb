@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -22,7 +22,7 @@ if (process.platform !== "win32") {
   chmodSync(opencode, 0o755);
 }
 
-const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-native-"));
+const root = realpathSync.native(mkdtempSync(join(tmpdir(), "continuitydb-opencode-native-")));
 const workspaceOne = join(root, "workspace-one");
 const workspaceTwo = join(root, "workspace-two");
 const repoOne = join(workspaceOne, "service");
