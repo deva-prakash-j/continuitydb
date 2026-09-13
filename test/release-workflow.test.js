@@ -11,6 +11,7 @@ import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
 const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
 const packageDocument = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const openCodeSmoke = readFileSync(new URL("../scripts/opencode-global-smoke.js", import.meta.url), "utf8");
 
 test("release workflow blocks publication on post-sign native semantic verification", () => {
   assert.equal(validateReleaseWorkflow(workflow).valid, true);
@@ -197,6 +198,14 @@ test("native and CI workflows cannot skip or ignore the real OpenCode global smo
   const skippedCiJob = structuredClone(ciWorkflow);
   skippedCiJob.jobs.binary.if = "github.ref == 'refs/heads/main'";
   assert.throws(() => validateCiWorkflow(skippedCiJob), /job must be unconditional/i);
+});
+
+test("real OpenCode smoke invokes remember and search through the installed plugin handlers", () => {
+  assert.match(openCodeSmoke, /ContinuityDBGlobalPlugin/);
+  assert.match(openCodeSmoke, /hooks\.tool\.continuitydb_remember\.execute/);
+  assert.match(openCodeSmoke, /hooks\.tool\.continuitydb_memory_search\.execute/);
+  assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"capture"/);
+  assert.doesNotMatch(openCodeSmoke, /succeed\(binary, \[\s*"search"/);
 });
 
 test("release workflow rejects mutable action tags in privileged and build jobs", () => {

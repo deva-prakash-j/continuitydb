@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const extension = process.platform === "win32" ? ".exe" : "";
 const binary = resolve(process.env.CONTINUITYDB_BINARY_PATH || process.argv[2]
@@ -71,6 +71,22 @@ function openRepository(repository) {
   });
 }
 
+async function loadInstalledPlugin() {
+  // OpenCode has already loaded and validated this exact global plugin. Make its
+  // pinned SDK dependency resolvable to Node so the smoke can invoke the same
+  // registered handler definitions without requiring a model/provider credential.
+  const packageTarget = join(configRoot, "node_modules", "@opencode-ai", "plugin");
+  mkdirSync(join(configRoot, "node_modules", "@opencode-ai"), { recursive: true });
+  cpSync(fileURLToPath(new URL("../node_modules/@opencode-ai/plugin/", import.meta.url)), packageTarget, {
+    recursive: true,
+  });
+  writeFileSync(join(configDir, "package.json"), '{"type":"module"}\n', { mode: 0o600 });
+  const installedPlugin = join(configDir, "plugins", "continuitydb.js");
+  const module = await import(`${pathToFileURL(installedPlugin).href}?native-smoke=${Date.now()}`);
+  assert.equal(typeof module.ContinuityDBGlobalPlugin, "function");
+  return module.ContinuityDBGlobalPlugin;
+}
+
 try {
   for (const repository of [repoOne, repoTwo]) {
     mkdirSync(repository, { recursive: true });
@@ -101,27 +117,26 @@ try {
   assert.match(projects[1].id, /^service-[a-f0-9]{12}$/);
   assert.equal(projects.some((project) => project.id === "default"), false);
 
+  const ContinuityDBGlobalPlugin = await loadInstalledPlugin();
   for (const [index, project] of projects.entries()) {
     const marker = `OpenCodeNativeMemory${index + 1}`;
-    const key = createHash("sha256").update(`${project.id}\0${marker}`).digest("hex");
-    const environment = {
-      ...process.env,
-      CONTINUITYDB_TENANT_ID: "opencode-native",
-      CONTINUITYDB_PRINCIPAL_ID: "opencode-global-smoke",
-      CONTINUITYDB_OWNER_ID: "opencode-native-owner",
-      CONTINUITYDB_AGENT_ID: "opencode",
-      CONTINUITYDB_ALLOWED_PROJECTS: project.id,
-      CONTINUITYDB_ALLOWED_SENSITIVITIES: "public,private",
+    const hooks = await ContinuityDBGlobalPlugin({
+      directory: project.root,
+      worktree: process.platform === "win32" ? "C:\\" : "/",
+      client: { app: { log: async () => ({}) } },
+    });
+    const context = {
+      directory: project.root,
+      worktree: process.platform === "win32" ? "C:\\" : "/",
+      sessionID: `native-smoke-${index + 1}`,
     };
-    const captured = succeed(binary, [
-      "capture", "--body", `${marker} is active.`,
-      "--kind", "working", "--sensitivity", "private",
-      "--idempotency-key", key, "--project", project.id, "--home", home,
-    ], { env: environment });
+    const captured = JSON.parse(await hooks.tool.continuitydb_remember.execute({
+      body: `${marker} is active.`,
+      kind: "working",
+      sensitivity: "private",
+    }, context));
     assert.equal(captured.record.project_id, project.id);
-    const search = succeed(binary, [
-      "search", marker, "--project", project.id, "--allow-projects", project.id, "--home", home,
-    ], { env: environment });
+    const search = JSON.parse(await hooks.tool.continuitydb_memory_search.execute({ query: marker }, context));
     assert.equal(search.results.length, 1);
     assert.equal(search.results[0].project_id, project.id);
     assert.match(search.results[0].body, new RegExp(marker));
@@ -142,7 +157,7 @@ try {
     projects: projects.map(({ id, root: projectRoot }) => ({ id, root: projectRoot })),
     checks: [
       "global-install", "real-opencode-plugin-load", "automatic-project-registration",
-      "collision-safe-project-ids", "plan-tool-permission", "project-isolated-capture-search",
+      "collision-safe-project-ids", "plan-tool-permission", "installed-plugin-handler-capture-search",
       "memory-preserving-uninstall",
     ],
   }, null, 2)}\n`);
