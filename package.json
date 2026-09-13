@@ -100,7 +100,6 @@
     "onnxruntime-web": "1.29.0"
   },
   "devDependencies": {
-    "@ai-sdk/openai-compatible": "3.0.48",
     "@opencode-ai/plugin": "1.18.30",
     "esbuild": "0.28.2",
     "opencode-ai": "1.18.30",

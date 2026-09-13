@@ -216,7 +216,9 @@ test("native and CI workflows cannot skip or ignore the real OpenCode global smo
 
 test("real OpenCode smoke invokes remember and search through the installed plugin handlers", () => {
   assert.match(openCodeSmoke, /runAsync\(opencode,\s*\[\s*"run"/);
-  assert.match(openCodeSmoke, /@ai-sdk\/openai-compatible/);
+  assert.match(openCodeSmoke, /npm: "@ai-sdk\/openai-compatible"/);
+  assert.doesNotMatch(openCodeSmoke, /@ai-sdk\/openai-compatible@/,
+    "the native smoke must use OpenCode's bundled provider without a runtime package install");
   assert.match(openCodeSmoke, /continuitydb_remember/);
   assert.match(openCodeSmoke, /continuitydb_memory_search/);
   assert.doesNotMatch(openCodeSmoke, /loadInstalledPlugin/);

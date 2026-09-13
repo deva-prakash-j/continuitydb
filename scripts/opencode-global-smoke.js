@@ -199,7 +199,7 @@ async function invokeToolsThroughOpenCode(repository, projectId, marker) {
       $schema: "https://opencode.ai/config.json",
       provider: {
         "continuity-smoke": {
-          npm: "@ai-sdk/openai-compatible@3.0.48",
+          npm: "@ai-sdk/openai-compatible",
           name: "ContinuityDB local smoke provider",
           options: { baseURL: provider.baseURL, apiKey: "local-smoke-placeholder" },
           models: { "memory-smoke": { name: "ContinuityDB memory smoke" } },
