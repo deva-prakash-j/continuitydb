@@ -49,7 +49,7 @@ test("global plugin automatically ensures the Git project and injects first-task
     }));
     const logs = [];
     const hooks = await module.ContinuityDBGlobalPlugin({
-      directory: repo, worktree: repo,
+      directory: repo, worktree: "/",
       client: { app: { log: async ({ body }) => logs.push(body) } },
     });
     await hooks["chat.message"](
@@ -85,7 +85,7 @@ test("global plugin tools are fixed to the derived project and governed capture"
       executable: cli.path, home: join(root, "vault"), workspaceRoots: [workspace],
     }));
     const hooks = await module.ContinuityDBGlobalPlugin({
-      directory: repo, worktree: repo, client: { app: { log: async () => {} } },
+      directory: repo, worktree: "/", client: { app: { log: async () => {} } },
     });
     const config = { permission: { "*": "ask", bash: "deny" } };
     await hooks.config(config);
@@ -96,7 +96,7 @@ test("global plugin tools are fixed to the derived project and governed capture"
       assert.equal(Object.hasOwn(definition.args, "project_id"), false);
       assert.equal(Object.hasOwn(definition.args, "project"), false);
     }
-    const context = { directory: repo, worktree: repo, sessionID: "s", messageID: "m", agent: "plan" };
+    const context = { directory: repo, worktree: "/", sessionID: "s", messageID: "m", agent: "plan" };
     const search = await hooks.tool.continuitydb_memory_search.execute({ query: "billing" }, context);
     assert.match(search, /Scoped search result/);
     const saved = await hooks.tool.continuitydb_remember.execute({
@@ -138,7 +138,7 @@ test("global plugin refreshes bounded context during compaction without storing 
       executable: cli.path, home: join(root, "vault"), workspaceRoots: [workspace],
     }));
     const hooks = await module.ContinuityDBGlobalPlugin({
-      directory: repo, worktree: repo, client: { app: { log: async () => {} } },
+      directory: repo, worktree: "/", client: { app: { log: async () => {} } },
     });
     await hooks["chat.message"]({ sessionID: "s" }, { parts: [{ type: "text", text: "PRIVATE TASK TEXT" }] });
     const output = { context: [] };
