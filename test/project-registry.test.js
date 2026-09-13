@@ -99,3 +99,20 @@ test("a stored project ID registered at two roots fails closed", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("a stored project root registered under two IDs fails closed", () => {
+  const { root, home } = fixture();
+  const shared = join(root, "shared");
+  try {
+    mkdirSync(home);
+    writeFileSync(join(home, "config.json"), `${JSON.stringify({
+      projects: [
+        { id: "service", root: shared, source: "git" },
+        { id: "service-copy", root: shared, source: "git" },
+      ],
+    })}\n`, { mode: 0o600 });
+    assert.throws(() => listRegisteredProjects(home), /root .*registered more than once/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
