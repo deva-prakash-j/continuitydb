@@ -17,13 +17,13 @@ function actionIndex(steps, prefix) {
 }
 
 function requireBlockingStep(step, message) {
-  invariant(step && !step.if, `${message}; the step must be unconditional`);
+  invariant(step && !Object.hasOwn(step, "if"), `${message}; the step must be unconditional`);
   invariant(step["continue-on-error"] === undefined || step["continue-on-error"] === false,
     `${message}; continue-on-error must be absent or the literal boolean false`);
 }
 
 function requireBlockingJob(job, message) {
-  invariant(job && !job.if, `${message}; the job must be unconditional`);
+  invariant(job && !Object.hasOwn(job, "if"), `${message}; the job must be unconditional`);
   invariant(job["continue-on-error"] === undefined || job["continue-on-error"] === false,
     `${message}; continue-on-error must be absent or the literal boolean false`);
 }

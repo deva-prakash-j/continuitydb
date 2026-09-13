@@ -186,6 +186,15 @@ test("native and CI workflows cannot skip or ignore the real OpenCode global smo
     .find((step) => step.run === "npm run test:opencode-global").if = "runner.os == 'Linux'";
   assert.throws(() => validateReleaseWorkflow(conditionalNative), /must run for every native matrix target/i);
 
+  const falseConditionalNative = structuredClone(workflow);
+  falseConditionalNative.jobs.build.steps
+    .find((step) => step.run === "npm run test:opencode-global").if = false;
+  assert.throws(() => validateReleaseWorkflow(falseConditionalNative), /must run for every native matrix target/i);
+
+  const falseConditionalNativeJob = structuredClone(workflow);
+  falseConditionalNativeJob.jobs.build.if = false;
+  assert.throws(() => validateReleaseWorkflow(falseConditionalNativeJob), /job must be unconditional/i);
+
   const ignoredNativeJob = structuredClone(workflow);
   ignoredNativeJob.jobs.build["continue-on-error"] = true;
   assert.throws(() => validateReleaseWorkflow(ignoredNativeJob), /OpenCode integration gates.*continue-on-error/i);
@@ -198,6 +207,11 @@ test("native and CI workflows cannot skip or ignore the real OpenCode global smo
   const skippedCiJob = structuredClone(ciWorkflow);
   skippedCiJob.jobs.binary.if = "github.ref == 'refs/heads/main'";
   assert.throws(() => validateCiWorkflow(skippedCiJob), /job must be unconditional/i);
+
+  const falseConditionalCi = structuredClone(ciWorkflow);
+  falseConditionalCi.jobs.binary.steps
+    .find((step) => step.run === "npm run test:opencode-global").if = false;
+  assert.throws(() => validateCiWorkflow(falseConditionalCi), /must be blocking/i);
 });
 
 test("real OpenCode smoke invokes remember and search through the installed plugin handlers", () => {
