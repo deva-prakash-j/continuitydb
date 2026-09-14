@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
 import { createHash } from "node:crypto";
+import { TextDecoder } from "node:util";
 
 const CODE_EXTENSIONS = new Set([
   ".c", ".cc", ".cpp", ".cs", ".go", ".java", ".js", ".jsx", ".kt", ".kts",
@@ -14,6 +15,7 @@ const SYMBOL_PATTERNS = [
   /\b(?:function|def|fn|func)\s+([A-Za-z_$][\w$]*)\s*\(/g,
   /\b(?:public|private|protected|static|async|final|synchronized|abstract|export\s+)?(?:[A-Za-z_$][\w$<>,.?\[\] ]+\s+)+([A-Za-z_$][\w$]*)\s*\([^;{}]*\)\s*(?:\{|=>)/g,
 ];
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 function git(root, args) {
   return execFileSync("git", ["-C", root, ...args], {
@@ -134,6 +136,8 @@ export function readCommittedSnapshot(inputPath, {
         maxBuffer: Math.max(objectSize + 1, 64 * 1024),
       });
       if (contents.includes(0)) { skipped.unsupported += 1; continue; }
+      try { UTF8_DECODER.decode(contents); }
+      catch { skipped.unsupported += 1; continue; }
       const checksum = createHash("sha256").update(contents).digest("hex");
       files.push({ repo_path: repoPath, git_object_id: entry.objectId, checksum, bytes: contents });
     } catch {

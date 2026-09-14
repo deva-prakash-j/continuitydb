@@ -45,6 +45,7 @@ test("committed snapshots are root-bound, blob-only, limited, and safe to share 
     writeFileSync(join(root, "src", "Api.java"), "public class Api {}\n");
     writeFileSync(join(root, ".env"), "SECRET=committed\n");
     writeFileSync(join(root, "large.md"), "x".repeat(80));
+    writeFileSync(join(root, "invalid.md"), Buffer.from([0xff, 0x61]));
     symlinkSync("README.md", join(root, "readme-link.md"));
     git(root, "init");
     git(root, "config", "user.name", "Fixture");
@@ -60,16 +61,18 @@ test("committed snapshots are root-bound, blob-only, limited, and safe to share 
     assert.equal(JSON.stringify(snapshot).includes("Dirty worktree text"), false);
     assert.equal(snapshot.files.some((file) => file.repo_path === ".env"), false);
     assert.equal(snapshot.files.some((file) => file.repo_path === "readme-link.md"), false);
+    assert.equal(snapshot.files.some((file) => file.repo_path === "invalid.md"), false);
     assert.equal(snapshot.skipped.denied, 1);
     assert.equal(snapshot.skipped.symlink, 1);
     assert.equal(snapshot.skipped.too_large, 1);
+    assert.equal(snapshot.skipped.unsupported, 1);
     assert.throws(() => readCommittedSnapshot(join(root, "src")), /Git repository root/);
     const limited = readCommittedSnapshot(root, { projectId: "api", maxFiles: 2, maxFileBytes: 32 });
     assert.equal(limited.truncated, true);
     assert.equal(limited.scanned_files, 2);
 
     const scan = scanRepository(root, { projectId: "api", maxFiles: 20, maxFileBytes: 32 });
-    assert.equal(scan.scanned_files, 5);
+    assert.equal(scan.scanned_files, 6);
     assert.equal(scan.produced_records, 2);
     assert.deepEqual(scan.skipped, snapshot.skipped);
     assert.equal(JSON.stringify(scan).includes("Committed README"), true);

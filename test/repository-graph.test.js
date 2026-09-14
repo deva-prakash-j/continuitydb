@@ -105,6 +105,40 @@ test("separates branches and removes only from the newly active projection", () 
   } finally { f.cleanup(); }
 });
 
+test("target-side changes, deletes, and renames reparse dependent callers", () => {
+  const change = fixture();
+  try {
+    buildRepositoryGraph(change.vault, change.repo, { projectId: "orders" });
+    writeFileSync(join(change.repo, "src", "OrderService.java"), "package acme; public class OrderService { public void save() {} public void later() {} }\n");
+    commit(change.repo, "change target");
+    const result = buildRepositoryGraph(change.vault, change.repo, { projectId: "orders" });
+    assert.equal(result.parsed_files, 2);
+    assert.equal(result.reused_files, 2);
+  } finally { change.cleanup(); }
+
+  const deletion = fixture();
+  try {
+    buildRepositoryGraph(deletion.vault, deletion.repo, { projectId: "orders" });
+    git(deletion.repo, "rm", "src/OrderService.java");
+    commit(deletion.repo, "delete target");
+    const result = buildRepositoryGraph(deletion.vault, deletion.repo, { projectId: "orders" });
+    assert.equal(result.parsed_files, 1);
+    assert.equal(result.reused_files, 2);
+    assert.equal(result.removed_files, 1);
+  } finally { deletion.cleanup(); }
+
+  const rename = fixture();
+  try {
+    buildRepositoryGraph(rename.vault, rename.repo, { projectId: "orders" });
+    git(rename.repo, "mv", "src/OrderService.java", "src/RenamedService.java");
+    commit(rename.repo, "rename target");
+    const result = buildRepositoryGraph(rename.vault, rename.repo, { projectId: "orders" });
+    assert.equal(result.parsed_files, 2);
+    assert.equal(result.reused_files, 2);
+    assert.equal(result.removed_files, 1);
+  } finally { rename.cleanup(); }
+});
+
 test("invalidated extractors and failed publication keep the active graph readable", () => {
   const f = fixture();
   try {
@@ -122,9 +156,11 @@ test("invalidated extractors and failed publication keep the active graph readab
     assert.ok(activeNodes(f.vault, "orders", active.branch).length > 0);
 
     writeFileSync(join(f.repo, "src", "ignored.js"), "export const ignored = true;\n");
+    writeFileSync(join(f.repo, "invalid.md"), Buffer.from([0xff, 0x61]));
     commit(f.repo, "unsupported graph source");
     const unsupported = buildRepositoryGraph(f.vault, f.repo, { projectId: "orders", extractorVersion: "test-v2" });
-    assert.equal(unsupported.unsupported_files, 1);
+    assert.equal(unsupported.unsupported_files, 2);
+    assert.equal(unsupported.reused_files, 4);
     assert.equal(first.nodes > 0, true);
   } finally { f.cleanup(); }
 });

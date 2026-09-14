@@ -151,6 +151,21 @@ test("publishing a graph atomically supersedes the previous generation", () => {
   } finally { f.cleanup(); }
 });
 
+test("active graph projection exposes only the scoped active generation", () => {
+  const f = fixture();
+  try {
+    const first = f.vault.publishGraph(graphFixture({ commit: "a" }));
+    const projection = f.vault.activeGraphProjection({ project_id: "api", branch: "main" });
+    assert.equal(projection.generation.id, first.id);
+    assert.equal(projection.source_states.length, 2);
+    assert.equal(projection.nodes.length, 2);
+    assert.equal(projection.edges.length, 1);
+    assert.deepEqual(f.vault.activeGraphProjection({ project_id: "other", branch: "main" }), {
+      generation: null, source_states: [], nodes: [], edges: [],
+    });
+  } finally { f.cleanup(); }
+});
+
 test("an invalid projection leaves the active generation unchanged", () => {
   const f = fixture();
   try {

@@ -15,24 +15,21 @@ function extractorFor(repoPath) {
 }
 
 function activeProjection(vault, scope) {
-  const generation = vault.activeGraphGeneration(scope);
-  if (!generation) return { generation: null, sourceStates: new Map(), nodesByPath: new Map(), edgesByPath: new Map() };
-  if (!vault?.db?.prepare) throw new Error("vault must expose graph source state storage");
-  const sourceStates = new Map(vault.db.prepare(`
-    SELECT repo_path, git_object_id, content_hash, extractor_version
-    FROM graph_source_states WHERE tenant_id = ? AND generation_id = ?
-  `).all(generation.tenant_id, generation.id).map((row) => [row.repo_path, row]));
+  const projection = vault.activeGraphProjection(scope);
+  const sourceStates = new Map(projection.source_states.map((row) => [row.repo_path, row]));
   const nodesByPath = new Map();
-  for (const node of vault.db.prepare(`SELECT * FROM graph_nodes WHERE tenant_id = ? AND generation_id = ?`).all(generation.tenant_id, generation.id)) {
+  const nodesById = new Map();
+  for (const node of projection.nodes) {
     const nodes = nodesByPath.get(node.repo_path) || [];
     nodes.push(node); nodesByPath.set(node.repo_path, nodes);
+    nodesById.set(node.id, node);
   }
   const edgesByPath = new Map();
-  for (const edge of vault.db.prepare(`SELECT * FROM graph_edges WHERE tenant_id = ? AND generation_id = ?`).all(generation.tenant_id, generation.id)) {
+  for (const edge of projection.edges) {
     const edges = edgesByPath.get(edge.repo_path) || [];
     edges.push(edge); edgesByPath.set(edge.repo_path, edges);
   }
-  return { generation, sourceStates, nodesByPath, edgesByPath };
+  return { generation: projection.generation, sourceStates, nodesByPath, nodesById, edgesByPath, edges: projection.edges };
 }
 
 // Extractors deliberately emit unresolved placeholders when they only see one
@@ -78,7 +75,7 @@ function copied(items, commit) {
  * untouched.
  */
 export function buildRepositoryGraph(vault, inputPath, options = {}) {
-  if (!vault || typeof vault.publishGraph !== "function" || typeof vault.activeGraphGeneration !== "function") {
+  if (!vault || typeof vault.publishGraph !== "function" || typeof vault.activeGraphProjection !== "function") {
     throw new Error("vault must provide graph publication APIs");
   }
   const snapshot = readCommittedSnapshot(inputPath, options);
@@ -87,6 +84,32 @@ export function buildRepositoryGraph(vault, inputPath, options = {}) {
   const extractor_version = options.extractorVersion ?? options.extractor_version ?? REPOSITORY_GRAPH_EXTRACTOR_VERSION;
   const scope = { tenant_id, project_id, branch: snapshot.repository.branch };
   const prior = activeProjection(vault, scope);
+  const candidates = snapshot.files.map((file) => ({ file, extractor: extractorFor(file.repo_path) }));
+  const graphPaths = new Set(candidates.filter(({ extractor }) => extractor).map(({ file }) => file.repo_path));
+  const pathsToParse = new Set();
+  for (const { file, extractor } of candidates) {
+    if (!extractor) continue;
+    const old = prior.sourceStates.get(file.repo_path);
+    if (!old || old.git_object_id !== file.git_object_id || old.extractor_version !== extractor_version) {
+      pathsToParse.add(file.repo_path);
+    }
+  }
+  // A reused source can retain an edge to a declaration in another file. If
+  // that target is changed, deleted, or renamed, re-extract the caller so it
+  // either resolves to the replacement or emits a safe local placeholder.
+  const affectedPaths = new Set([...pathsToParse, ...[...prior.sourceStates.keys()].filter((path) => !graphPaths.has(path))]);
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (const edge of prior.edges) {
+      const sourcePath = edge.repo_path || prior.nodesById.get(edge.source_id)?.repo_path;
+      const targetPath = prior.nodesById.get(edge.target_id)?.repo_path;
+      if (!targetPath || !affectedPaths.has(targetPath) || !graphPaths.has(sourcePath) || affectedPaths.has(sourcePath)) continue;
+      affectedPaths.add(sourcePath);
+      pathsToParse.add(sourcePath);
+      expanded = true;
+    }
+  }
   const source_states = [];
   const nodes = [];
   const edges = [];
@@ -95,8 +118,7 @@ export function buildRepositoryGraph(vault, inputPath, options = {}) {
   let reused_files = 0;
   let unsupported_files = snapshot.skipped.unsupported;
 
-  for (const file of snapshot.files) {
-    const extractor = extractorFor(file.repo_path);
+  for (const { file, extractor } of candidates) {
     if (!extractor) { unsupported_files += 1; continue; }
     source_states.push({
       repo_path: file.repo_path,
@@ -105,7 +127,7 @@ export function buildRepositoryGraph(vault, inputPath, options = {}) {
       extractor_version,
     });
     const old = prior.sourceStates.get(file.repo_path);
-    if (old && old.git_object_id === file.git_object_id && old.extractor_version === extractor_version) {
+    if (old && old.git_object_id === file.git_object_id && old.extractor_version === extractor_version && !pathsToParse.has(file.repo_path)) {
       reused_files += 1;
       nodes.push(...copied(prior.nodesByPath.get(file.repo_path), snapshot.repository.commit));
       edges.push(...copied(prior.edgesByPath.get(file.repo_path), snapshot.repository.commit));

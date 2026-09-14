@@ -1152,6 +1152,28 @@ export class ContextVault {
     return graphGenerationFromRow(row);
   }
 
+  activeGraphProjection(scope) {
+    const generation = this.activeGraphGeneration(scope);
+    if (!generation) return { generation: null, source_states: [], nodes: [], edges: [] };
+    const source_states = this.db.prepare(`
+      SELECT repo_path, git_object_id, content_hash, extractor_version
+      FROM graph_source_states
+      WHERE tenant_id = ? AND generation_id = ?
+      ORDER BY repo_path
+    `).all(generation.tenant_id, generation.id);
+    const nodes = this.db.prepare(`
+      SELECT * FROM graph_nodes
+      WHERE tenant_id = ? AND generation_id = ?
+      ORDER BY id
+    `).all(generation.tenant_id, generation.id).map((node) => ({ ...node, branch: node.branch || null }));
+    const edges = this.db.prepare(`
+      SELECT * FROM graph_edges
+      WHERE tenant_id = ? AND generation_id = ?
+      ORDER BY id
+    `).all(generation.tenant_id, generation.id);
+    return { generation, source_states, nodes, edges };
+  }
+
   graphStatus(scope) {
     const normalized = normalizeGraphScope(scope);
     const branchClause = normalized.branchProvided ? " AND branch = ?" : "";
