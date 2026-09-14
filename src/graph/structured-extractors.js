@@ -22,6 +22,37 @@ function empty(errors = 0, warnings = 0, skipped = 0) {
 
 function isSecret(parts) { return parts.some((part) => SECRET_KEY.test(part)); }
 
+function maskXmlComments(text) {
+  return text.replace(/<!--[\s\S]*?(?:-->|$)/g, (comment) => comment.replace(/[^\r\n]/g, " "));
+}
+
+function maskGradleComments(text) {
+  const chars = [...text]; let quote = null;
+  for (let index = 0; index < chars.length;) {
+    if (quote) {
+      if (chars[index] === "\\") { index += 2; continue; }
+      if (chars[index] === quote) quote = null;
+      index += 1; continue;
+    }
+    if (chars[index] === "'" || chars[index] === '"') { quote = chars[index]; index += 1; continue; }
+    if (chars[index] === "/" && chars[index + 1] === "/") {
+      const start = index; index += 2;
+      while (index < chars.length && chars[index] !== "\n") index += 1;
+      for (let cursor = start; cursor < index; cursor += 1) chars[cursor] = " ";
+      continue;
+    }
+    if (chars[index] === "/" && chars[index + 1] === "*") {
+      const start = index; index += 2;
+      while (index < chars.length && !(chars[index] === "*" && chars[index + 1] === "/")) index += 1;
+      index = Math.min(chars.length, index + 2);
+      for (let cursor = start; cursor < index; cursor += 1) if (chars[cursor] !== "\n") chars[cursor] = " ";
+      continue;
+    }
+    index += 1;
+  }
+  return chars.join("");
+}
+
 function graphBuilder(scope, language) {
   const nodes = new Map(); const edges = [];
   const addNode = (kind, qualified_name, { line = null, summary = undefined } = {}) => {
@@ -67,32 +98,34 @@ function graphBuilder(scope, language) {
 }
 
 function extractPom(scope, text) {
-  if (!/<project(?:\s|>)/.test(text) || !/<\/project\s*>/.test(text)) return empty(1);
+  const masked = maskXmlComments(text);
+  if (!/<project(?:\s|>)/.test(masked) || !/<\/project\s*>/.test(masked)) return empty(1);
   const graph = graphBuilder(scope, "xml");
   const dependency = /<dependency(?:\s[^>]*)?>([\s\S]*?)<\/dependency\s*>/g;
   let match; let line = 1;
-  while ((match = dependency.exec(text))) {
+  while ((match = dependency.exec(masked))) {
     const group = match[1].match(/<groupId\s*>([^<\s]+)<\/groupId\s*>/)?.[1];
     const artifact = match[1].match(/<artifactId\s*>([^<\s]+)<\/artifactId\s*>/)?.[1];
     if (!group || !artifact || /[@/\\]/.test(group) || /[@/\\]/.test(artifact)) continue;
-    line = text.slice(0, match.index).split("\n").length;
+    line = masked.slice(0, match.index).split("\n").length;
     graph.addEdge(graph.file, graph.addNode("dependency", `${group}:${artifact}`, { line }), "depends-on", line);
   }
   return graph.finish();
 }
 
 function extractGradle(scope, text) {
+  const masked = maskGradleComments(text);
   let quote = null;
-  for (let index = 0; index < text.length; index += 1) {
-    if (text[index] === "\\") { index += 1; continue; }
-    if ((text[index] === "'" || text[index] === '"') && (!quote || quote === text[index])) quote = quote ? null : text[index];
+  for (let index = 0; index < masked.length; index += 1) {
+    if (masked[index] === "\\") { index += 1; continue; }
+    if ((masked[index] === "'" || masked[index] === '"') && (!quote || quote === masked[index])) quote = quote ? null : masked[index];
   }
-  if (quote || (text.match(/\(/g)?.length || 0) !== (text.match(/\)/g)?.length || 0)) return empty(1);
+  if (quote || (masked.match(/\(/g)?.length || 0) !== (masked.match(/\)/g)?.length || 0)) return empty(1);
   const graph = graphBuilder(scope, "gradle");
   const notation = /\b(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testRuntimeOnly)\s*(?:\(\s*)?["']([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)(?::[^"']+)?["']\s*\)?/g;
   let match;
-  while ((match = notation.exec(text))) {
-    const line = text.slice(0, match.index).split("\n").length;
+  while ((match = notation.exec(masked))) {
+    const line = masked.slice(0, match.index).split("\n").length;
     graph.addEdge(graph.file, graph.addNode("dependency", `${match[1]}:${match[2]}`, { line }), "depends-on", line);
   }
   return graph.finish();

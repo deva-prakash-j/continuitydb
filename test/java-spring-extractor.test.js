@@ -38,18 +38,47 @@ function relations(result) {
 
 test("extracts deterministic Java and Spring graph facts", () => {
   const result = extractJavaSpring(input);
-  const expected = [
+  assert.deepEqual(relations(result), [
     "calls:com.acme.OrderController.list->com.acme.OrderService.findAll",
     "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderController",
+    "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderPort",
+    "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderService",
     "exposes:com.acme.OrderController.list->GET /orders",
     "implements:com.acme.OrderService->com.acme.OrderPort",
+    "imports:src/main/java/com/acme/OrderController.java->org.springframework.beans.factory.annotation.Value",
+    "imports:src/main/java/com/acme/OrderController.java->org.springframework.web.bind.annotation.GetMapping",
     "imports:src/main/java/com/acme/OrderController.java->org.springframework.web.bind.annotation.RestController",
     "reads-config:com.acme.OrderController->orders.page-size",
-  ];
-  assert.deepEqual(relations(result).filter((relation) => expected.includes(relation)), expected);
+  ]);
   assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme" && node.kind === "package"));
   assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme.OrderController.list"));
   assert.ok(!result.nodes.some((node) => node.qualified_name.includes("Pretend") || node.qualified_name.includes("nope")));
   assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme.OrderController.overloaded/1"));
   assert.deepEqual(result, extractJavaSpring(input));
+});
+
+test("handles fully-qualified annotations, secret configuration keys, and extends target kinds", () => {
+  const result = extractJavaSpring({
+    ...input,
+    text: `package com.acme;
+class Parent {}
+class Child extends Parent {}
+interface ParentPort {}
+interface ChildPort extends ParentPort {}
+class A {
+  @org.springframework.beans.factory.annotation.Value("\${db.password}") String password;
+  @org.springframework.beans.factory.annotation.Value("\${orders.page-size}") String pageSize;
+  @org.springframework.web.bind.annotation.GetMapping("/orders") void list() {}
+}`,
+  });
+  const nodeById = new Map(result.nodes.map((node) => [node.id, node]));
+  assert.ok(!result.nodes.some((node) => node.qualified_name.includes("db.password")));
+  assert.ok(!result.edges.some((edge) => edge.relation === "reads-config" && edge.target.qualified_name.includes("db.password")));
+  assert.ok(result.edges.some((edge) => edge.relation === "reads-config" && edge.target.qualified_name === "orders.page-size"));
+  assert.ok(result.edges.some((edge) => edge.relation === "exposes" && edge.source.qualified_name === "com.acme.A.list" && edge.target.qualified_name === "GET /orders"));
+  assert.ok(!result.nodes.some((node) => node.qualified_name === "com.acme.A.Value"));
+  const classExtends = result.edges.find((edge) => edge.relation === "extends" && nodeById.get(edge.source_id).qualified_name === "com.acme.Child");
+  const interfaceExtends = result.edges.find((edge) => edge.relation === "extends" && nodeById.get(edge.source_id).qualified_name === "com.acme.ChildPort");
+  assert.equal(nodeById.get(classExtends.target_id).kind, "class");
+  assert.equal(nodeById.get(interfaceExtends.target_id).kind, "interface");
 });

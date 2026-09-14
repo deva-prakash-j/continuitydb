@@ -30,3 +30,13 @@ test("handles duplicate keys and malformed input safely and deterministically", 
   assert.equal(malformed.diagnostics.errors, 1);
   assert.deepEqual(duplicate, extract("application.yml", "server:\n  port: 8080\n  port: 9090\nsecret:\n  value: do-not-leak\n"));
 });
+
+test("does not extract dependencies from XML or Gradle comments", () => {
+  const pom = extract("pom.xml", `<project><!-- <dependency><groupId>internal</groupId><artifactId>do-not-leak</artifactId></dependency> --><dependencies><dependency><groupId>org.springframework</groupId><artifactId>spring-web</artifactId></dependency></dependencies></project>`);
+  const gradle = extract("build.gradle", `// implementation("internal:do-not-leak:1.0")\n/* api('internal:do-not-leak:1.0') */\nimplementation("org.springframework:spring-web:6.1.0")`);
+  for (const result of [pom, gradle]) {
+    assert.ok(!JSON.stringify(result).includes("internal:do-not-leak"));
+    assert.deepEqual(result.edges.map((edge) => `${edge.relation}:${edge.target.qualified_name}`), ["depends-on:org.springframework:spring-web"]);
+  }
+  assert.equal(gradle.edges[0].start_line, 3);
+});

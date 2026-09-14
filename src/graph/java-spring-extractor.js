@@ -4,6 +4,7 @@ import { requiredIdentifier } from "../security.js";
 const EXTRACTOR_VERSION = "java-spring-v1";
 const TYPE_WORDS = new Set(["class", "interface", "enum", "record"]);
 const MODIFIERS = new Set(["public", "private", "protected", "static", "final", "abstract", "default", "synchronized", "native", "strictfp", "sealed", "non-sealed", "volatile", "transient"]);
+const SECRET_CONFIGURATION_KEY = /(?:pass(?:word)?|secret|token|api[-_]?key|credential|private[-_]?key|authorization|auth)/i;
 
 function scopeFor(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("extractor input must be an object");
@@ -112,12 +113,17 @@ function annotationFacts(tokens, parens) {
   const annotations = [];
   for (let index = 0; index + 1 < tokens.length; index += 1) {
     if (tokens[index].value !== "@" || tokens[index + 1].type !== "identifier") continue;
-    let end = index + 1; let args = [];
-    if (tokens[end + 1]?.value === "(") {
-      const close = parens.get(end + 1);
-      if (close !== undefined) { args = tokens.slice(end + 2, close); end = close; }
+    const parts = [tokens[index + 1].value]; let cursor = index + 1; let args = []; let open = null;
+    while (tokens[cursor + 1]?.value === "." && tokens[cursor + 2]?.type === "identifier") {
+      parts.push(tokens[cursor + 2].value); cursor += 2;
     }
-    annotations.push({ name: tokens[index + 1].value, start: index, end, args, token: tokens[index] });
+    let end = cursor;
+    if (tokens[cursor + 1]?.value === "(") {
+      open = cursor + 1;
+      const close = parens.get(open);
+      if (close !== undefined) { args = tokens.slice(open + 1, close); end = close; }
+    }
+    annotations.push({ name: parts.join("."), simpleName: parts.at(-1), start: index, end, open, args, token: tokens[index] });
   }
   return annotations;
 }
@@ -135,6 +141,7 @@ export function parseJavaStructure(tokens) {
     }
   }
   const annotations = annotationFacts(tokens, parens);
+  const annotationOpens = new Set(annotations.map((annotation) => annotation.open).filter((index) => index !== null));
   const types = [];
   for (let index = 0; index < tokens.length - 1; index += 1) {
     if (!TYPE_WORDS.has(tokens[index].value) || tokens[index + 1].type !== "identifier") continue;
@@ -164,7 +171,7 @@ export function parseJavaStructure(tokens) {
     for (let index = type.open + 1; index < type.close; index += 1) {
       if (tokens[index].value === "{") { depth += 1; continue; }
       if (tokens[index].value === "}") { depth -= 1; continue; }
-      if (depth !== 0 || tokens[index].value !== "(" || tokens[index - 1]?.type !== "identifier" || tokens[index - 2]?.value === "@") continue;
+      if (depth !== 0 || annotationOpens.has(index) || tokens[index].value !== "(" || tokens[index - 1]?.type !== "identifier" || tokens[index - 2]?.value === "@") continue;
       const close = parens.get(index); if (close === undefined) continue;
       let terminator = close + 1;
       while (terminator < type.close && !["{", ";", "="].includes(tokens[terminator].value)) terminator += 1;
@@ -194,7 +201,7 @@ export function parseJavaStructure(tokens) {
 
 function endpointFor(annotation) {
   const methods = { GetMapping: "GET", PostMapping: "POST", PutMapping: "PUT", DeleteMapping: "DELETE", PatchMapping: "PATCH" };
-  const method = methods[annotation.name];
+  const method = methods[annotation.simpleName];
   if (!method) return null;
   const path = annotation.args.find((token) => token.type === "string")?.value || "/";
   return `${method} ${path.startsWith("/") ? path : `/${path}`}`;
@@ -239,7 +246,8 @@ export function mapJavaStructureToGraph(input, syntax) {
   for (const type of syntax.types) {
     const source = typeNodes.get(type.qualified_name);
     for (const relation of type.relations) {
-      const target = addNode("interface", qualifiedType(relation.target, syntax.packageName, syntax.imports), type.token, "resolved");
+      const targetKind = relation.relation === "implements" || type.kind === "interface" ? "interface" : "class";
+      const target = addNode(targetKind, qualifiedType(relation.target, syntax.packageName, syntax.imports), type.token, "resolved");
       addEdge(source, target, relation.relation, type.token);
     }
     for (const field of type.fields) addNode("field", `${type.qualified_name}.${field.name}`, field.token);
@@ -261,10 +269,12 @@ export function mapJavaStructureToGraph(input, syntax) {
   for (const type of syntax.types) {
     const source = typeNodes.get(type.qualified_name);
     for (const annotation of syntax.annotations.filter((item) => item.start > type.open && item.end < type.close)) {
-      if (annotation.name !== "Value") continue;
+      if (annotation.simpleName !== "Value") continue;
       const value = annotation.args.find((token) => token.type === "string")?.value || "";
       const key = value.match(/\$?\{?([A-Za-z0-9_.-]+)\}?/)?.[1];
-      if (key) addEdge(source, addNode("configuration-key", key, annotation.token), "reads-config", annotation.token);
+      if (key && !SECRET_CONFIGURATION_KEY.test(key)) {
+        addEdge(source, addNode("configuration-key", key, annotation.token), "reads-config", annotation.token);
+      }
     }
     for (const method of type.methods) {
       const methodNode = methodNodes.get(method.qualified_name);
