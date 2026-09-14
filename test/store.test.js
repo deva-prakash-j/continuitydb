@@ -143,10 +143,10 @@ test("publishing a graph atomically supersedes the previous generation", () => {
   try {
     const first = f.vault.publishGraph(graphFixture({ commit: "a" }));
     const second = f.vault.publishGraph(graphFixture({ commit: "b" }));
-    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, second.id);
-    assert.equal(f.vault.graphStatus({ project_id: "api" }).generations.superseded, 1);
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api", branch: "main" }).id, second.id);
+    assert.equal(f.vault.graphStatus({ project_id: "api", branch: "main" }).generations.superseded, 1);
     assert.notEqual(first.id, second.id);
-    assert.equal(f.vault.graphStatus({ project_id: "api" }).nodes, 2);
+    assert.equal(f.vault.graphStatus({ project_id: "api", branch: "main" }).nodes, 2);
     assert.equal(f.vault.verifyAuditLog().valid, true);
   } finally { f.cleanup(); }
 });
@@ -239,7 +239,7 @@ test("an invalid projection leaves the active generation unchanged", () => {
   try {
     const active = f.vault.publishGraph(graphFixture({ commit: "a" }));
     assert.throws(() => f.vault.publishGraph(graphFixture({ commit: "b", danglingEdge: true })), /unknown target node/);
-    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, active.id);
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api", branch: "main" }).id, active.id);
   } finally { f.cleanup(); }
 });
 
@@ -251,7 +251,7 @@ test("graph publication rejects a scope that graph reads cannot address", () => 
       /project_id contains invalid characters or length/,
     );
     const published = f.vault.publishGraph(graphFixture({ commit: "b" }));
-    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, published.id);
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api", branch: "main" }).id, published.id);
   } finally { f.cleanup(); }
 });
 

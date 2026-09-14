@@ -358,7 +358,7 @@ components:
           type: string
           enum: [hybrid, graph-only, graph-first]
           default: hybrid
-          description: Hybrid preserves eager semantic retrieval; graph-only never embeds; graph-first embeds only after insufficient graph coverage.
+          description: Hybrid is the graph-free legacy governed-memory baseline and preserves eager semantic retrieval; graph-only never embeds; graph-first embeds only after insufficient graph coverage.
         graph_depth: { type: integer, minimum: 0, maximum: 3, default: 2 }
         strict_evidence: { type: boolean, default: false }
         graph_max_visited: { type: integer, minimum: 25, maximum: 2000, default: 400 }
@@ -368,7 +368,7 @@ components:
       required: [requested_mode, effective_mode, semantic_fallback_used, fallback_reason, graph_generation]
       properties:
         requested_mode: { type: string, enum: [hybrid, graph-only, graph-first] }
-        effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical+graph] }
+        effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical, lexical+graph] }
         semantic_fallback_used: { type: boolean }
         fallback_reason:
           type: [string, "null"]
@@ -396,6 +396,8 @@ components:
         project_id: { type: string }
         branch: { type: [string, "null"] }
         commit: { type: string }
+        valid_from: { type: [string, "null"], format: date-time }
+        valid_to: { type: [string, "null"], format: date-time }
     GraphPathHop:
       type: object
       required: [edge_id, source_id, source_label, target_id, target_label, relation, direction, provenance, weight]
@@ -405,6 +407,10 @@ components:
         source_label: { type: string }
         target_id: { type: string }
         target_label: { type: string }
+        source_generation_id: { type: string, description: Present for cross-generation hops. }
+        source_project_id: { type: string, description: Present for cross-project hops. }
+        target_generation_id: { type: string, description: Present for cross-generation hops. }
+        target_project_id: { type: string, description: Present for cross-project hops. }
         relation: { type: string }
         direction: { type: string, enum: [incoming, outgoing] }
         provenance: { type: string, enum: [extracted, resolved, inferred] }
@@ -420,7 +426,7 @@ components:
         generated_at: { type: string, format: date-time }
         retrieval_mode:
           type: string
-          enum: [hybrid, graph-only, graph-first, lexical+graph]
+          enum: [hybrid, graph-only, graph-first, lexical, lexical+graph]
           description: Actual effective retrieval mode; may be omitted only when compacting the smallest token envelopes.
         retrieval:
           description: Full detailed retrieval metadata; compact token envelopes retain only effective_mode, semantic_fallback_used, and fallback_reason.
@@ -429,7 +435,7 @@ components:
             - type: object
               required: [effective_mode, semantic_fallback_used, fallback_reason]
               properties:
-                effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical+graph] }
+                effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical, lexical+graph] }
                 semantic_fallback_used: { type: boolean }
                 fallback_reason:
                   type: [string, "null"]

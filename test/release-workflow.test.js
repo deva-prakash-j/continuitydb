@@ -808,6 +808,18 @@ test("graph-first release benchmark uses the frozen representative fixture and r
   assert.equal(report.security.stale_generation_failures, 0);
   assert.equal(Number.isFinite(report.modes["graph-first"].median_context_tokens), true);
   assert.equal(Number.isFinite(report.modes["graph-first"].embedding_avoidance_rate), true);
+  assert.equal(report.methodology.graph_source, "production-committed-snapshot-extraction");
+  assert.equal(report.security.owner_scope_failures, 0);
+  assert.equal(report.security.sensitivity_scope_failures, 0);
+  assert.equal(report.security.omitted_branch_failures, 0);
+  assert.equal(report.security.historical_generation_failures, 0);
+  assert.equal(report.security.expected_empty_failures, 0);
+  assert.equal(Number.isFinite(report.resources.index_wall_time_ms), true);
+  assert.equal(Number.isSafeInteger(report.resources.peak_memory_bytes), true);
+  assert.equal(Number.isSafeInteger(report.resources.database_size_bytes), true);
+  assert.equal(Number.isFinite(report.resources.incremental_update_time_ms), true);
+  assert.ok(report.resources.incremental_parsed_files >= 1);
+  assert.ok(report.resources.incremental_reused_files >= 1);
   assert.deepEqual(Object.keys(report.by_query_class).sort(), [
     "call-path", "conceptual", "configuration-flow", "cross-project-path",
     "dependency-impact", "exact-symbol", "historical-decision",
@@ -864,6 +876,7 @@ test("graph-first isolation probes request denied content and account for cited 
       assert.equal(observations.length, 3);
       for (const observation of observations) {
         assert.equal(observation.cross_scope_failure, false);
+        assert.equal(observation.expected_empty_failure, false);
         assert.deepEqual(observation.forbidden_evidence_projects, []);
       }
     }
@@ -891,8 +904,11 @@ test("graph-first benchmark avoidance is based on queries, not raw embed calls",
 });
 
 test("graph-first benchmark has deterministic non-timing metrics", async () => {
+  const volatileResourceFields = new Set([
+    "index_wall_time_ms", "incremental_update_time_ms", "peak_memory_bytes", "database_size_bytes",
+  ]);
   const stableReport = (report) => JSON.parse(JSON.stringify(report, (key, value) => (
-    key.endsWith("latency_ms") ? undefined : value
+    key.endsWith("latency_ms") || volatileResourceFields.has(key) ? undefined : value
   )));
   const first = await runGraphFirstBenchmark();
   const second = await runGraphFirstBenchmark();

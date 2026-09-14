@@ -14,14 +14,24 @@ function publishOrderGraph(vault) {
     label: "OrderController",
     language: "java",
   };
+  const service = {
+    repo_path: "src/main/java/com/acme/OrderService.java",
+    kind: "class",
+    qualified_name: "com.acme.OrderService",
+    label: "OrderService",
+    language: "java",
+  };
   return vault.publishGraph({
     project_id: "orders",
     branch: "main",
     commit: "abc123",
     extractor_version: "test-v1",
-    source_states: [{ repo_path: controller.repo_path, git_object_id: "controller-v1" }],
-    nodes: [controller],
-    edges: [],
+    source_states: [
+      { repo_path: controller.repo_path, git_object_id: "controller-v1" },
+      { repo_path: service.repo_path, git_object_id: "service-v1" },
+    ],
+    nodes: [controller, service],
+    edges: [{ source: controller, target: service, relation: "calls", repo_path: controller.repo_path }],
   });
 }
 
@@ -121,6 +131,42 @@ test("graph-only never embeds, while legacy hybrid eagerly includes semantic can
   }
 });
 
+test("legacy hybrid results are unchanged when a native code graph is published", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-legacy-hybrid-baseline-"));
+  const vault = new ContextVault(root);
+  const embedder = countingEmbedder();
+  try {
+    const semantic = vault.propose({
+      project_id: "orders",
+      namespace_id: "project/orders",
+      title: "OrderController legacy memory",
+      body: "The existing hybrid baseline ranks this governed memory.",
+    });
+    vault.commit(semantic.record.id);
+    const engine = new HybridEngine(vault, embedder);
+    await engine.indexMemory(semantic.record.id);
+    const request = {
+      query: "OrderController",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "main",
+      as_of: "2026-09-14T00:00:00Z",
+      retrieval_mode: "hybrid",
+      top_k: 8,
+      token_budget: 32000,
+    };
+    const before = await engine.searchDetailed(request);
+    publishOrderGraph(vault);
+    const after = await engine.searchDetailed(request);
+    assert.deepEqual(after.results, before.results);
+    assert.equal(after.results.some((item) => item.type === "graph-node"), false);
+    assert.equal(after.retrieval.graph_generation, null);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("context packs expose actual graph, fallback, hybrid, and unavailable retrieval telemetry", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-context-pack-modes-"));
   const vault = new ContextVault(root);
@@ -180,7 +226,7 @@ test("context packs expose actual graph, fallback, hybrid, and unavailable retri
       task: "OrderController",
       retrieval_mode: "hybrid",
     });
-    assert.equal(hybridUnavailable.retrieval_mode, "lexical+graph");
+    assert.equal(hybridUnavailable.retrieval_mode, "lexical");
     assert.equal(hybridUnavailable.retrieval.requested_mode, "hybrid");
     assert.equal(hybridUnavailable.retrieval.semantic_fallback_used, false);
     assert.equal(hybridUnavailable.retrieval.fallback_reason, null);
@@ -237,7 +283,7 @@ test("unauthorized or stale graphs cannot suppress fallback and unavailable sema
       allowed_projects: ["orders"],
       retrieval_mode: "hybrid",
     });
-    assert.equal(legacyWithoutEmbedder.retrieval.effective_mode, "lexical+graph");
+    assert.equal(legacyWithoutEmbedder.retrieval.effective_mode, "lexical");
     assert.equal(legacyWithoutEmbedder.retrieval.semantic_fallback_used, false);
     assert.equal(legacyWithoutEmbedder.retrieval.fallback_reason, null);
   } finally {

@@ -164,3 +164,95 @@ test("invalidated extractors and failed publication keep the active graph readab
     assert.equal(first.nodes > 0, true);
   } finally { f.cleanup(); }
 });
+
+test("incomplete snapshots and extractor errors refuse publication with diagnostics", () => {
+  const truncated = fixture();
+  try {
+    assert.throws(
+      () => buildRepositoryGraph(truncated.vault, truncated.repo, { projectId: "orders", maxFiles: 2 }),
+      (error) => error.code === "INCOMPLETE_GRAPH_SNAPSHOT"
+        && error.diagnostics.truncated === true
+        && error.diagnostics.scanned_files === 2,
+    );
+    assert.equal(truncated.vault.activeGraphGeneration({ project_id: "orders" }), null);
+  } finally { truncated.cleanup(); }
+
+  const oversized = fixture();
+  try {
+    assert.throws(
+      () => buildRepositoryGraph(oversized.vault, oversized.repo, { projectId: "orders", maxFileBytes: 32 }),
+      (error) => error.code === "INCOMPLETE_GRAPH_SNAPSHOT" && error.diagnostics.skipped.too_large > 0,
+    );
+    assert.equal(oversized.vault.activeGraphGeneration({ project_id: "orders" }), null);
+  } finally { oversized.cleanup(); }
+
+  const malformed = fixture();
+  try {
+    const branch = git(malformed.repo, "branch", "--show-current");
+    const active = buildRepositoryGraph(malformed.vault, malformed.repo, { projectId: "orders" });
+    writeFileSync(join(malformed.repo, "broken.json"), "{\"server\":");
+    commit(malformed.repo, "malformed structured file");
+    assert.throws(
+      () => buildRepositoryGraph(malformed.vault, malformed.repo, { projectId: "orders" }),
+      (error) => error.code === "GRAPH_EXTRACTION_FAILED" && error.diagnostics.errors === 1,
+    );
+    assert.equal(malformed.vault.activeGraphGeneration({ project_id: "orders", branch }).id, active.generation_id);
+  } finally { malformed.cleanup(); }
+});
+
+test("since is only a change hint and never turns unchanged tracked files into removals", () => {
+  const f = fixture();
+  try {
+    const first = buildRepositoryGraph(f.vault, f.repo, { projectId: "orders" });
+    writeFileSync(join(f.repo, "README.md"), "# Orders\nChanged with since.\n");
+    commit(f.repo, "changed readme with since hint");
+    const second = buildRepositoryGraph(f.vault, f.repo, { projectId: "orders", since: first.commit });
+    assert.equal(second.scanned_files, 4);
+    assert.equal(second.parsed_files, 1);
+    assert.equal(second.reused_files, 3);
+    assert.equal(second.removed_files, 0);
+    assert.ok(activeNodes(f.vault, "orders", git(f.repo, "branch", "--show-current"))
+      .some((item) => item.repo_path === "src/OrderService.java"));
+  } finally { f.cleanup(); }
+});
+
+test("compare-and-swap publication rejects a build based on a superseded generation", () => {
+  const f = fixture();
+  try {
+    const branch = git(f.repo, "branch", "--show-current");
+    buildRepositoryGraph(f.vault, f.repo, { projectId: "orders" });
+    writeFileSync(join(f.repo, "README.md"), "# Orders\nBuild that loses a publication race.\n");
+    commit(f.repo, "race candidate");
+
+    const originalPublish = f.vault.publishGraph.bind(f.vault);
+    let winner;
+    f.vault.publishGraph = (candidate, options) => {
+      f.vault.publishGraph = originalPublish;
+      const concurrent = nodeProjectionForRace(candidate, "concurrent-winner");
+      winner = originalPublish(concurrent);
+      return originalPublish(candidate, options);
+    };
+    assert.throws(
+      () => buildRepositoryGraph(f.vault, f.repo, { projectId: "orders" }),
+      (error) => error.code === "STALE_GRAPH_BUILD",
+    );
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "orders", branch }).id, winner.id);
+  } finally { f.cleanup(); }
+});
+
+function nodeProjectionForRace(candidate, commitValue) {
+  const marker = { repo_path: "RACE.md", kind: "document-section", qualified_name: "race.Winner" };
+  return {
+    tenant_id: candidate.tenant_id,
+    owner_id: candidate.owner_id,
+    namespace_id: candidate.namespace_id,
+    sensitivity: candidate.sensitivity,
+    project_id: candidate.project_id,
+    branch: candidate.branch,
+    commit: commitValue,
+    extractor_version: candidate.extractor_version,
+    source_states: [{ repo_path: marker.repo_path, git_object_id: commitValue }],
+    nodes: [marker],
+    edges: [],
+  };
+}

@@ -89,15 +89,17 @@ Typed project and memory edges carry weight, provenance and validity windows.
 2. Compute explicit project dependency closure within the caller allowlist.
 3. Apply tenant, owner, namespace, sensitivity, status, branch, expiry, valid-time
    and stale filters inside every retriever.
-4. Resolve exact symbol/path/configuration/dependency seeds, then graph FTS seeds.
-5. Traverse authorized typed graph edges with depth, visited-node, and path budgets.
-6. Evaluate graph coverage. In `graph-first`, invoke semantic retrieval only for
+4. For `graph-only` and `graph-first`, resolve exact
+   symbol/path/configuration/dependency seeds, then graph FTS seeds and traverse
+   authorized typed edges with depth, visited-node, and path budgets. `hybrid`
+   intentionally skips the native graph as the legacy rollback baseline.
+5. Evaluate graph coverage. In `graph-first`, invoke semantic retrieval only for
    `no_seed`, `insufficient_candidates`, `low_path_confidence`, or
    `conceptual_query`; `graph-only` never embeds and `hybrid` embeds eagerly.
-7. Fuse lexical, semantic (when used), record, and graph-path ranks using weighted RRF.
-8. Apply project proximity, confidence, importance, freshness and exact-score boosts.
-9. Use Maximal Marginal Relevance to reduce duplicate evidence.
-10. Pack the full serialized envelope within the caller budget and return
+6. Fuse the mode-applicable lexical, semantic, record, and graph-path ranks using weighted RRF.
+7. Apply project proximity, confidence, importance, freshness and exact-score boosts.
+8. Use Maximal Marginal Relevance to reduce duplicate evidence.
+9. Pack the full serialized envelope within the caller budget and return
     citations, evidence paths, requested/effective mode, fallback reason, and
     active generation metadata.
 
@@ -121,8 +123,10 @@ scope or stale-generation failures. See [graph-first retrieval](graph-first-retr
 - A graph build publishes a complete staging generation in one transaction;
   readers see either the prior active generation or the complete replacement.
   Changed-file builds reuse unchanged extracted facts, while extractor-version
-  changes force reparsing. Graph projections remain rebuildable and do not
-  replace governed records.
+  changes force reparsing. Incomplete snapshots, extractor failures, changed
+  repository HEADs, and stale active-generation compare-and-swap attempts refuse
+  publication. Graph projections remain rebuildable and do not replace governed
+  records.
 - Forgetting tombstones the record and removes it from all local retrieval paths.
 - Distributed mode uses canonical transaction + outbox/log; projectors are
   idempotent and query responses expose index generation/freshness.

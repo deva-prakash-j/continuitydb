@@ -115,7 +115,7 @@ Usage:
   continuitydb search QUERY|--query QUERY [--project ID] [--allow-projects A,B] [--top-k N] [--mode MODE] [--depth 0..3]
   continuitydb context TASK [--project ID] [--allow-projects A,B] [--token-budget N]
   continuitydb graph build --repo PATH --project ID [--apply]
-  continuitydb graph status --project ID [--branch REF]
+  continuitydb graph status --project ID [--branch REF]       # omission means branch-null only
   continuitydb graph explain --project ID --node QUALIFIED_NAME [--branch REF]
   continuitydb graph path --project ID --from QUALIFIED_NAME --to QUALIFIED_NAME [--branch REF]
   continuitydb handoff-save --file HANDOFF.json

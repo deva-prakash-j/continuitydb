@@ -213,6 +213,17 @@ function before(annotations, fact) {
 
 export function mapJavaStructureToGraph(input, syntax) {
   const scope = scopeFor(input); const nodes = new Map(); const edges = [];
+  // Excerpts are evidence, not a second secret-bearing source archive. Reuse the
+  // lexical mask so comments and string payloads cannot escape the extractor's
+  // existing configuration-key redaction policy through an excerpt.
+  const sourceLines = maskJava(input.text).split(/\r?\n/);
+  const excerptAt = (token) => {
+    let excerpt = token?.line
+      ? (sourceLines[token.line - 1] || "").trim()
+      : sourceLines.find((line) => line.trim())?.trim() || "";
+    while (Buffer.byteLength(excerpt, "utf8") > 512) excerpt = excerpt.slice(0, Math.floor(excerpt.length * 0.9)).trimEnd();
+    return excerpt || null;
+  };
   const addNode = (kind, qualified_name, token = null, provenance = "extracted", label = qualified_name) => {
     const identity = { ...scope, kind, qualified_name };
     const id = graphNodeId(identity);
@@ -221,6 +232,7 @@ export function mapJavaStructureToGraph(input, syntax) {
       start_line: token?.line ?? null, start_column: token?.column ?? null,
       end_line: token ? token.line : null, end_column: token ? token.column + token.value.length : null,
       extractor_version: EXTRACTOR_VERSION,
+      excerpt: excerptAt(token),
     });
     return nodes.get(id);
   };
@@ -250,7 +262,10 @@ export function mapJavaStructureToGraph(input, syntax) {
       const target = addNode(targetKind, qualifiedType(relation.target, syntax.packageName, syntax.imports), type.token, "resolved");
       addEdge(source, target, relation.relation, type.token);
     }
-    for (const field of type.fields) addNode("field", `${type.qualified_name}.${field.name}`, field.token);
+    for (const field of type.fields) {
+      const fieldNode = addNode("field", `${type.qualified_name}.${field.name}`, field.token);
+      addEdge(source, fieldNode, "contains", field.token);
+    }
   }
   const methodGroups = new Map();
   for (const type of syntax.types) for (const method of type.methods) {
@@ -261,24 +276,34 @@ export function mapJavaStructureToGraph(input, syntax) {
   for (const [base, records] of methodGroups) records.forEach(({ method }, ordinal) => {
     const suffix = records.length > 1 ? `/${method.arity}${ordinal ? `-${ordinal + 1}` : ""}` : "";
     method.qualified_name = `${base}${suffix}`;
-    methodNodes.set(method.qualified_name, addNode("method", method.qualified_name, method.token));
+    const kind = method.name === records[0].type.name ? "constructor" : "method";
+    methodNodes.set(method.qualified_name, addNode(kind, method.qualified_name, method.token));
   });
-  for (const annotation of syntax.annotations) {
-    addNode("annotation", qualifiedType(annotation.name, syntax.packageName, syntax.imports), annotation.token);
-  }
+  const annotationNodes = new Map(syntax.annotations.map((annotation) => [
+    annotation,
+    addNode("annotation", qualifiedType(annotation.name, syntax.packageName, syntax.imports), annotation.token),
+  ]));
   for (const type of syntax.types) {
     const source = typeNodes.get(type.qualified_name);
+    for (const annotation of before(syntax.annotations, type)) {
+      addEdge(source, annotationNodes.get(annotation), "declares", annotation.token);
+    }
     for (const annotation of syntax.annotations.filter((item) => item.start > type.open && item.end < type.close)) {
       if (annotation.simpleName !== "Value") continue;
       const value = annotation.args.find((token) => token.type === "string")?.value || "";
       const key = value.match(/^\$\{([A-Za-z0-9_.-]+)\}$/)?.[1];
       if (key && !SECRET_CONFIGURATION_KEY.test(key)) {
-        addEdge(source, addNode("configuration-key", key, annotation.token), "reads-config", annotation.token);
+        // The annotation explicitly reads the key, while the key declaration
+        // itself lives in a structured configuration file and is resolved after
+        // all file projections are assembled.
+        addEdge(source, addNode("configuration-key", key, annotation.token, "resolved"), "reads-config", annotation.token);
       }
     }
     for (const method of type.methods) {
       const methodNode = methodNodes.get(method.qualified_name);
+      addEdge(source, methodNode, "contains", method.token);
       for (const annotation of syntax.annotations.filter((item) => item.start > type.open && item.end < method.start && item.end >= method.start - 24)) {
+        addEdge(methodNode, annotationNodes.get(annotation), "declares", annotation.token);
         const endpoint = endpointFor(annotation);
         if (endpoint) addEdge(methodNode, addNode("endpoint", endpoint, annotation.token), "exposes", annotation.token);
       }

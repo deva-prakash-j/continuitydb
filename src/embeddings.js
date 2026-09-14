@@ -225,7 +225,7 @@ export class HybridEngine {
         retrieval: {
           ...detailed.retrieval,
           requested_mode: "hybrid",
-          effective_mode: this.embedder ? "hybrid" : "lexical+graph",
+          effective_mode: this.embedder ? "hybrid" : "lexical",
           semantic_fallback_used: false,
           fallback_reason: null,
         },

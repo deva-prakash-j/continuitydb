@@ -182,12 +182,13 @@ and credentials when their trust domains differ.
 - native, versioned Java/Spring code graphs built from committed Git blobs, with
   Maven/Gradle, YAML/JSON, and Markdown evidence;
 - selectable `hybrid`, `graph-only`, and `graph-first` retrieval; graph-first
-  invokes semantic retrieval only after an explicit coverage failure;
+  invokes semantic retrieval only after an explicit coverage failure, while
+  `hybrid` remains the graph-free governed-memory rollback baseline;
 - bounded graph traversal (depth 0–3), cited evidence paths, active-generation
   status, and repository-relative source locations;
 - bounded exact vector scan for embedded mode;
 - project dependency closure and typed memory-graph expansion;
-- Reciprocal Rank Fusion across lexical, semantic, and graph candidates;
+- mode-specific Reciprocal Rank Fusion across lexical, semantic, and graph candidates;
 - project proximity, confidence, importance, freshness, exact-score, and bounded feedback signals;
 - Maximal Marginal Relevance to reduce duplicate context;
 - branch, validity-time, expiry, stale-state, and token-budget controls;

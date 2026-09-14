@@ -40,9 +40,17 @@ test("extracts deterministic Java and Spring graph facts", () => {
   const result = extractJavaSpring(input);
   assert.deepEqual(relations(result), [
     "calls:com.acme.OrderController.list->com.acme.OrderService.findAll",
+    "contains:com.acme.OrderController->com.acme.OrderController.list",
+    "contains:com.acme.OrderController->com.acme.OrderController.OrderController",
+    "contains:com.acme.OrderController->com.acme.OrderController.overloaded/1",
+    "contains:com.acme.OrderController->com.acme.OrderController.overloaded/1-2",
+    "contains:com.acme.OrderController->com.acme.OrderController.service",
+    "contains:com.acme.OrderService->com.acme.OrderService.findAll",
     "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderController",
     "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderPort",
     "contains:src/main/java/com/acme/OrderController.java->com.acme.OrderService",
+    "declares:com.acme.OrderController->org.springframework.web.bind.annotation.RestController",
+    "declares:com.acme.OrderController.list->org.springframework.web.bind.annotation.GetMapping",
     "exposes:com.acme.OrderController.list->GET /orders",
     "implements:com.acme.OrderService->com.acme.OrderPort",
     "imports:src/main/java/com/acme/OrderController.java->org.springframework.beans.factory.annotation.Value",
@@ -107,4 +115,19 @@ class A { @Value("do-not-leak") String value; }`,
   });
   assert.ok(!JSON.stringify(result).includes("do-not-leak"));
   assert.ok(!result.edges.some((edge) => edge.relation === "reads-config"));
+});
+
+test("methods, fields, and Spring stereotypes are connected by production containment evidence", () => {
+  const result = extractJavaSpring(input);
+  const evidence = relations(result);
+  assert.ok(evidence.includes("contains:com.acme.OrderController->com.acme.OrderController.list"));
+  assert.ok(evidence.includes("contains:com.acme.OrderController->com.acme.OrderController.service"));
+  assert.ok(evidence.includes("contains:com.acme.OrderService->com.acme.OrderService.findAll"));
+  assert.ok(evidence.includes("declares:com.acme.OrderController->org.springframework.web.bind.annotation.RestController"));
+  assert.ok(evidence.includes("declares:com.acme.OrderController.list->org.springframework.web.bind.annotation.GetMapping"));
+  const controller = result.nodes.find((item) => item.qualified_name === "com.acme.OrderController");
+  const list = result.nodes.find((item) => item.qualified_name === "com.acme.OrderController.list");
+  assert.match(controller.excerpt, /class OrderController/);
+  assert.match(list.excerpt, /list\(\)/);
+  assert.ok(Buffer.byteLength(controller.excerpt, "utf8") <= 512);
 });

@@ -53,30 +53,34 @@ function maskGradleComments(text) {
   return chars.join("");
 }
 
-function graphBuilder(scope, language) {
+function graphBuilder(scope, language, text) {
   const nodes = new Map(); const edges = [];
-  const addNode = (kind, qualified_name, { line = null, summary = undefined } = {}) => {
+  const addNode = (kind, qualified_name, { line = null, excerpt = undefined, summary = undefined, provenance = "extracted" } = {}) => {
     const identity = { ...scope, kind, qualified_name };
     const id = graphNodeId(identity);
     if (!nodes.has(id)) {
       const node = {
-        ...identity, id, label: qualified_name, language, provenance: "extracted",
+        ...identity, id, label: qualified_name, language, provenance,
         start_line: line, start_column: line === null ? null : 1,
         end_line: line, end_column: line === null ? null : 1,
         extractor_version: EXTRACTOR_VERSION,
       };
-      if (summary) node.summary = summary.slice(0, 280);
+      let boundedExcerpt = excerpt ?? summary ?? qualified_name;
+      while (Buffer.byteLength(boundedExcerpt, "utf8") > 512) {
+        boundedExcerpt = boundedExcerpt.slice(0, Math.floor(boundedExcerpt.length * 0.9)).trimEnd();
+      }
+      node.excerpt = boundedExcerpt;
       nodes.set(id, node);
     }
     return nodes.get(id);
   };
   const file = addNode("file", scope.repo_path);
-  const addEdge = (source, target, relation, line = null) => {
+  const addEdge = (source, target, relation, line = null, provenance = "extracted") => {
     const edge = {
       source_id: source.id, target_id: target.id, relation, repo_path: scope.repo_path,
       start_line: line, start_column: line === null ? null : 1,
       end_line: line, end_column: line === null ? null : 1,
-      provenance: "extracted", commit: scope.commit, extractor_version: EXTRACTOR_VERSION,
+      provenance, commit: scope.commit, extractor_version: EXTRACTOR_VERSION,
       source, target,
     };
     edge.id = graphEdgeId(edge); edges.push(edge);
@@ -100,7 +104,14 @@ function graphBuilder(scope, language) {
 function extractPom(scope, text) {
   const masked = maskXmlComments(text);
   if (!/<project(?:\s|>)/.test(masked) || !/<\/project\s*>/.test(masked)) return empty(1);
-  const graph = graphBuilder(scope, "xml");
+  const graph = graphBuilder(scope, "xml", text);
+  const projectHeader = masked.replace(/<dependencies(?:\s[^>]*)?>[\s\S]*?<\/dependencies\s*>/g, "");
+  const projectGroup = projectHeader.match(/<groupId\s*>([^<\s]+)<\/groupId\s*>/)?.[1] || null;
+  const projectArtifact = projectHeader.match(/<artifactId\s*>([^<\s]+)<\/artifactId\s*>/)?.[1] || null;
+  const module = projectArtifact && !/[@/\\]/.test(projectArtifact)
+    ? graph.addNode("module", projectGroup ? `${projectGroup}:${projectArtifact}` : projectArtifact, { line: 1 })
+    : graph.file;
+  if (module !== graph.file) graph.addEdge(graph.file, module, "contains", 1);
   const dependency = /<dependency(?:\s[^>]*)?>([\s\S]*?)<\/dependency\s*>/g;
   let match; let line = 1;
   while ((match = dependency.exec(masked))) {
@@ -108,7 +119,7 @@ function extractPom(scope, text) {
     const artifact = match[1].match(/<artifactId\s*>([^<\s]+)<\/artifactId\s*>/)?.[1];
     if (!group || !artifact || /[@/\\]/.test(group) || /[@/\\]/.test(artifact)) continue;
     line = masked.slice(0, match.index).split("\n").length;
-    graph.addEdge(graph.file, graph.addNode("dependency", `${group}:${artifact}`, { line }), "depends-on", line);
+    graph.addEdge(module, graph.addNode("dependency", `${group}:${artifact}`, { line }), "depends-on", line);
   }
   return graph.finish();
 }
@@ -121,22 +132,42 @@ function extractGradle(scope, text) {
     if ((masked[index] === "'" || masked[index] === '"') && (!quote || quote === masked[index])) quote = quote ? null : masked[index];
   }
   if (quote || (masked.match(/\(/g)?.length || 0) !== (masked.match(/\)/g)?.length || 0)) return empty(1);
-  const graph = graphBuilder(scope, "gradle");
+  const graph = graphBuilder(scope, "gradle", text);
+  const moduleName = masked.match(/\brootProject\.name\s*=\s*["']([A-Za-z0-9_.-]+)["']/)?.[1] || null;
+  const module = moduleName ? graph.addNode("module", moduleName, { line: 1 }) : graph.file;
+  if (module !== graph.file) graph.addEdge(graph.file, module, "contains", 1);
   const notation = /\b(?:implementation|api|compileOnly|runtimeOnly|testImplementation|testRuntimeOnly)\s*(?:\(\s*)?["']([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+)(?::[^"']+)?["']\s*\)?/g;
   let match;
   while ((match = notation.exec(masked))) {
     const line = masked.slice(0, match.index).split("\n").length;
-    graph.addEdge(graph.file, graph.addNode("dependency", `${match[1]}:${match[2]}`, { line }), "depends-on", line);
+    graph.addEdge(module, graph.addNode("dependency", `${match[1]}:${match[2]}`, { line }), "depends-on", line);
   }
   return graph.finish();
 }
 
 function extractYaml(scope, text) {
-  const graph = graphBuilder(scope, "yaml");
-  const stack = []; const lines = text.split(/\r?\n/); let skipped = 0;
+  const graph = graphBuilder(scope, "yaml", text);
+  const stack = []; const lines = text.split(/\r?\n/); let skipped = 0; let blockIndent = null;
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index]; if (!raw.trim() || raw.trimStart().startsWith("#") || raw.trim() === "---") continue;
     if (/\t/.test(raw)) return empty(1, 0, skipped);
+    const rawIndent = raw.match(/^ */)[0].length;
+    if (blockIndent !== null) {
+      if (rawIndent > blockIndent) continue;
+      blockIndent = null;
+    }
+    const sequence = raw.match(/^( *)-\s*(.*)$/);
+    if (sequence) {
+      const indent = sequence[1].length;
+      while (stack.length && indent < stack.at(-1).indent) stack.pop();
+      if (!stack.length) return empty(1, 0, skipped);
+      if (!stack.at(-1).denied) {
+        const qualified = stack.map((entry) => entry.key).join(".");
+        const sequenceNode = graph.addNode("configuration-key", qualified, { line: index + 1 });
+        graph.addEdge(graph.file, sequenceNode, "declares", index + 1);
+      }
+      continue;
+    }
     const match = raw.match(/^( *)(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_.-]+))\s*:\s*(.*)$/);
     if (!match) return empty(1, 0, skipped);
     const indent = match[1].length; const key = match[2] ?? match[3] ?? match[4]; const value = match[5];
@@ -152,6 +183,7 @@ function extractYaml(scope, text) {
     if (value.trim()) {
       const qualified = parts.join("."); const node = graph.addNode("configuration-key", qualified, { line: index + 1 });
       graph.addEdge(graph.file, node, "declares", index + 1);
+      if (["|", ">", "|-", ">-", "|+", ">+"].includes(value.trim())) blockIndent = indent;
     } else stack.push({ indent, key, denied: false });
   }
   return graph.finish({ errors: 0, warnings: 0, skipped });
@@ -162,7 +194,7 @@ function extractJson(scope, text) {
   let parsed;
   try { parsed = JSON.parse(text); } catch { return empty(1); }
   if (!parsed || typeof parsed !== "object") return empty(1);
-  const graph = graphBuilder(scope, "json"); let skipped = 0;
+  const graph = graphBuilder(scope, "json", text); let skipped = 0;
   const visit = (value, parts) => {
     if (!value || typeof value !== "object") return;
     for (const [key, child] of Object.entries(value)) {
@@ -179,7 +211,7 @@ function extractJson(scope, text) {
 }
 
 function extractMarkdown(scope, text) {
-  const graph = graphBuilder(scope, "markdown");
+  const graph = graphBuilder(scope, "markdown", text);
   const title = scope.repo_path.split("/").at(-1).replace(/\.[^.]+$/, "");
   const headings = [...text.matchAll(/^(#{1,6})\s+(.+?)\s*#*\s*$/gm)];
   headings.forEach((match, index) => {
@@ -190,8 +222,15 @@ function extractMarkdown(scope, text) {
       .map((line) => line.trim()).filter((line) => line && !SECRET_KEY.test(line) && !/\b(?:password|token|secret)\s*[:=]/i.test(line))
       .join(" ").slice(0, 280);
     const line = text.slice(0, match.index).split("\n").length;
-    const section = graph.addNode("document-section", `${title}#${heading}`, { line, summary });
+    const section = graph.addNode("document-section", `${title}#${heading}`, { line, excerpt: summary });
     graph.addEdge(graph.file, section, "documents", line);
+    for (const reference of [...summary.matchAll(/`([A-Za-z_$][A-Za-z0-9_$.#/:-]{2,199})`/g)]) {
+      const target = graph.addNode("external-symbol", reference[1], { line, provenance: "resolved" });
+      const relation = /\b(?:affects?|impacts?)\b/i.test(summary.slice(Math.max(0, reference.index - 40), reference.index + reference[0].length + 10))
+        ? "affects"
+        : "documents";
+      graph.addEdge(section, target, relation, line, "resolved");
+    }
   });
   return graph.finish();
 }

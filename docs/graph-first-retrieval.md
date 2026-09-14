@@ -13,6 +13,9 @@ per request while collecting evidence for promotion.
 Graph ingestion reads Git tree entries and blobs for the resolved commit. Dirty
 worktree content, symlinks, binary data, denied secret-like paths, and paths
 outside the repository root are rejected or skipped before extraction.
+Truncated scans and supported files that are oversized, unreadable, or fail
+extraction refuse publication with diagnostics; they never replace a complete
+active generation.
 
 ```bash
 # Preview in a disposable vault; the configured vault is not changed.
@@ -35,13 +38,15 @@ reconciled before deterministic cross-file resolution. An extractor-version
 change invalidates reuse. Publication inserts a staging generation and all of its
 nodes and edges in one transaction, verifies edge endpoints, supersedes the old
 generation, and activates the replacement. An interrupted or invalid build
-leaves the previous generation active.
+leaves the previous generation active. Publication also compares the repository
+HEAD and prior active-generation ID immediately before commit, so a stale or
+concurrent build fails closed.
 
 ## Retrieval modes
 
 | Mode | Seed/traversal behavior | Semantic behavior |
 |---|---|---|
-| `hybrid` | Lexical records plus the authorized graph | Generates a query embedding eagerly when configured |
+| `hybrid` | Legacy governed-memory lexical, semantic, and memory-edge retrieval; does not consult the native code graph | Generates a query embedding eagerly when configured |
 | `graph-only` | Exact/FTS seeds and bounded typed paths only | Never generates an embedding |
 | `graph-first` | Runs the graph coverage gate first | Embeds only when graph evidence is insufficient |
 
@@ -63,6 +68,8 @@ Depth defaults to two and accepts zero through three. `strict_evidence` excludes
 inferred nodes and edges. Responses preserve existing result fields and add the
 requested/effective mode, whether semantic fallback ran, its reason, the active
 graph generation, repository-relative citations, and compact evidence paths.
+For `hybrid`, `graph_generation` is `null` by design so it remains a genuine
+pre-graph rollback baseline.
 
 The graph-first fallback reasons are:
 
@@ -80,6 +87,13 @@ selection, traversal, fallback candidates, and packing. Unauthorized nodes canno
 be seeds or intermediate path nodes. Graph labels, documentation, source text,
 and memories are untrusted evidence, never executable instructions or permission
 to widen scope.
+
+Branch omission means the branch-null scope only; it never means "the latest
+named branch." Supply `branch` to read a named-branch graph. Historical `as_of`
+queries select the generation whose validity window contains that instant,
+including a retained superseded generation. Exact governed-memory citations can
+produce a dynamically re-authorized memory-record-to-code edge, and resolved
+edges can cite an authorized endpoint in another active project generation.
 
 Every returned edge carries direction, provenance, weight, source location,
 commit, and its deterministic ID. Results are tied to active generations. Code
@@ -99,17 +113,22 @@ npm run benchmark:graph-first -- --output=/tmp/graph-first-report.json
 npm run benchmark:graph-first -- --promote-default=graph-first
 ```
 
-The runner uses one temporary vault and the same corpus for `graph-only`,
-`graph-first`, and `hybrid`. It reports recall at fixed `top_k`, required path
-coverage, latency, serialized context tokens, query-embedding calls, stale
-evidence, and negative isolation results overall and by query class.
+The runner creates five disposable Git repositories and indexes their committed
+Java/Spring, Maven/Gradle, YAML, and Markdown sources through the production
+`buildRepositoryGraph` path. It uses one temporary vault and the same corpus for
+`graph-only`, `graph-first`, and `hybrid`. It reports recall at fixed `top_k`,
+required path coverage, latency, serialized context tokens, query-embedding
+calls, stale evidence, negative isolation results, index/update time, sampled
+peak RSS, database size, and incremental parsed/reused counts.
 
 Promotion requires all of the following:
 
 1. no downstream answer-accuracy regression against `hybrid`;
 2. at least 20% lower median context-pack tokens;
 3. at least 60% query-embedding avoidance on exact/structural questions;
-4. zero cross-scope and stale-generation failures.
+4. zero cross-scope, stale-generation, expected-empty, owner, sensitivity,
+   omitted-branch, historical-generation, and production cross-generation
+   probe failures.
 
 The repository benchmark intentionally does not call a downstream answer model;
 it reports answer accuracy as unavailable instead of treating retrieval recall as

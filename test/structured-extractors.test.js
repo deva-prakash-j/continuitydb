@@ -40,3 +40,35 @@ test("does not extract dependencies from XML or Gradle comments", () => {
   }
   assert.equal(gradle.edges[0].start_line, 3);
 });
+
+test("Markdown excerpts survive extraction and explicit ADR references produce evidence", () => {
+  const result = extract("ADR-004.md", [
+    "# Decision",
+    "Use the transactional outbox.",
+    "",
+    "Affects `com.acme.orders.OrderService`.",
+  ].join("\n"));
+  const decision = result.nodes.find((item) => item.qualified_name === "ADR-004#Decision");
+  assert.match(decision.excerpt, /transactional outbox/);
+  assert.ok(result.edges.some((edge) => edge.relation === "affects"
+    && edge.source.qualified_name === "ADR-004#Decision"
+    && edge.target.qualified_name === "com.acme.orders.OrderService"));
+});
+
+test("YAML sequences and multiline scalars preserve surrounding configuration keys", () => {
+  const result = extract("application.yml", [
+    "spring:",
+    "  profiles:",
+    "    - local",
+    "    - production",
+    "banner:",
+    "  text: |",
+    "    Orders API",
+    "server:",
+    "  port: 8080",
+  ].join("\n"));
+  assert.equal(result.diagnostics.errors, 0);
+  assert.ok(result.nodes.some((item) => item.qualified_name === "spring.profiles"));
+  assert.ok(result.nodes.some((item) => item.qualified_name === "banner.text"));
+  assert.ok(result.nodes.some((item) => item.qualified_name === "server.port"));
+});

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { performance } from "node:perf_hooks";
 import { HybridEngine } from "../src/embeddings.js";
-import { graphNodeId } from "../src/graph/model.js";
+import { buildRepositoryGraph } from "../src/graph/repository-graph.js";
 import { ContextVault, estimateSerializedTokens } from "../src/store.js";
 
 const benchmarkDirectory = fileURLToPath(new URL(".", import.meta.url));
@@ -21,130 +22,103 @@ const STRUCTURAL_CLASSES = new Set([
   "exact-symbol", "call-path", "dependency-impact", "configuration-flow", "cross-project-path",
 ]);
 
-function graphNode(projectId, repoPath, kind, qualifiedName, label = null) {
-  return {
-    repo_path: repoPath,
-    kind,
-    qualified_name: qualifiedName,
-    label: label || qualifiedName.split(/[.#]/).at(-1),
-    language: repoPath.endsWith(".java") ? "java" : repoPath.endsWith(".md") ? "markdown" : "structured",
-    provenance: "extracted",
-  };
+const REPOSITORY_FILES = Object.freeze({
+  "orders-api": {
+    "pom.xml": `<project><artifactId>orders-api</artifactId><dependencies><dependency><groupId>org.springframework</groupId><artifactId>spring-web</artifactId></dependency></dependencies></project>\n`,
+    "src/main/java/com/acme/orders/OrderController.java": `package com.acme.orders;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.beans.factory.annotation.Value;
+@RestController public class OrderController {
+  private OrderService service;
+  @Value("\${orders.page-size}") private int pageSize;
+  @GetMapping("/orders") public void list() { service.findAll(); }
+}\n`,
+    "src/main/java/com/acme/orders/OrderService.java": `package com.acme.orders;
+public class OrderService {
+  private OrderRepository repository;
+  public void findAll() { repository.findActive(); }
+}\n`,
+    "src/main/java/com/acme/orders/OrderRepository.java": `package com.acme.orders;
+import org.springframework.beans.factory.annotation.Value;
+public class OrderRepository {
+  @Value("\${orders.datasource.url}") private String url;
+  public void findActive() {}
+}\n`,
+    "src/main/java/com/acme/orders/OrderPort.java": "package com.acme.orders; public interface OrderPort {}\n",
+    "src/main/java/com/acme/orders/JdbcOrderAdapter.java": "package com.acme.orders; public class JdbcOrderAdapter implements OrderPort {}\n",
+    "src/main/java/com/acme/orders/PaymentBridge.java": `package com.acme.orders;
+import com.acme.payments.PaymentController;
+public class PaymentBridge {
+  private PaymentController controller;
+  public void invoke() { controller.charge(); }
+}\n`,
+    "src/main/resources/application.yml": "orders:\n  page-size: 25\n  datasource:\n    url: jdbc:fixture\n",
+    "docs/ADR-004.md": "# Decision\nAffects `com.acme.orders.OrderService` through the transactional outbox.\n",
+    "docs/ADR-009.md": "# Decision\nDocuments `orders.page-size` for stable pagination.\n",
+    "README.md": "# Orders API\nProduction extraction benchmark fixture.\n",
+  },
+  "orders-schema": {
+    "pom.xml": `<project><artifactId>orders-schema</artifactId><dependencies><dependency><groupId>com.fasterxml.jackson.core</groupId><artifactId>jackson-databind</artifactId></dependency></dependencies></project>\n`,
+    "src/main/java/com/acme/events/OrderCreated.java": "package com.acme.events; public class OrderCreated { public String orderId; }\n",
+    "src/main/java/com/acme/events/OrderCancelled.java": "package com.acme.events; public class OrderCancelled { public String reason; }\n",
+    "src/main/resources/application.yml": "events:\n  orders:\n    topic: orders\n",
+    "docs/ADR-012.md": "# Decision\nDocuments `com.acme.events.OrderCreated` compatibility.\n",
+  },
+  payments: {
+    "build.gradle.kts": `rootProject.name = "payments"\ndependencies { implementation("com.stripe:stripe-java:24.0.0") }\n`,
+    "src/main/java/com/acme/payments/PaymentController.java": `package com.acme.payments;
+import org.springframework.web.bind.annotation.PostMapping;
+public class PaymentController {
+  private PaymentService service;
+  @PostMapping("/payments") public void charge() { service.charge(); }
+}\n`,
+    "src/main/java/com/acme/payments/PaymentService.java": `package com.acme.payments;
+import org.springframework.beans.factory.annotation.Value;
+public class PaymentService {
+  private StripeGateway gateway;
+  @Value("\${payment.timeout-ms}") private int timeout;
+  public void charge() { gateway.authorize(); }
+}\n`,
+    "src/main/java/com/acme/payments/StripeGateway.java": "package com.acme.payments; public class StripeGateway { public void authorize() {} }\n",
+    "src/main/resources/application.yml": "payment:\n  timeout-ms: 1000\n",
+    "docs/ADR-021.md": "# Decision\nDocuments `com.acme.payments.StripeGateway` as the provider abstraction.\n",
+  },
+  "payroll-private": {
+    "src/main/java/corp/payroll/SecretPayrollExporter.java": `package corp.payroll;
+import org.springframework.beans.factory.annotation.Value;
+public class SecretPayrollExporter {
+  @Value("\${payroll.ssn-key}") private String key;
+  public void export() {}
+}\n`,
+    "src/main/resources/application.yml": "payroll:\n  ssn-key: fixture-reference\n",
+  },
+  "admin-private": {
+    "src/main/java/corp/admin/RootAdminController.java": "package corp.admin; public class RootAdminController { public void disableAudit() {} }\n",
+  },
+});
+
+function git(repo, args, date = null) {
+  const env = date ? { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date } : process.env;
+  return execFileSync("git", ["-C", repo, ...args], {
+    encoding: "utf8", env, stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 }
 
-function projection(projectId, nodes, edgeDefinitions) {
-  const byName = new Map(nodes.map((node) => [node.qualified_name, node]));
-  const edges = edgeDefinitions.map(([source, target, relation, repoPath, startLine]) => ({
-    source: byName.get(source), target: byName.get(target), relation,
-    repo_path: repoPath, start_line: startLine, provenance: "extracted",
-  }));
-  if (edges.some((edge) => !edge.source || !edge.target)) throw new Error(`invalid ${projectId} benchmark edge`);
-  const sourcePaths = [...new Set(nodes.map((node) => node.repo_path))].sort();
-  return {
-    tenant_id: "local",
-    project_id: projectId,
-    branch: "main",
-    commit: COMMIT,
-    extractor_version: "benchmark-v1",
-    source_states: sourcePaths.map((repo_path) => ({
-      repo_path,
-      git_object_id: createHash("sha256").update(`${projectId}\0${repo_path}`).digest("hex"),
-    })),
-    nodes,
-    edges,
-  };
-}
-
-function graphCorpus() {
-  const orders = [
-    graphNode("orders-api", "pom.xml", "module", "orders-api", "orders-api"),
-    graphNode("orders-api", "pom.xml", "dependency", "org.springframework:spring-web", "spring-web"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderController.java", "class", "com.acme.orders.OrderController", "OrderController"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderController.java", "method", "com.acme.orders.OrderController.list", "list"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderController.java", "endpoint", "GET /orders", "GET /orders"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderService.java", "class", "com.acme.orders.OrderService", "OrderService"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderService.java", "method", "com.acme.orders.OrderService.findAll", "findAll"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderRepository.java", "class", "com.acme.orders.OrderRepository", "OrderRepository"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderRepository.java", "method", "com.acme.orders.OrderRepository.findActive", "findActive"),
-    graphNode("orders-api", "src/main/resources/application.yml", "configuration-key", "orders.page-size", "orders.page-size"),
-    graphNode("orders-api", "src/main/resources/application.yml", "configuration-key", "orders.datasource.url", "orders.datasource.url"),
-    graphNode("orders-api", "docs/ADR-004.md", "decision", "ADR-004#Decision", "Transactional outbox decision"),
-    graphNode("orders-api", "docs/ADR-009.md", "decision", "ADR-009#Decision", "Pagination decision"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/OrderPort.java", "interface", "com.acme.orders.OrderPort", "OrderPort"),
-    graphNode("orders-api", "src/main/java/com/acme/orders/JdbcOrderAdapter.java", "class", "com.acme.orders.JdbcOrderAdapter", "JdbcOrderAdapter"),
-  ];
-  const schema = [
-    graphNode("orders-schema", "pom.xml", "module", "orders-schema", "orders-schema"),
-    graphNode("orders-schema", "pom.xml", "dependency", "com.fasterxml.jackson.core:jackson-databind", "jackson-databind"),
-    graphNode("orders-schema", "src/main/java/com/acme/events/OrderCreated.java", "class", "com.acme.events.OrderCreated", "OrderCreated"),
-    graphNode("orders-schema", "src/main/java/com/acme/events/OrderCreated.java", "field", "com.acme.events.OrderCreated.orderId", "orderId"),
-    graphNode("orders-schema", "src/main/java/com/acme/events/OrderCancelled.java", "class", "com.acme.events.OrderCancelled", "OrderCancelled"),
-    graphNode("orders-schema", "src/main/java/com/acme/events/OrderCancelled.java", "field", "com.acme.events.OrderCancelled.reason", "reason"),
-    graphNode("orders-schema", "src/main/resources/application.yml", "configuration-key", "events.orders.topic", "events.orders.topic"),
-    graphNode("orders-schema", "docs/ADR-012.md", "decision", "ADR-012#Decision", "Compatibility decision"),
-  ];
-  const payments = [
-    graphNode("payments", "build.gradle.kts", "module", "payments", "payments"),
-    graphNode("payments", "build.gradle.kts", "dependency", "com.stripe:stripe-java", "stripe-java"),
-    graphNode("payments", "src/main/java/com/acme/payments/PaymentController.java", "class", "com.acme.payments.PaymentController", "PaymentController"),
-    graphNode("payments", "src/main/java/com/acme/payments/PaymentController.java", "method", "com.acme.payments.PaymentController.charge", "charge"),
-    graphNode("payments", "src/main/java/com/acme/payments/PaymentController.java", "endpoint", "POST /payments", "POST /payments"),
-    graphNode("payments", "src/main/java/com/acme/payments/PaymentService.java", "class", "com.acme.payments.PaymentService", "PaymentService"),
-    graphNode("payments", "src/main/java/com/acme/payments/PaymentService.java", "method", "com.acme.payments.PaymentService.charge", "charge"),
-    graphNode("payments", "src/main/java/com/acme/payments/StripeGateway.java", "class", "com.acme.payments.StripeGateway", "StripeGateway"),
-    graphNode("payments", "src/main/java/com/acme/payments/StripeGateway.java", "method", "com.acme.payments.StripeGateway.authorize", "authorize"),
-    graphNode("payments", "src/main/resources/application.yml", "configuration-key", "payment.timeout-ms", "payment.timeout-ms"),
-    graphNode("payments", "docs/ADR-021.md", "decision", "ADR-021#Decision", "Provider abstraction decision"),
-  ];
-  const payroll = [
-    graphNode("payroll-private", "src/main/java/corp/payroll/SecretPayrollExporter.java", "class", "corp.payroll.SecretPayrollExporter", "SecretPayrollExporter"),
-    graphNode("payroll-private", "src/main/java/corp/payroll/SecretPayrollExporter.java", "method", "corp.payroll.SecretPayrollExporter.export", "export"),
-    graphNode("payroll-private", "src/main/resources/application.yml", "configuration-key", "payroll.ssn-key", "payroll.ssn-key"),
-  ];
-  const admin = [
-    graphNode("admin-private", "src/main/java/corp/admin/RootAdminController.java", "class", "corp.admin.RootAdminController", "RootAdminController"),
-    graphNode("admin-private", "src/main/java/corp/admin/RootAdminController.java", "method", "corp.admin.RootAdminController.disableAudit", "disableAudit"),
-  ];
-  return [
-    projection("orders-api", orders, [
-      ["orders-api", "org.springframework:spring-web", "depends-on", "pom.xml", 10],
-      ["com.acme.orders.OrderController", "com.acme.orders.OrderController.list", "contains", "src/main/java/com/acme/orders/OrderController.java", 8],
-      ["com.acme.orders.OrderController.list", "com.acme.orders.OrderService.findAll", "calls", "src/main/java/com/acme/orders/OrderController.java", 21],
-      ["com.acme.orders.OrderController.list", "GET /orders", "exposes", "src/main/java/com/acme/orders/OrderController.java", 19],
-      ["com.acme.orders.OrderController", "orders.page-size", "reads-config", "src/main/java/com/acme/orders/OrderController.java", 12],
-      ["com.acme.orders.OrderService", "com.acme.orders.OrderService.findAll", "contains", "src/main/java/com/acme/orders/OrderService.java", 7],
-      ["com.acme.orders.OrderService.findAll", "com.acme.orders.OrderRepository.findActive", "calls", "src/main/java/com/acme/orders/OrderService.java", 18],
-      ["com.acme.orders.OrderRepository", "com.acme.orders.OrderRepository.findActive", "contains", "src/main/java/com/acme/orders/OrderRepository.java", 7],
-      ["com.acme.orders.OrderRepository", "orders.datasource.url", "reads-config", "src/main/java/com/acme/orders/OrderRepository.java", 11],
-      ["com.acme.orders.JdbcOrderAdapter", "com.acme.orders.OrderPort", "implements", "src/main/java/com/acme/orders/JdbcOrderAdapter.java", 6],
-      ["ADR-004#Decision", "com.acme.orders.OrderService", "affects", "docs/ADR-004.md", 9],
-      ["ADR-009#Decision", "orders.page-size", "documents", "docs/ADR-009.md", 7]
-    ]),
-    projection("orders-schema", schema, [
-      ["orders-schema", "com.fasterxml.jackson.core:jackson-databind", "depends-on", "pom.xml", 11],
-      ["com.acme.events.OrderCreated", "com.acme.events.OrderCreated.orderId", "declares", "src/main/java/com/acme/events/OrderCreated.java", 6],
-      ["com.acme.events.OrderCancelled", "com.acme.events.OrderCancelled.reason", "declares", "src/main/java/com/acme/events/OrderCancelled.java", 6],
-      ["orders-schema", "events.orders.topic", "reads-config", "src/main/resources/application.yml", 2],
-      ["ADR-012#Decision", "com.acme.events.OrderCreated", "documents", "docs/ADR-012.md", 8]
-    ]),
-    projection("payments", payments, [
-      ["payments", "com.stripe:stripe-java", "depends-on", "build.gradle.kts", 13],
-      ["com.acme.payments.PaymentController", "com.acme.payments.PaymentController.charge", "contains", "src/main/java/com/acme/payments/PaymentController.java", 8],
-      ["com.acme.payments.PaymentController.charge", "com.acme.payments.PaymentService.charge", "calls", "src/main/java/com/acme/payments/PaymentController.java", 20],
-      ["com.acme.payments.PaymentController.charge", "POST /payments", "exposes", "src/main/java/com/acme/payments/PaymentController.java", 18],
-      ["com.acme.payments.PaymentService", "com.acme.payments.PaymentService.charge", "contains", "src/main/java/com/acme/payments/PaymentService.java", 7],
-      ["com.acme.payments.PaymentService.charge", "com.acme.payments.StripeGateway.authorize", "calls", "src/main/java/com/acme/payments/PaymentService.java", 22],
-      ["com.acme.payments.PaymentService", "payment.timeout-ms", "reads-config", "src/main/java/com/acme/payments/PaymentService.java", 11],
-      ["ADR-021#Decision", "com.acme.payments.StripeGateway", "documents", "docs/ADR-021.md", 8]
-    ]),
-    projection("payroll-private", payroll, [
-      ["corp.payroll.SecretPayrollExporter", "corp.payroll.SecretPayrollExporter.export", "contains", "src/main/java/corp/payroll/SecretPayrollExporter.java", 6],
-      ["corp.payroll.SecretPayrollExporter", "payroll.ssn-key", "reads-config", "src/main/java/corp/payroll/SecretPayrollExporter.java", 10]
-    ]),
-    projection("admin-private", admin, [
-      ["corp.admin.RootAdminController", "corp.admin.RootAdminController.disableAudit", "contains", "src/main/java/corp/admin/RootAdminController.java", 6]
-    ]),
-  ];
+function createCommittedRepository(parent, projectId, files, date = FIXTURE_TIMESTAMP) {
+  const repo = join(parent, projectId);
+  mkdirSync(repo, { recursive: true });
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.name", "Benchmark Fixture"]);
+  git(repo, ["config", "user.email", "benchmark@example.invalid"]);
+  for (const [repoPath, contents] of Object.entries(files)) {
+    const target = join(repo, repoPath);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, contents, "utf8");
+  }
+  git(repo, ["add", "."]);
+  git(repo, ["commit", "-m", "initial production benchmark fixture"], date);
+  return repo;
 }
 
 const MEMORY_CORPUS = [
@@ -206,22 +180,19 @@ class DeterministicBenchmarkEmbedder {
   }
 }
 
-function seedVault(vault, engine) {
-  const knownNodeIds = new Set();
-  const knownEdgeKeys = new Set();
-  const nodeProjects = new Map();
-  for (const graph of graphCorpus()) {
-    for (const node of graph.nodes) {
-      const nodeId = graphNodeId({ ...node, tenant_id: "local", project_id: graph.project_id });
-      knownNodeIds.add(nodeId);
-      nodeProjects.set(nodeId, graph.project_id);
-    }
-    for (const edge of graph.edges) {
-      const sourceId = graphNodeId({ ...edge.source, tenant_id: "local", project_id: graph.project_id });
-      const targetId = graphNodeId({ ...edge.target, tenant_id: "local", project_id: graph.project_id });
-      knownEdgeKeys.add(`${edge.relation}\0${sourceId}\0${targetId}`);
-    }
-    vault.publishGraph(graph);
+async function seedVault(vault, engine, repositoryRoot) {
+  const repositories = new Map(Object.entries(REPOSITORY_FILES).map(([projectId, files]) => [
+    projectId, createCommittedRepository(repositoryRoot, projectId, files),
+  ]));
+  const initialBuilds = new Map();
+  // Dependencies are extracted first so the orders build can resolve its
+  // PaymentBridge call to an endpoint in another active graph generation.
+  for (const projectId of ["payments", "orders-schema", "payroll-private", "admin-private", "orders-api"]) {
+    initialBuilds.set(projectId, buildRepositoryGraph(vault, repositories.get(projectId), {
+      projectId,
+      ownerId: projectId === "admin-private" ? "other-owner" : "local-user",
+      sensitivity: projectId === "payroll-private" ? "restricted" : "private",
+    }));
   }
   vault.linkProjects({ source_project: "orders-api", target_project: "orders-schema", provenance: "benchmark fixture" });
   vault.linkProjects({ source_project: "orders-api", target_project: "payments", provenance: "benchmark fixture" });
@@ -242,8 +213,40 @@ function seedVault(vault, engine) {
     `).run(FIXTURE_TIMESTAMP, FIXTURE_TIMESTAMP, FIXTURE_TIMESTAMP, memoryId);
     memoryIds.set(fixtureId, memoryId);
   }
-  return Promise.all([...memoryIds.values()].map((id) => engine.indexMemory(id)))
-    .then(() => ({ knownNodeIds, knownEdgeKeys, memoryIds, nodeProjects }));
+  await Promise.all([...memoryIds.values()].map((id) => engine.indexMemory(id)));
+
+  const ordersRepo = repositories.get("orders-api");
+  writeFileSync(join(ordersRepo, "README.md"), "# Orders API\nIncremental production extraction benchmark fixture.\n", "utf8");
+  git(ordersRepo, ["add", "README.md"]);
+  git(ordersRepo, ["commit", "-m", "incremental documentation update"], "2026-09-14T00:01:00.000Z");
+  const incrementalStarted = performance.now();
+  const incremental = buildRepositoryGraph(vault, ordersRepo, { projectId: "orders-api" });
+  const incrementalUpdateTimeMs = performance.now() - incrementalStarted;
+
+  const knownNodeIds = new Set();
+  const nodeProjects = new Map();
+  for (const row of vault.db.prepare("SELECT id, project_id FROM graph_nodes ORDER BY id").all()) {
+    knownNodeIds.add(row.id);
+    nodeProjects.set(row.id, row.project_id);
+  }
+  const knownEdgeKeys = new Set(vault.db.prepare(`
+    SELECT relation, source_id, target_id FROM graph_edges ORDER BY id
+  `).all().map((edge) => `${edge.relation}\0${edge.source_id}\0${edge.target_id}`));
+  const validCommits = new Set([
+    COMMIT,
+    ...vault.db.prepare("SELECT DISTINCT \"commit\" FROM graph_generations").all().map((row) => row.commit),
+  ]);
+  return {
+    knownNodeIds,
+    knownEdgeKeys,
+    memoryIds,
+    nodeProjects,
+    repositories,
+    initialBuilds,
+    incremental,
+    incrementalUpdateTimeMs,
+    validCommits,
+  };
 }
 
 // ContextVault correctly creates production IDs randomly. The benchmark needs
@@ -326,6 +329,7 @@ export function observeBenchmarkQuery(
   embeddingInvocations,
   memoryIds,
   nodeProjects = new Map(),
+  validCommits = new Set([COMMIT]),
 ) {
   const results = pack.memories || [];
   const gold = new Set([
@@ -360,12 +364,12 @@ export function observeBenchmarkQuery(
     ...results.flatMap((result) => {
       const reasons = [];
       if (result.temporal?.stale === true) reasons.push(`${result.id}:stale`);
-      if (result.citation?.git_commit && result.citation.git_commit !== COMMIT) reasons.push(`${result.id}:citation-commit`);
-      if ((result.graph_path || []).some((edge) => edge.commit && edge.commit !== COMMIT)) reasons.push(`${result.id}:path-commit`);
+      if (result.citation?.git_commit && !validCommits.has(result.citation.git_commit)) reasons.push(`${result.id}:citation-commit`);
+      if ((result.graph_path || []).some((edge) => edge.commit && !validCommits.has(edge.commit))) reasons.push(`${result.id}:path-commit`);
       return reasons;
     }),
     ...generationCommits(pack.retrieval)
-      .filter((commit) => commit && commit !== COMMIT)
+      .filter((commit) => commit && !validCommits.has(commit))
       .map((commit) => `generation:${commit}`),
   ];
   const staleEvidence = staleReasons.length > 0;
@@ -381,6 +385,8 @@ export function observeBenchmarkQuery(
     latency_ms: durationMs,
     context_tokens: canonicalContextTokens(pack),
     embedding_invocations: embeddingInvocations,
+    result_count: results.length,
+    expected_empty_failure: query.expected_empty === true && results.length !== 0,
     cross_scope_failure: crossScopeFailure,
     disclosed_projects: disclosedProjectSet,
     forbidden_evidence_projects: forbiddenEvidenceProjects,
@@ -421,6 +427,7 @@ export function summarizeBenchmarkObservations(observations) {
     structural_embedding_avoidance_rate: avoidanceRate(structural),
     stale_generation_failures: observations.filter((item) => item.stale_generation_failure).length,
     cross_scope_failures: observations.filter((item) => item.cross_scope_failure).length,
+    expected_empty_failures: observations.filter((item) => item.expected_empty_failure).length,
   };
 }
 
@@ -445,14 +452,90 @@ function validateFixture(knownNodeIds, knownEdgeKeys, memoryIds) {
   }
 }
 
+function runSecurityProbes(vault, seed) {
+  const common = {
+    tenant_id: "local",
+    retrieval_mode: "graph-only",
+    top_k: 5,
+    token_budget: 1200,
+  };
+  const ownerScopeFailures = vault.searchDetailed({
+    ...common,
+    owner_id: "local-user",
+    project_id: "admin-private",
+    allowed_projects: ["admin-private"],
+    allowed_sensitivities: ["private"],
+    branch: "main",
+    query: "corp.admin.RootAdminController.disableAudit",
+  }).results.length;
+  const sensitivityScopeFailures = vault.searchDetailed({
+    ...common,
+    owner_id: "local-user",
+    project_id: "payroll-private",
+    allowed_projects: ["payroll-private"],
+    allowed_sensitivities: ["private"],
+    branch: "main",
+    query: "corp.payroll.SecretPayrollExporter",
+  }).results.length;
+  const omittedBranchFailures = vault.searchDetailed({
+    ...common,
+    owner_id: "local-user",
+    project_id: "orders-api",
+    allowed_projects: ["orders-api"],
+    allowed_sensitivities: ["private"],
+    query: "com.acme.orders.OrderService.findAll",
+  }).results.length;
+  const historical = vault.searchDetailed({
+    ...common,
+    owner_id: "local-user",
+    project_id: "orders-api",
+    allowed_projects: ["orders-api"],
+    allowed_sensitivities: ["private"],
+    branch: "main",
+    as_of: "2026-09-14T00:00:30.000Z",
+    query: "com.acme.orders.OrderService.findAll",
+  });
+  const historicalGenerationFailures = historical.retrieval.graph_generation?.commit
+    === seed.initialBuilds.get("orders-api").commit ? 0 : 1;
+  const crossGeneration = vault.searchDetailed({
+    ...common,
+    owner_id: "local-user",
+    project_id: "orders-api",
+    allowed_projects: ["orders-api", "payments"],
+    allowed_sensitivities: ["private"],
+    branch: "main",
+    direction: "outgoing",
+    query: "com.acme.orders.PaymentBridge.invoke",
+  });
+  const productionCrossGenerationFailures = crossGeneration.results.some((result) => (
+    result.graph_path.some((edge) => edge.target_label === "com.acme.payments.PaymentController.charge"
+      && edge.source_generation_id !== edge.target_generation_id)
+  )) ? 0 : 1;
+  return {
+    owner_scope_failures: ownerScopeFailures,
+    sensitivity_scope_failures: sensitivityScopeFailures,
+    omitted_branch_failures: omittedBranchFailures,
+    historical_generation_failures: historicalGenerationFailures,
+    production_cross_generation_failures: productionCrossGenerationFailures,
+  };
+}
+
 export async function runGraphFirstBenchmark({ promotionRequested = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-graph-first-benchmark-"));
   const vault = new ContextVault(root);
   const embedder = new DeterministicBenchmarkEmbedder();
   const engine = new HybridEngine(vault, embedder);
   try {
-    const { knownNodeIds, knownEdgeKeys, memoryIds, nodeProjects } = await seedVault(vault, engine);
+    const repositoryRoot = join(root, "benchmark-repositories");
+    mkdirSync(repositoryRoot, { recursive: true });
+    let peakMemoryBytes = process.memoryUsage().rss;
+    const indexStarted = performance.now();
+    const seed = await seedVault(vault, engine, repositoryRoot);
+    const indexWallTimeMs = performance.now() - indexStarted;
+    peakMemoryBytes = Math.max(peakMemoryBytes, process.memoryUsage().rss);
+    const { knownNodeIds, knownEdgeKeys, memoryIds, nodeProjects, validCommits } = seed;
     validateFixture(knownNodeIds, knownEdgeKeys, memoryIds);
+    const securityProbes = runSecurityProbes(vault, seed);
     embedder.queryCalls = 0;
     const observations = [];
     for (const mode of MODES) {
@@ -473,13 +556,15 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
           graph_max_visited: 400,
           graph_max_paths: 40,
           strict_evidence: true,
+          exclude_types: query.expected_empty ? ["decision"] : [],
           top_k: fixture.top_k,
           token_budget: fixture.token_budget,
         });
         observations.push(observeBenchmarkQuery(
           query, mode, pack, performance.now() - started,
-          embedder.queryCalls - callsBefore, memoryIds, nodeProjects,
+          embedder.queryCalls - callsBefore, memoryIds, nodeProjects, validCommits,
         ));
+        peakMemoryBytes = Math.max(peakMemoryBytes, process.memoryUsage().rss);
       }
     }
 
@@ -494,6 +579,9 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
     ]));
     const crossScopeFailures = observations.filter((item) => item.cross_scope_failure).length;
     const staleGenerationFailures = observations.filter((item) => item.stale_generation_failure).length;
+    const expectedEmptyFailures = observations.filter((item) => item.expected_empty_failure).length;
+    vault.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    const databaseSizeBytes = statSync(join(root, "index", "context-vault.db")).size;
     const tokenReduction = 1 - modes["graph-first"].median_context_tokens / modes.hybrid.median_context_tokens;
     const gates = {
       no_answer_accuracy_regression: false,
@@ -502,6 +590,8 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
         modes["graph-first"].structural_embedding_avoidance_rate >= 0.6,
       zero_cross_scope_failures: crossScopeFailures === 0,
       zero_stale_generation_failures: staleGenerationFailures === 0,
+      zero_expected_empty_failures: expectedEmptyFailures === 0,
+      production_security_probes_passed: Object.values(securityProbes).every((value) => value === 0),
     };
     const releaseGatesPassed = Object.values(gates).every(Boolean);
     return {
@@ -526,9 +616,12 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
       },
       methodology: {
         vaults: 1,
-        graph_generations: graphCorpus().length,
+        graph_generations: Number(vault.db.prepare("SELECT count(*) AS count FROM graph_generations").get().count),
         records: MEMORY_CORPUS.length,
         modes: MODES,
+        graph_source: "production-committed-snapshot-extraction",
+        production_repositories: REPOSITORY_FILES ? Object.keys(REPOSITORY_FILES).length : 0,
+        graph_builder: "buildRepositoryGraph",
         latency_clock: "performance.now",
         context_token_estimator: "ContinuityDB estimateSerializedTokens with volatile timestamps, scores, and self-measurement fields canonicalized",
       },
@@ -537,6 +630,16 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
       security: {
         cross_scope_failures: crossScopeFailures,
         stale_generation_failures: staleGenerationFailures,
+        expected_empty_failures: expectedEmptyFailures,
+        ...securityProbes,
+      },
+      resources: {
+        index_wall_time_ms: rounded(indexWallTimeMs),
+        incremental_update_time_ms: rounded(seed.incrementalUpdateTimeMs),
+        peak_memory_bytes: peakMemoryBytes,
+        database_size_bytes: databaseSizeBytes,
+        incremental_parsed_files: seed.incremental.parsed_files,
+        incremental_reused_files: seed.incremental.reused_files,
       },
       release_gates: {
         ...gates,
@@ -563,7 +666,7 @@ async function main() {
   const outputArgument = process.argv.find((argument) => argument.startsWith("--output="));
   if (outputArgument) writeFileSync(resolve(outputArgument.slice("--output=".length)), json, "utf8");
   process.stdout.write(json);
-  if (report.security.cross_scope_failures || report.security.stale_generation_failures) process.exitCode = 2;
+  if (Object.values(report.security).some((value) => Number(value) > 0)) process.exitCode = 2;
   if (promotionRequested && !report.release_gates.passed) process.exitCode = 3;
 }
 

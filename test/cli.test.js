@@ -149,6 +149,7 @@ test("CLI builds and queries repository graphs without mutating on preview", () 
     assert.equal(git("config", "user.email", "fixture@example.invalid").status, 0);
     assert.equal(git("add", ".").status, 0);
     assert.equal(git("commit", "-m", "initial").status, 0);
+    const branch = git("branch", "--show-current").stdout.trim();
 
     const common = [cli, "graph", "build", "--repo", repo, "--project", "orders", "--home", home];
     const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
@@ -161,10 +162,10 @@ test("CLI builds and queries repository graphs without mutating on preview", () 
     assert.equal(JSON.parse(applied.stdout).applied, true);
 
     const commands = [
-      ["graph", "status", "--project", "orders"],
-      ["graph", "explain", "--project", "orders", "--node", "com.acme.OrderController"],
-      ["graph", "path", "--project", "orders", "--from", "com.acme.OrderController", "--to", "com.acme.OrderService"],
-      ["search", "--query", "OrderController", "--project", "orders", "--mode", "graph-first", "--depth", "2"],
+      ["graph", "status", "--project", "orders", "--branch", branch],
+      ["graph", "explain", "--project", "orders", "--branch", branch, "--node", "com.acme.OrderController"],
+      ["graph", "path", "--project", "orders", "--branch", branch, "--from", "com.acme.OrderController", "--to", "com.acme.OrderService"],
+      ["search", "--query", "OrderController", "--project", "orders", "--branch", branch, "--mode", "graph-first", "--depth", "2"],
     ];
     const values = [];
     for (const args of commands) {
@@ -182,7 +183,7 @@ test("CLI builds and queries repository graphs without mutating on preview", () 
     assert.ok(values[2] === null || values[2].qualified_name === "com.acme.OrderService");
     const searched = spawnSync(process.execPath, [
       cli, "search", "--query", "OrderController", "--project", "orders",
-      "--mode", "graph-first", "--depth", "2", "--home", home,
+      "--branch", branch, "--mode", "graph-first", "--depth", "2", "--home", home,
     ], { encoding: "utf8", env: { ...process.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" } });
     const searchValue = JSON.parse(searched.stdout);
     assert.equal(searchValue.results.length > 0, true);

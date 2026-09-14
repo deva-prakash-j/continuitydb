@@ -63,16 +63,21 @@ than a substitute for a held-out engineering retrieval dataset.
 npm run benchmark:graph-first
 ```
 
-This dependency-free benchmark builds one temporary vault with the same records
-and active graph generations for all 30 frozen questions, then runs `graph-only`,
-`graph-first`, and `hybrid` at `top_k=5`. The fixture spans exact symbols, call
+This dependency-free benchmark creates five disposable Git repositories and
+builds their graph generations through production committed-snapshot extraction
+into one temporary vault. It uses the same records and active generations for
+all 30 frozen questions, then runs `graph-only`, `graph-first`, and `hybrid` at
+`top_k=5`. The fixture spans exact symbols, call
 paths, dependency impact, configuration flow, authorized cross-project paths,
 conceptual questions, and historical decisions. Six questions are negative
 isolation probes.
 
 The JSON report includes overall and per-class recall, required citation-path
 coverage, p50/p95 latency, median/p95 serialized context tokens, embedding
-invocations and avoidance, stale-generation failures, and cross-scope failures.
+invocations and avoidance, stale-generation failures, cross-scope/owner/
+sensitivity/branch/history/expected-empty probes, a production cross-generation
+path, index and incremental-update time, sampled peak RSS, SQLite size, and
+incremental parsed/reused file counts.
 The included deterministic benchmark embedder is an instrumentation fixture, not
 a quality claim for a production embedding model. Latencies are real wall-clock
 measurements and therefore vary by machine. Token measurement canonicalizes

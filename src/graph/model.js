@@ -9,6 +9,9 @@ export const GRAPH_RELATIONS = new Set([
 ]);
 
 const GRAPH_PROVENANCE = new Set(["extracted", "resolved", "inferred"]);
+const GRAPH_SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
+const GRAPH_LIFECYCLE = new Set(["active", "inactive", "tombstoned"]);
+const MAX_EXCERPT_BYTES = 512;
 
 function requiredString(value, name) {
   if (typeof value !== "string" || value.trim() === "") throw new Error(`${name} must be a non-empty string`);
@@ -18,6 +21,33 @@ function requiredString(value, name) {
 function optionalString(value, name) {
   if (value === undefined || value === null || value === "") return null;
   return requiredString(value, name);
+}
+
+function optionalIso(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) throw new Error(`${name} must be an ISO-8601 timestamp`);
+  return new Date(timestamp).toISOString();
+}
+
+function optionalExcerpt(value) {
+  const excerpt = optionalString(value, "excerpt");
+  if (excerpt && Buffer.byteLength(excerpt, "utf8") > MAX_EXCERPT_BYTES) {
+    throw new Error(`excerpt must be at most ${MAX_EXCERPT_BYTES} UTF-8 bytes`);
+  }
+  return excerpt;
+}
+
+function normalizeSensitivity(value, fallback = "private") {
+  const sensitivity = value === undefined || value === null || value === "" ? fallback : value;
+  if (!GRAPH_SENSITIVITIES.has(sensitivity)) throw new Error("graph sensitivity is invalid");
+  return sensitivity;
+}
+
+function normalizeLifecycle(value, fallback = "active") {
+  const lifecycle = value === undefined || value === null || value === "" ? fallback : value;
+  if (!GRAPH_LIFECYCLE.has(lifecycle)) throw new Error("graph lifecycle_status is invalid");
+  return lifecycle;
 }
 
 function bounded(value, min, max, name) {
@@ -75,13 +105,25 @@ function normalizeScope(input) {
   const branch = input.branch === undefined || input.branch === null || input.branch === ""
     ? null
     : requiredIdentifier(input.branch, "branch");
-  return {
+  const scope = {
     tenant_id: requiredIdentifier(input.tenant_id, "tenant_id"),
+    owner_id: requiredIdentifier(input.owner_id || "local-user", "owner_id"),
     project_id: requiredIdentifier(input.project_id, "project_id"),
+    namespace_id: requiredIdentifier(input.namespace_id || `project/${input.project_id}`, "namespace_id"),
+    sensitivity: normalizeSensitivity(input.sensitivity),
+    lifecycle_status: normalizeLifecycle(input.lifecycle_status),
     branch,
     commit: requiredString(input.commit, "commit"),
     extractor_version: requiredString(input.extractor_version, "extractor_version"),
+    valid_from: optionalIso(input.valid_from, "generation valid_from"),
+    valid_to: optionalIso(input.valid_to, "generation valid_to"),
+    expires_at: optionalIso(input.expires_at, "generation expires_at"),
+    stale: input.stale ? 1 : 0,
   };
+  if (scope.valid_from && scope.valid_to && scope.valid_from >= scope.valid_to) {
+    throw new Error("generation valid_from must be earlier than valid_to");
+  }
+  return scope;
 }
 
 export function graphNodeId(input) {
@@ -125,14 +167,23 @@ function canonicalSourceLocation(input) {
 
 function normalizeNode(input, scope) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("graph node must be an object");
+  const projectId = requiredIdentifier(input.project_id || scope.project_id, "node project_id");
   const node = {
     tenant_id: scope.tenant_id,
-    project_id: scope.project_id,
+    owner_id: requiredIdentifier(input.owner_id || scope.owner_id, "node owner_id"),
+    project_id: projectId,
+    namespace_id: requiredIdentifier(input.namespace_id || (projectId === scope.project_id ? scope.namespace_id : `project/${projectId}`), "node namespace_id"),
+    sensitivity: normalizeSensitivity(input.sensitivity, scope.sensitivity),
+    lifecycle_status: normalizeLifecycle(input.lifecycle_status, scope.lifecycle_status),
     repo_path: normalizeGraphPath(input.repo_path),
     kind: requiredString(input.kind, "node kind"),
     qualified_name: requiredString(input.qualified_name, "qualified_name"),
     label: optionalString(input.label, "node label") || requiredString(input.qualified_name, "qualified_name"),
-    branch: scope.branch,
+    branch: input.branch === undefined
+      ? scope.branch
+      : input.branch === null || input.branch === ""
+        ? null
+        : requiredIdentifier(input.branch, "node branch"),
     commit: optionalString(input.commit, "node commit") || scope.commit,
     content_hash: optionalString(input.content_hash, "content_hash"),
     language: optionalString(input.language, "language"),
@@ -142,9 +193,12 @@ function normalizeNode(input, scope) {
     end_column: optionalInteger(input.end_column, "end_column"),
     extractor_version: optionalString(input.extractor_version, "node extractor_version") || scope.extractor_version,
     provenance: normalizeProvenance(input.provenance, "node provenance"),
-    valid_from: optionalString(input.valid_from, "valid_from"),
-    valid_to: optionalString(input.valid_to, "valid_to"),
-    stale: input.stale ? 1 : 0,
+    valid_from: optionalIso(input.valid_from ?? scope.valid_from, "valid_from"),
+    valid_to: optionalIso(input.valid_to ?? scope.valid_to, "valid_to"),
+    expires_at: optionalIso(input.expires_at ?? scope.expires_at, "expires_at"),
+    stale: input.stale === undefined ? scope.stale : input.stale ? 1 : 0,
+    excerpt: optionalExcerpt(input.excerpt ?? input.summary),
+    memory_id: optionalString(input.memory_id, "memory_id"),
   };
   if (node.valid_from && node.valid_to && node.valid_from >= node.valid_to) {
     throw new Error("node valid_from must be earlier than valid_to");
@@ -167,8 +221,15 @@ function normalizeEdge(input, scope) {
   if (!GRAPH_RELATIONS.has(relation)) throw new Error("graph relation is invalid");
   const provenance = normalizeProvenance(input.provenance);
   const edge = {
+    owner_id: requiredIdentifier(input.owner_id || scope.owner_id, "edge owner_id"),
+    project_id: requiredIdentifier(input.project_id || scope.project_id, "edge project_id"),
+    namespace_id: requiredIdentifier(input.namespace_id || scope.namespace_id, "edge namespace_id"),
+    sensitivity: normalizeSensitivity(input.sensitivity, scope.sensitivity),
+    lifecycle_status: normalizeLifecycle(input.lifecycle_status, scope.lifecycle_status),
     source_id: nodeIdForReference(input.source_id ?? input.source, scope),
     target_id: nodeIdForReference(input.target_id ?? input.target, scope),
+    source_generation_id: optionalString(input.source_generation_id ?? input.source?.generation_id, "source_generation_id"),
+    target_generation_id: optionalString(input.target_generation_id ?? input.target?.generation_id, "target_generation_id"),
     relation,
     source_location: canonicalSourceLocation(input),
     repo_path: input.repo_path === undefined || input.repo_path === null ? null : normalizeGraphPath(input.repo_path),
@@ -178,11 +239,17 @@ function normalizeEdge(input, scope) {
     end_column: optionalInteger(input.end_column, "end_column"),
     weight: normalizeWeight(input.weight, provenance),
     provenance,
+    branch: input.branch === undefined
+      ? scope.branch
+      : input.branch === null || input.branch === ""
+        ? null
+        : requiredIdentifier(input.branch, "edge branch"),
     commit: optionalString(input.commit, "edge commit") || scope.commit,
     extractor_version: optionalString(input.extractor_version, "edge extractor_version") || scope.extractor_version,
-    valid_from: optionalString(input.valid_from, "valid_from"),
-    valid_to: optionalString(input.valid_to, "valid_to"),
-    stale: input.stale ? 1 : 0,
+    valid_from: optionalIso(input.valid_from ?? scope.valid_from, "valid_from"),
+    valid_to: optionalIso(input.valid_to ?? scope.valid_to, "valid_to"),
+    expires_at: optionalIso(input.expires_at ?? scope.expires_at, "expires_at"),
+    stale: input.stale === undefined ? scope.stale : input.stale ? 1 : 0,
   };
   if (edge.valid_from && edge.valid_to && edge.valid_from >= edge.valid_to) {
     throw new Error("edge valid_from must be earlier than valid_to");

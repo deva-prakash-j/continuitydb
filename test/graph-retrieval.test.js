@@ -174,3 +174,21 @@ test("visited budgets cap breadth and inferred edges rank below extracted eviden
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("coverage requires non-seed evidence and a meaningful scored path", () => {
+  const isolatedSeed = {
+    id: "isolated", seed_match: "exact", score: 1, depth: 0, graph_path: [],
+  };
+  assert.deepEqual(
+    evaluateGraphCoverage({ seeds: [isolatedSeed], candidates: [isolatedSeed] }).fallback_reason,
+    "insufficient_candidates",
+  );
+  const weakPath = {
+    id: "weak", seed_match: "exact", score: 0.05, depth: 1,
+    graph_path: [{ edge_id: "weak-edge" }],
+  };
+  assert.equal(
+    evaluateGraphCoverage({ seeds: [isolatedSeed], candidates: [isolatedSeed, weakPath] }).fallback_reason,
+    "low_path_confidence",
+  );
+});

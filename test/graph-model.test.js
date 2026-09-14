@@ -107,3 +107,54 @@ test("graph normalization rejects absolute source locations and falsey explicit 
     /node provenance is invalid/,
   );
 });
+
+test("graph projections preserve the governed scope envelope and bounded excerpts on every row", () => {
+  const source = {
+    project_id: "api",
+    repo_path: "src/Api.java",
+    kind: "class",
+    qualified_name: "com.acme.Api",
+    excerpt: "public class Api {}",
+  };
+  const target = {
+    project_id: "schema",
+    repo_path: "src/Schema.java",
+    kind: "class",
+    qualified_name: "com.acme.Schema",
+    generation_id: "schema-generation",
+  };
+  const normalized = normalizeGraphProjection({
+    tenant_id: "tenant-a",
+    owner_id: "alice",
+    namespace_id: "project/api",
+    sensitivity: "sensitive",
+    lifecycle_status: "active",
+    expires_at: "2027-01-01T00:00:00Z",
+    valid_from: "2026-01-01T00:00:00Z",
+    project_id: "api",
+    branch: "main",
+    commit: "abcdef1",
+    extractor_version: "graph-v1",
+    source_states: [],
+    nodes: [source],
+    edges: [{ source, target, relation: "calls", repo_path: source.repo_path }],
+  });
+  for (const row of [normalized, normalized.nodes[0], normalized.edges[0]]) {
+    assert.equal(row.owner_id, "alice");
+    assert.equal(row.namespace_id, "project/api");
+    assert.equal(row.sensitivity, "sensitive");
+    assert.equal(row.lifecycle_status, "active");
+    assert.equal(row.expires_at, "2027-01-01T00:00:00.000Z");
+  }
+  assert.equal(normalized.nodes[0].excerpt, "public class Api {}");
+  assert.equal(normalized.edges[0].target_generation_id, "schema-generation");
+  assert.notEqual(normalized.edges[0].source_id, normalized.edges[0].target_id);
+  assert.throws(
+    () => normalizeGraphProjection({
+      ...normalized,
+      hash: undefined,
+      nodes: [{ ...source, excerpt: "x".repeat(513) }],
+    }),
+    /excerpt must be at most 512 UTF-8 bytes/,
+  );
+});

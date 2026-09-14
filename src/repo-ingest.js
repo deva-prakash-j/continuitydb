@@ -9,6 +9,9 @@ const CODE_EXTENSIONS = new Set([
   ".php", ".py", ".rb", ".rs", ".scala", ".swift", ".ts", ".tsx", ".vue",
 ]);
 const DOC_EXTENSIONS = new Set([".md", ".mdx", ".rst", ".txt", ".adoc"]);
+// These committed structured files feed the native graph extractor even when
+// legacy record ingestion does not produce a standalone memory for them.
+const GRAPH_STRUCTURED_EXTENSIONS = new Set([".gradle", ".json", ".yaml", ".yml"]);
 const DENIED_BASENAMES = /(^|\/)(?:\.env(?:\.|$)|\.git\/|id_(?:rsa|ed25519)|.*\.(?:pem|key|p12|pfx)$|secrets?(?:\.|\/)|credentials?(?:\.|\/))/i;
 const SYMBOL_PATTERNS = [
   /\b(?:class|interface|enum|record|trait|struct|type)\s+([A-Za-z_$][\w$]*)/g,
@@ -95,6 +98,7 @@ export function readCommittedSnapshot(inputPath, {
   const repositoryRoot = realpathSync(git(root, ["rev-parse", "--show-toplevel"]));
   if (root !== repositoryRoot) throw new Error("scan path must be the Git repository root");
   const commit = git(root, ["rev-parse", "HEAD"]);
+  const commitTime = new Date(git(root, ["show", "-s", "--format=%cI", commit])).toISOString();
   const branch = git(root, ["branch", "--show-current"]) || null;
   const remote = (() => {
     try { return sanitizeRemote(git(root, ["remote", "get-url", "origin"])); } catch { return null; }
@@ -124,6 +128,7 @@ export function readCommittedSnapshot(inputPath, {
     if (entry.objectType !== "blob" || entry.mode === "120000") { skipped.symlink += 1; continue; }
     const extension = extname(repoPath);
     const supported = CODE_EXTENSIONS.has(extension)
+      || GRAPH_STRUCTURED_EXTENSIONS.has(extension)
       || (includeDocs && DOC_EXTENSIONS.has(extension))
       || /(?:package\.json|pom\.xml|requirements[^/]*\.txt|go\.mod|Cargo\.toml)$/.test(repoPath);
     if (!supported) { skipped.unsupported += 1; continue; }
@@ -145,7 +150,7 @@ export function readCommittedSnapshot(inputPath, {
     }
   }
   const snapshot = {
-    repository: { project_id: inferredProject, root, remote, commit, branch },
+    repository: { project_id: inferredProject, root, remote, commit, commit_time: commitTime, branch },
     truncated: tree.length > tracked.length,
     skipped,
     files,
