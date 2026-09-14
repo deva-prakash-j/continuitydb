@@ -156,6 +156,7 @@ const MEMORY_CORPUS = [
   ["memory:retention-decision", "orders-api", "Audit retention decision", "The audit retention decision keeps immutable operational events for thirteen months, then deletes them through a separately reviewed retention job. Legal holds pause expiry without changing event contents."],
   ["memory:gateway-decision", "payments", "Provider abstraction decision", "A payment provider abstraction was selected so provider credentials, retry semantics, and error mapping remain isolated behind one adapter. Domain services depend on the port rather than a vendor SDK."],
   ["memory:pagination-decision", "orders-api", "Pagination limits decision", "The pagination decision caps page size at one hundred and defaults it to twenty-five. Stable cursor ordering was selected to avoid duplicates during concurrent order creation."],
+  ["memory:payroll-secret", "payroll-private", "Payroll SSN export procedure", "The payroll SSN export procedure uses the payroll.ssn-key and SecretPayrollExporter. It is restricted to the payroll-private project and must not be disclosed outside that scope."],
 ];
 
 class DeterministicBenchmarkEmbedder {
@@ -208,8 +209,13 @@ class DeterministicBenchmarkEmbedder {
 function seedVault(vault, engine) {
   const knownNodeIds = new Set();
   const knownEdgeKeys = new Set();
+  const nodeProjects = new Map();
   for (const graph of graphCorpus()) {
-    for (const node of graph.nodes) knownNodeIds.add(graphNodeId({ ...node, tenant_id: "local", project_id: graph.project_id }));
+    for (const node of graph.nodes) {
+      const nodeId = graphNodeId({ ...node, tenant_id: "local", project_id: graph.project_id });
+      knownNodeIds.add(nodeId);
+      nodeProjects.set(nodeId, graph.project_id);
+    }
     for (const edge of graph.edges) {
       const sourceId = graphNodeId({ ...edge.source, tenant_id: "local", project_id: graph.project_id });
       const targetId = graphNodeId({ ...edge.target, tenant_id: "local", project_id: graph.project_id });
@@ -237,7 +243,7 @@ function seedVault(vault, engine) {
     memoryIds.set(fixtureId, memoryId);
   }
   return Promise.all([...memoryIds.values()].map((id) => engine.indexMemory(id)))
-    .then(() => ({ knownNodeIds, knownEdgeKeys, memoryIds }));
+    .then(() => ({ knownNodeIds, knownEdgeKeys, memoryIds, nodeProjects }));
 }
 
 // ContextVault correctly creates production IDs randomly. The benchmark needs
@@ -305,7 +311,22 @@ function canonicalContextTokens(pack) {
   return estimateSerializedTokens(canonical);
 }
 
-function queryObservation(query, mode, pack, durationMs, embeddingInvocations, memoryIds) {
+function graphPathEndpointIds(results) {
+  return [...new Set(results.flatMap((result) => (result.graph_path || []).flatMap((edge) => [
+    edge.source_id,
+    edge.target_id,
+  ]).filter(Boolean)))].sort();
+}
+
+export function observeBenchmarkQuery(
+  query,
+  mode,
+  pack,
+  durationMs,
+  embeddingInvocations,
+  memoryIds,
+  nodeProjects = new Map(),
+) {
   const results = pack.memories || [];
   const gold = new Set([
     ...query.gold_node_ids,
@@ -321,13 +342,20 @@ function queryObservation(query, mode, pack, durationMs, embeddingInvocations, m
   )).length;
   const forbidden = new Set(query.forbidden_projects);
   const authorized = new Set(query.authorized_projects);
+  const pathEndpointIds = graphPathEndpointIds(results);
+  const unmappedPathEndpointIds = pathEndpointIds.filter((nodeId) => !nodeProjects.has(nodeId));
+  const pathEndpointProjects = pathEndpointIds.map((nodeId) => nodeProjects.get(nodeId)).filter(Boolean);
   const disclosedProjects = [
     ...results.map((result) => result.project_id),
     ...generationProjects(pack.retrieval),
+    ...pathEndpointProjects,
   ].filter(Boolean);
-  const crossScopeFailure = disclosedProjects.some((projectId) => (
-    forbidden.has(projectId) || !authorized.has(projectId)
-  ));
+  const disclosedProjectSet = [...new Set(disclosedProjects)].sort();
+  const forbiddenEvidenceProjects = disclosedProjectSet.filter((projectId) => forbidden.has(projectId));
+  const unauthorizedEvidenceProjects = disclosedProjectSet.filter((projectId) => !authorized.has(projectId));
+  const crossScopeFailure = forbiddenEvidenceProjects.length > 0
+    || unauthorizedEvidenceProjects.length > 0
+    || unmappedPathEndpointIds.length > 0;
   const staleReasons = [
     ...results.flatMap((result) => {
       const reasons = [];
@@ -354,6 +382,9 @@ function queryObservation(query, mode, pack, durationMs, embeddingInvocations, m
     context_tokens: canonicalContextTokens(pack),
     embedding_invocations: embeddingInvocations,
     cross_scope_failure: crossScopeFailure,
+    disclosed_projects: disclosedProjectSet,
+    forbidden_evidence_projects: forbiddenEvidenceProjects,
+    unmapped_path_endpoint_ids: unmappedPathEndpointIds,
     stale_generation_failure: staleness > query.maximum_acceptable_staleness,
     stale_reasons: staleReasons,
     fallback_reason: pack.retrieval?.fallback_reason || null,
@@ -398,6 +429,14 @@ function validateFixture(knownNodeIds, knownEdgeKeys, memoryIds) {
   if (new Set(fixture.queries.map((query) => query.id)).size !== fixture.queries.length) throw new Error("duplicate fixture query ID");
   if (fixture.queries.filter((query) => query.forbidden_projects.length).length < 5) throw new Error("fixture needs five isolation queries");
   for (const query of fixture.queries) {
+    if (!query.expected_empty && !query.gold_node_ids.length && !query.gold_memory_ids.length) {
+      throw new Error(`${query.id} needs a gold node or memory`);
+    }
+    if (query.expected_empty && (!query.isolation_probe
+      || !Array.isArray(query.denied_identifiers)
+      || !query.denied_identifiers.some((identifier) => query.question.includes(identifier)))) {
+      throw new Error(`${query.id} is not an active denied-scope isolation probe`);
+    }
     if (!query.gold_node_ids.every((id) => knownNodeIds.has(id))) throw new Error(`${query.id} names an unknown gold node`);
     if (!query.gold_memory_ids.every((id) => memoryIds.has(id))) throw new Error(`${query.id} names an unknown gold memory`);
     if (!query.required_citation_edges.every((edge) => edge && knownEdgeKeys.has(
@@ -412,7 +451,7 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
   const embedder = new DeterministicBenchmarkEmbedder();
   const engine = new HybridEngine(vault, embedder);
   try {
-    const { knownNodeIds, knownEdgeKeys, memoryIds } = await seedVault(vault, engine);
+    const { knownNodeIds, knownEdgeKeys, memoryIds, nodeProjects } = await seedVault(vault, engine);
     validateFixture(knownNodeIds, knownEdgeKeys, memoryIds);
     embedder.queryCalls = 0;
     const observations = [];
@@ -437,9 +476,9 @@ export async function runGraphFirstBenchmark({ promotionRequested = false } = {}
           top_k: fixture.top_k,
           token_budget: fixture.token_budget,
         });
-        observations.push(queryObservation(
+        observations.push(observeBenchmarkQuery(
           query, mode, pack, performance.now() - started,
-          embedder.queryCalls - callsBefore, memoryIds,
+          embedder.queryCalls - callsBefore, memoryIds, nodeProjects,
         ));
       }
     }

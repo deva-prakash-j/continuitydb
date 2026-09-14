@@ -7,7 +7,11 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { parse } from "yaml";
 import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate-release-workflow.js";
-import { runGraphFirstBenchmark, summarizeBenchmarkObservations } from "../benchmarks/graph-first-benchmark.js";
+import {
+  observeBenchmarkQuery,
+  runGraphFirstBenchmark,
+  summarizeBenchmarkObservations,
+} from "../benchmarks/graph-first-benchmark.js";
 
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
 const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
@@ -788,7 +792,7 @@ test("graph-first release benchmark uses the frozen representative fixture and r
   for (const query of fixture.queries) {
     assert.ok(query.authorized_projects.length > 0);
     assert.equal(typeof query.branch, "string");
-    assert.ok(query.gold_node_ids.length > 0 || query.gold_memory_ids.length > 0);
+    assert.ok(query.expected_empty || query.gold_node_ids.length > 0 || query.gold_memory_ids.length > 0);
     assert.ok(Array.isArray(query.required_citation_edges));
     assert.equal(Number.isInteger(query.maximum_acceptable_staleness), true);
   }
@@ -818,6 +822,52 @@ test("graph-first release benchmark uses the frozen representative fixture and r
     encoding: "utf8",
   });
   assert.notEqual(failedPromotion.status, 0, "an ineligible graph-first promotion must fail");
+});
+
+test("graph-first isolation probes request denied content and account for cited endpoint projects", () => {
+  const fixture = JSON.parse(readFileSync(new URL("../benchmarks/graph-first-fixture.json", import.meta.url), "utf8"));
+  const probes = fixture.queries.filter((query) => query.isolation_probe === true);
+  assert.ok(probes.length >= 5);
+  for (const query of probes) {
+    assert.equal(query.expected_empty, true);
+    assert.ok(query.denied_identifiers.some((identifier) => query.question.includes(identifier)));
+    assert.ok(query.forbidden_projects.length > 0);
+  }
+
+  const pack = {
+    memories: [{
+      id: "authorized-result",
+      project_id: "orders-api",
+      graph_path: [{ source_id: "orders-node", target_id: "payroll-node" }],
+    }],
+    retrieval: null,
+  };
+  const endpointLeak = observeBenchmarkQuery(
+    {
+      id: "endpoint-leak", class: "exact-symbol", gold_node_ids: [], gold_memory_ids: [],
+      required_citation_edges: [], forbidden_projects: ["payroll-private"],
+      authorized_projects: ["orders-api"], maximum_acceptable_staleness: 0,
+    },
+    "graph-only",
+    pack,
+    0,
+    0,
+    new Map(),
+    new Map([["orders-node", "orders-api"], ["payroll-node", "payroll-private"]]),
+  );
+  assert.equal(endpointLeak.cross_scope_failure, true);
+  assert.deepEqual(endpointLeak.forbidden_evidence_projects, ["payroll-private"]);
+
+  return runGraphFirstBenchmark().then((report) => {
+    for (const probe of probes) {
+      const observations = report.query_results.filter((item) => item.id === probe.id);
+      assert.equal(observations.length, 3);
+      for (const observation of observations) {
+        assert.equal(observation.cross_scope_failure, false);
+        assert.deepEqual(observation.forbidden_evidence_projects, []);
+      }
+    }
+  });
 });
 
 test("graph-first benchmark avoidance is based on queries, not raw embed calls", () => {
