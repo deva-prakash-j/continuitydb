@@ -108,3 +108,69 @@ test("depth, path budgets, stale generations, and administrative paths are enfor
     assert.equal(resolveGraphSeeds(f.vault, scope).length, 0);
   } finally { f.cleanup(); }
 });
+
+test("branch generations remain separated and unauthorized intermediate nodes stop paths", () => {
+  const f = fixture();
+  try {
+    f.vault.publishGraph({
+      project_id: "orders-api", branch: "feature/private", commit: "feature", extractor_version: "test-v1",
+      source_states: [{ repo_path: "src/FeatureOnly.java", git_object_id: "feature" }],
+      nodes: [{ repo_path: "src/FeatureOnly.java", kind: "class", qualified_name: "private.FeatureOnly" }], edges: [],
+    });
+    assert.equal(resolveGraphSeeds(f.vault, { ...scope, query: "private.FeatureOnly", branch: "main" }).length, 0);
+    assert.equal(resolveGraphSeeds(f.vault, { ...scope, query: "private.FeatureOnly", branch: "feature/private" }).length, 1);
+
+    const start = { repo_path: "src/GateStart.java", kind: "class", qualified_name: "gate.Start" };
+    const deniedNode = { repo_path: "src/PayrollBridge.java", kind: "class", qualified_name: "gate.PayrollBridge" };
+    const behind = { repo_path: "src/AuthorizedBehind.java", kind: "class", qualified_name: "gate.AuthorizedBehind" };
+    f.vault.publishGraph({
+      project_id: "orders-api", branch: "main", commit: "gate", extractor_version: "test-v1",
+      source_states: [start, deniedNode, behind].map((node) => ({ repo_path: node.repo_path, git_object_id: node.qualified_name })),
+      nodes: [start, deniedNode, behind],
+      edges: [
+        { source: start, target: deniedNode, relation: "calls", repo_path: start.repo_path },
+        { source: deniedNode, target: behind, relation: "calls", repo_path: deniedNode.repo_path },
+      ],
+    });
+    const denied = f.vault.db.prepare("SELECT id FROM graph_nodes WHERE qualified_name = ?").get("gate.PayrollBridge");
+    f.vault.db.prepare("UPDATE graph_nodes SET project_id = 'payroll' WHERE id = ?").run(denied.id);
+    const traversed = traverseGraph(f.vault, { ...scope, query: "gate.Start", direction: "outgoing", depth: 3 });
+    assert.equal(traversed.some((candidate) => candidate.id === denied.id), false);
+    assert.equal(JSON.stringify(traversed).includes("PayrollBridge"), false);
+    assert.equal(JSON.stringify(traversed).includes("AuthorizedBehind"), false);
+  } finally { f.cleanup(); }
+});
+
+test("visited budgets cap breadth and inferred edges rank below extracted evidence", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-graph-budget-"));
+  const vault = new ContextVault(root);
+  try {
+    const hub = { repo_path: "src/Hub.java", kind: "class", qualified_name: "budget.Hub" };
+    const targets = Array.from({ length: 30 }, (_, index) => ({
+      repo_path: `src/Target${index}.java`, kind: "class", qualified_name: `budget.Target${index}`,
+    }));
+    vault.publishGraph({
+      project_id: "budget", branch: "main", commit: "budget", extractor_version: "test-v1",
+      source_states: [hub, ...targets].map((node) => ({ repo_path: node.repo_path, git_object_id: node.qualified_name })),
+      nodes: [hub, ...targets],
+      edges: targets.map((target, index) => ({
+        source: hub, target, relation: "calls", repo_path: hub.repo_path,
+        start_line: index + 1, provenance: index === 29 ? "inferred" : "extracted",
+      })),
+    });
+    const input = {
+      query: "budget.Hub", project_id: "budget", allowed_projects: ["budget"], branch: "main",
+      direction: "outgoing", depth: 1, maxPaths: 40,
+    };
+    const capped = traverseGraph(vault, { ...input, maxVisited: 25 });
+    assert.equal(capped.length, 25);
+    const all = traverseGraph(vault, { ...input, maxVisited: 400 });
+    const extracted = all.find((candidate) => candidate.qualified_name === "budget.Target0");
+    const inferred = all.find((candidate) => candidate.qualified_name === "budget.Target29");
+    assert.ok(extracted.score > inferred.score);
+    assert.ok(all.indexOf(extracted) < all.indexOf(inferred));
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

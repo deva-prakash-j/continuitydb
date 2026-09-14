@@ -119,3 +119,29 @@ test("code graph seeds and paths enforce node and edge validity before traversal
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("historical graph scope evaluates project-edge valid_from and valid_to at as_of", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-temporal-project-edge-"));
+  const vault = new ContextVault(root);
+  try {
+    const schema = { repo_path: "schema/OrderSchema.json", kind: "schema", qualified_name: "orders.OrderSchema" };
+    vault.publishGraph({
+      project_id: "orders-schema", branch: "main", commit: "schema", extractor_version: "test-v1",
+      source_states: [{ repo_path: schema.repo_path, git_object_id: "schema" }], nodes: [schema], edges: [],
+    });
+    vault.linkProjects({
+      source_project: "orders-api", target_project: "orders-schema", provenance: "historical pom.xml",
+      valid_from: "2026-03-01T00:00:00Z", valid_to: "2026-09-01T00:00:00Z",
+    });
+    const input = {
+      query: "orders.OrderSchema", project_id: "orders-api",
+      allowed_projects: ["orders-api", "orders-schema"], branch: "main", retrieval_mode: "graph-only",
+    };
+    assert.equal(vault.searchDetailed({ ...input, as_of: "2026-02-01T00:00:00Z" }).results.length, 0);
+    assert.equal(vault.searchDetailed({ ...input, as_of: "2026-06-01T00:00:00Z" }).results.length, 1);
+    assert.equal(vault.searchDetailed({ ...input, as_of: "2026-10-01T00:00:00Z" }).results.length, 0);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

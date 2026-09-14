@@ -1503,9 +1503,10 @@ export class ContextVault {
     return this.db.prepare(sql).get(id) || null;
   }
 
-  dependencies(projectId, maxDepth = 2, allowedProjects = [], tenantId = LOCAL_TENANT) {
+  dependencies(projectId, maxDepth = 2, allowedProjects = [], tenantId = LOCAL_TENANT, asOf = null) {
     if (!projectId) return new Map();
     requiredIdentifier(tenantId, "tenant_id");
+    const effectiveTime = optionalIso(asOf, "as_of") || nowIso();
     const allowed = new Set(allowedProjects);
     if (!allowed.has(projectId)) throw new Error(`project ${projectId} is not allowed for this caller`);
     const visited = new Map([[projectId, 0]]);
@@ -1520,9 +1521,10 @@ export class ContextVault {
             WHERE tenant_id = ? AND source_project = ?
               AND relation IN ('depends-on', 'calls', 'consumes', 'imports')
               AND weight > 0
+              AND (valid_from IS NULL OR valid_from <= ?)
               AND (valid_to IS NULL OR valid_to > ?)
           `)
-          .all(tenantId, project, nowIso());
+          .all(tenantId, project, effectiveTime, effectiveTime);
         for (const row of rows) {
           if (allowed.has(row.target_project) && !visited.has(row.target_project)) {
             visited.set(row.target_project, depth);
@@ -1549,6 +1551,13 @@ export class ContextVault {
     const seeds = input.project_id ? resolveGraphSeeds(this, input) : [];
     const graphCandidates = input.project_id ? traverseGraph(this, { ...input, seeds }) : [];
     const coverage = evaluateGraphCoverage({ query: input.query, seeds, candidates: graphCandidates });
+    const retrieval = {
+      requested_mode: requestedMode,
+      effective_mode: requestedMode,
+      semantic_fallback_used: false,
+      fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
+      graph_generation: graphGenerationSummary(this, input),
+    };
     const candidateTopK = clamp(Number(input.top_k ?? 8) * 4, 8, 100);
     const memoryResults = requestedMode === "graph-only" ? [] : this.searchMemoryResults({
       ...input,
@@ -1607,26 +1616,30 @@ export class ContextVault {
     const results = [];
     const topK = clamp(Number(input.top_k ?? 8), 1, 50);
     const tokenBudget = input.token_budget ?? 1200;
+    const envelope = (items) => ({ results: items, retrieval });
     for (const item of diverse) {
       if (results.length >= topK) break;
-      let candidate = item;
-      while (candidate.graph_path?.length > 1 && estimateSerializedTokens({ results: [...results, candidate] }) > clamp(Number(tokenBudget), 64, 32_000)) {
-        candidate = { ...candidate, graph_path: candidate.graph_path.slice(0, -1) };
+      const optionalMetadata = { ...item };
+      delete optionalMetadata.feedback;
+      delete optionalMetadata.tags;
+      const compactMetadata = { ...optionalMetadata };
+      delete compactMetadata.score_signals;
+      let fitted = null;
+      const candidates = [item, optionalMetadata, compactMetadata];
+      const limit = clamp(Number(tokenBudget), 64, 32_000);
+      for (const candidate of candidates) {
+        if (estimateSerializedTokens(envelope([...results, candidate])) <= limit) {
+          fitted = candidate;
+          break;
+        }
       }
-      const fitted = fitResultWithinEnvelope(results, candidate, tokenBudget);
+      // Preserve the cited graph path while compacting optional metadata first;
+      // body text is the final elastic field in the existing result contract.
+      if (!fitted) fitted = fitResultWithinEnvelope(results, compactMetadata, tokenBudget, envelope);
       if (!fitted) break;
       results.push(fitted);
     }
-    return {
-      results,
-      retrieval: {
-        requested_mode: requestedMode,
-        effective_mode: requestedMode,
-        semantic_fallback_used: false,
-        fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
-        graph_generation: graphGenerationSummary(this, input),
-      },
-    };
+    return { results, retrieval };
   }
 
   explainGraphNode(input = {}) {
@@ -1691,15 +1704,16 @@ export class ContextVault {
     const sensitivities = allowed_sensitivities.filter((value) => ["public", "private", "sensitive", "restricted"].includes(value));
     const excludedTypes = normalizeExcludedTypes(exclude_types);
     if (!sensitivities.length) return [];
+    const effectiveTime = optionalIso(as_of, "as_of") || nowIso();
     const projects = this.dependencies(
       project_id,
       clamp(Number(dependency_depth), 0, 5),
       allowed_projects,
       tenantId,
+      effectiveTime,
     );
     const namespaces = [PERSONAL_NAMESPACE, ...[...projects.keys()].map((id) => `project/${id}`)];
     const candidateLimit = clamp(Number(top_k) * 8, 24, 200);
-    const effectiveTime = optionalIso(as_of, "as_of") || nowIso();
     const rows = this.db.prepare(`
       SELECT r.*, bm25(memory_fts, 0.0, 8.0, 5.0, 2.0, 3.0, 4.0) AS lexical_rank
       FROM memory_fts
@@ -1985,9 +1999,15 @@ export class ContextVault {
     const queryVector = decodeVector(encoded, query_embedding.length);
     const sensitivities = allowed_sensitivities.filter((value) => ["public", "private", "sensitive", "restricted"].includes(value));
     if (!sensitivities.length) return [];
-    const projects = this.dependencies(project_id, clamp(Number(dependency_depth), 0, 5), allowed_projects, tenantId);
-    const namespaces = [PERSONAL_NAMESPACE, ...[...projects.keys()].map((id) => `project/${id}`)];
     const effectiveTime = optionalIso(as_of, "as_of") || nowIso();
+    const projects = this.dependencies(
+      project_id,
+      clamp(Number(dependency_depth), 0, 5),
+      allowed_projects,
+      tenantId,
+      effectiveTime,
+    );
+    const namespaces = [PERSONAL_NAMESPACE, ...[...projects.keys()].map((id) => `project/${id}`)];
     const rows = this.db.prepare(`
       SELECT r.*, e.dimensions, e.vector
       FROM memory_embeddings e

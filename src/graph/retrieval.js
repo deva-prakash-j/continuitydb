@@ -42,7 +42,8 @@ function ftsExpression(terms) {
 
 export function authorizedScope(vault, input) {
   const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
-  if (!input.project_id) return { tenantId, projects: [], generations: [], effectiveTime: optionalTime(input.as_of) };
+  const effectiveTime = optionalTime(input.as_of);
+  if (!input.project_id) return { tenantId, projects: [], generations: [], effectiveTime };
   const projectId = requiredIdentifier(input.project_id, "project_id");
   const allowedProjects = [...new Set((input.allowed_projects || []).map((item) => requiredIdentifier(item, "allowed project")))];
   const projects = [...vault.dependencies(
@@ -50,6 +51,7 @@ export function authorizedScope(vault, input) {
     Math.min(5, Math.max(0, Number(input.dependency_depth ?? 2))),
     allowedProjects,
     tenantId,
+    effectiveTime,
   ).keys()].sort();
   const generations = projects.flatMap((project) => {
     const request = { tenant_id: tenantId, project_id: project };
@@ -59,7 +61,7 @@ export function authorizedScope(vault, input) {
     const generation = vault.activeGraphGeneration(request);
     return generation ? [generation] : [];
   });
-  return { tenantId, projectId, projects, generations, effectiveTime: optionalTime(input.as_of) };
+  return { tenantId, projectId, projects, generations, effectiveTime };
 }
 
 function graphPredicate(input, alias = "n") {

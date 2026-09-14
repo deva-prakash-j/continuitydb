@@ -184,6 +184,25 @@ test("detailed graph search preserves the legacy array search contract", () => {
   } finally { f.cleanup(); }
 });
 
+test("detailed search packs retrieval metadata and cited paths inside the token envelope", () => {
+  const f = fixture();
+  try {
+    f.vault.publishGraph(graphFixture({ commit: "budget" }));
+    const detailed = f.vault.searchDetailed({
+      query: "com.acme.Service",
+      project_id: "api",
+      allowed_projects: ["api"],
+      branch: "main",
+      retrieval_mode: "graph-only",
+      direction: "incoming",
+      top_k: 2,
+      token_budget: 475,
+    });
+    assert.ok(estimateSerializedTokens(detailed) <= 475);
+    assert.ok(detailed.results.some((result) => result.graph_path.length === 1));
+  } finally { f.cleanup(); }
+});
+
 test("an invalid projection leaves the active generation unchanged", () => {
   const f = fixture();
   try {
