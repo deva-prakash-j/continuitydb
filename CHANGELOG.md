@@ -5,6 +5,22 @@ after the first stable release.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-14
+
+- Added deterministic native code-graph extraction for Java/Spring, structured
+  configuration, dependencies, and documentation from committed Git snapshots.
+- Added atomic branch-aware graph generations, incremental rebuilds, typed
+  provenance, and authorization-aware temporal traversal with bounded cited
+  evidence paths.
+- Added `graph-only` and `graph-first` retrieval across CLI, MCP, and HTTP,
+  including truthful semantic-fallback telemetry and token-budgeted context
+  packs. The existing `hybrid` mode remains the default until graph-first meets
+  the documented promotion threshold.
+- Added reproducible graph retrieval benchmarks covering recall, path coverage,
+  latency, token use, embedding avoidance, and cross-scope isolation.
+
+## [0.8.0] - 2026-09-13
+
 - Added one-time global OpenCode integration for trusted workspace roots. New
   Git repositories are registered automatically when opened, receive bounded
   project-scoped recall, and expose governed project memory tools without

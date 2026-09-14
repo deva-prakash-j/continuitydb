@@ -1,6 +1,6 @@
 {
   "name": "continuitydb",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "private": false,
   "description": "Git-grounded, provider-neutral context continuity for AI coding agents",
   "type": "module",
