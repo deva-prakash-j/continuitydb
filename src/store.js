@@ -141,6 +141,22 @@ function fitResultWithinEnvelope(results, candidate, tokenBudget, envelope = (it
   return best;
 }
 
+function graphGenerationVariants(summary) {
+  if (!summary) return [null];
+  const generations = summary.generations || [summary];
+  const totalCount = Number(summary.total_count ?? generations.length);
+  const compact = {
+    generations: generations.slice(0, 2).map(({ id, project_id }) => ({ id, project_id })),
+    total_count: totalCount,
+    truncated: true,
+  };
+  const minimal = { total_count: totalCount, truncated: true };
+  const variants = [summary, compact, minimal];
+  return variants.filter((variant, index) => (
+    variants.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(variant)) === index
+  ));
+}
+
 export function fitContextPack(payload, tokenBudget) {
   const requestedTokens = clamp(Number(tokenBudget), 64, 32_000);
   const candidates = payload.memories || [];
@@ -1551,13 +1567,14 @@ export class ContextVault {
     const seeds = input.project_id ? resolveGraphSeeds(this, input) : [];
     const graphCandidates = input.project_id ? traverseGraph(this, { ...input, seeds }) : [];
     const coverage = evaluateGraphCoverage({ query: input.query, seeds, candidates: graphCandidates });
-    const retrieval = {
+    const retrievalBase = {
       requested_mode: requestedMode,
       effective_mode: requestedMode,
       semantic_fallback_used: false,
       fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
-      graph_generation: graphGenerationSummary(this, input),
     };
+    const retrievalVariants = graphGenerationVariants(graphGenerationSummary(this, input))
+      .map((graph_generation) => ({ ...retrievalBase, graph_generation }));
     const candidateTopK = clamp(Number(input.top_k ?? 8) * 4, 8, 100);
     const memoryResults = requestedMode === "graph-only" ? [] : this.searchMemoryResults({
       ...input,
@@ -1616,7 +1633,14 @@ export class ContextVault {
     const results = [];
     const topK = clamp(Number(input.top_k ?? 8), 1, 50);
     const tokenBudget = input.token_budget ?? 1200;
-    const envelope = (items) => ({ results: items, retrieval });
+    const limit = clamp(Number(tokenBudget), 64, 32_000);
+    let retrievalIndex = retrievalVariants.findIndex((candidate) => (
+      estimateSerializedTokens({ results, retrieval: candidate }) <= limit
+    ));
+    // The fixed retrieval fields fit the public minimum budget; this final
+    // variant explicitly reports omitted generation detail.
+    if (retrievalIndex < 0) retrievalIndex = retrievalVariants.length - 1;
+    let retrieval = retrievalVariants[retrievalIndex];
     for (const item of diverse) {
       if (results.length >= topK) break;
       const optionalMetadata = { ...item };
@@ -1626,16 +1650,36 @@ export class ContextVault {
       delete compactMetadata.score_signals;
       let fitted = null;
       const candidates = [item, optionalMetadata, compactMetadata];
-      const limit = clamp(Number(tokenBudget), 64, 32_000);
       for (const candidate of candidates) {
-        if (estimateSerializedTokens(envelope([...results, candidate])) <= limit) {
-          fitted = candidate;
-          break;
+        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+          const candidateRetrieval = retrievalVariants[index];
+          if (estimateSerializedTokens({ results: [...results, candidate], retrieval: candidateRetrieval }) <= limit) {
+            fitted = candidate;
+            retrievalIndex = index;
+            retrieval = candidateRetrieval;
+            break;
+          }
         }
+        if (fitted) break;
       }
       // Preserve the cited graph path while compacting optional metadata first;
       // body text is the final elastic field in the existing result contract.
-      if (!fitted) fitted = fitResultWithinEnvelope(results, compactMetadata, tokenBudget, envelope);
+      if (!fitted) {
+        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+          const candidateRetrieval = retrievalVariants[index];
+          fitted = fitResultWithinEnvelope(
+            results,
+            compactMetadata,
+            tokenBudget,
+            (items) => ({ results: items, retrieval: candidateRetrieval }),
+          );
+          if (fitted) {
+            retrievalIndex = index;
+            retrieval = candidateRetrieval;
+            break;
+          }
+        }
+      }
       if (!fitted) break;
       results.push(fitted);
     }

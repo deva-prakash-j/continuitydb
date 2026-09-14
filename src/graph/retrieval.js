@@ -436,10 +436,16 @@ export function evaluateGraphCoverage({ query = "", seeds = [], candidates = [],
   };
 }
 
-export function graphGenerationSummary(vault, input) {
+export function graphGenerationSummary(vault, input, { limit = 20 } = {}) {
+  const boundedLimit = Math.min(20, Math.max(1, Number.isInteger(limit) ? limit : 20));
   const generations = authorizedScope(vault, input).generations
     .map(({ id, project_id, branch, commit }) => ({ id, project_id, branch, commit }))
     .sort((left, right) => left.project_id.localeCompare(right.project_id) || left.id.localeCompare(right.id));
   if (!generations.length) return null;
-  return generations.length === 1 ? generations[0] : generations;
+  if (generations.length === 1) return generations[0];
+  return {
+    generations: generations.slice(0, boundedLimit),
+    total_count: generations.length,
+    truncated: generations.length > boundedLimit,
+  };
 }

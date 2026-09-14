@@ -203,6 +203,37 @@ test("detailed search packs retrieval metadata and cited paths inside the token 
   } finally { f.cleanup(); }
 });
 
+test("many authorized generations truncate metadata before cited evidence", () => {
+  const f = fixture();
+  try {
+    f.vault.publishGraph(graphFixture({ commit: "bounded-generations" }));
+    const dependencies = Array.from({ length: 24 }, (_, index) => `dep-${index}`);
+    for (const project_id of dependencies) {
+      const node = { repo_path: "README.md", kind: "document", qualified_name: `${project_id}.Readme` };
+      f.vault.publishGraph({
+        project_id, branch: "main", commit: project_id, extractor_version: "test-v1",
+        source_states: [{ repo_path: node.repo_path, git_object_id: project_id }], nodes: [node], edges: [],
+      });
+      f.vault.linkProjects({ source_project: "api", target_project: project_id, provenance: `${project_id}/pom.xml` });
+    }
+    const tokenBudget = 475;
+    const detailed = f.vault.searchDetailed({
+      query: "com.acme.Service",
+      project_id: "api",
+      allowed_projects: ["api", ...dependencies],
+      branch: "main",
+      retrieval_mode: "graph-only",
+      direction: "incoming",
+      top_k: 2,
+      token_budget: tokenBudget,
+    });
+    assert.ok(estimateSerializedTokens(detailed) <= tokenBudget);
+    assert.ok(detailed.results.some((result) => result.graph_path.length === 1));
+    assert.equal(detailed.retrieval.graph_generation.total_count, 25);
+    assert.equal(detailed.retrieval.graph_generation.truncated, true);
+  } finally { f.cleanup(); }
+});
+
 test("an invalid projection leaves the active generation unchanged", () => {
   const f = fixture();
   try {
