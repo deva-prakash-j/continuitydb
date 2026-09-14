@@ -1,7 +1,7 @@
 # Native Graph-First Retrieval Design
 
 **Date:** 2026-09-14
-**Status:** Approved direction; implementation pending plan review
+**Status:** Approved for implementation
 
 ## Goal
 
