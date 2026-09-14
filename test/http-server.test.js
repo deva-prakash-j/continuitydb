@@ -192,6 +192,16 @@ test("HTTP search validates graph bounds, binds authorization, and returns retri
     assert.equal(value.retrieval.requested_mode, "graph-first");
     assert.equal(value.retrieval.fallback_reason, "semantic_unavailable");
     assert.equal(detailedCalls, 1);
+    const contextResponse = await fetch(`${base}/v1/context-packs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ task: "OrderController", project_id: "api", retrieval_mode: "graph-only" }),
+    });
+    assert.equal(contextResponse.status, 200);
+    const context = await contextResponse.json();
+    assert.equal(context.retrieval_mode, "graph-only");
+    assert.equal(context.retrieval.requested_mode, "graph-only");
+    assert.equal(context.retrieval.semantic_fallback_used, false);
 
     for (const input of [
       { query: "x", project_id: "api", graph_depth: 4 },

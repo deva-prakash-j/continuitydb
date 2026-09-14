@@ -121,7 +121,11 @@ paths:
                 graph_max_visited: { type: integer, minimum: 25, maximum: 2000, default: 400 }
                 graph_max_paths: { type: integer, minimum: 1, maximum: 200, default: 40 }
       responses:
-        "200": { description: Token-bounded cited context pack }
+        "200":
+          description: Token-bounded cited context pack with actual retrieval mode and fallback telemetry
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContextPack" }
         "400": { description: Invalid retrieval mode, depth, graph budget, or context field }
   /v1/memories/proposals:
     post:
@@ -407,6 +411,39 @@ components:
         weight: { type: number, minimum: 0, maximum: 1 }
         source_location: { type: [string, "null"] }
         commit: { type: string }
+    ContextPack:
+      type: object
+      required: [retrieval, memories, budget]
+      properties:
+        project_id: { type: [string, "null"] }
+        task: { type: string }
+        generated_at: { type: string, format: date-time }
+        retrieval_mode:
+          type: string
+          enum: [hybrid, graph-only, graph-first, lexical+graph]
+          description: Actual effective retrieval mode; may be omitted only when compacting the smallest token envelopes.
+        retrieval:
+          description: Full detailed retrieval metadata; compact token envelopes retain only effective_mode, semantic_fallback_used, and fallback_reason.
+          anyOf:
+            - $ref: "#/components/schemas/RetrievalMetadata"
+            - type: object
+              required: [effective_mode, semantic_fallback_used, fallback_reason]
+              properties:
+                effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical+graph] }
+                semantic_fallback_used: { type: boolean }
+                fallback_reason:
+                  type: [string, "null"]
+                  enum: [no_seed, insufficient_candidates, low_path_confidence, conceptual_query, semantic_unavailable, null]
+        warning: { type: string }
+        memories: { type: array, items: { $ref: "#/components/schemas/MemoryResult" } }
+        budget:
+          type: object
+          required: [requested_tokens, estimator, estimated_tokens, serialized_bytes]
+          properties:
+            requested_tokens: { type: integer, minimum: 64, maximum: 32000 }
+            estimator: { type: string }
+            estimated_tokens: { type: integer, minimum: 0 }
+            serialized_bytes: { type: integer, minimum: 0 }
     MemoryInput:
       type: object
       required: [body, namespace_id]

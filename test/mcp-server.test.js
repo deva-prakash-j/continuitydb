@@ -198,6 +198,13 @@ test("MCP search accepts bounded graph options and returns additive retrieval me
     ]);
     assert.equal(found.structuredContent.retrieval.requested_mode, "graph-first");
     assert.equal(found.structuredContent.retrieval.fallback_reason, "semantic_unavailable");
+    const context = await client.callTool({
+      name: "memory_context_pack",
+      arguments: { task: "OrderController", project_id: "orders", retrieval_mode: "graph-only" },
+    });
+    assert.equal(context.structuredContent.retrieval_mode, "graph-only");
+    assert.equal(context.structuredContent.retrieval.requested_mode, "graph-only");
+    assert.equal(context.structuredContent.retrieval.semantic_fallback_used, false);
 
     for (const arguments_ of [
       { query: "x", project_id: "orders", graph_depth: 4 },

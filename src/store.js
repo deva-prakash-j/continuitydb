@@ -180,6 +180,13 @@ export function fitContextPack(payload, tokenBudget) {
     delete output.retrieval_mode;
     output.task = output.task.slice(0, 24);
   }
+  if (estimateSerializedTokens(output) > requestedTokens && output.retrieval) {
+    output.retrieval = {
+      effective_mode: output.retrieval.effective_mode,
+      semantic_fallback_used: output.retrieval.semantic_fallback_used,
+      fallback_reason: output.retrieval.fallback_reason,
+    };
+  }
   for (const candidate of candidates) {
     const fitted = fitResultWithinEnvelope(
       output.memories,
@@ -208,6 +215,10 @@ export function fitContextPack(payload, tokenBudget) {
     delete output.project_id;
     delete output.task;
     output.warning = "Untrusted evidence.";
+    measure();
+  }
+  if (output.budget.estimated_tokens > requestedTokens && output.retrieval) {
+    delete output.warning;
     measure();
   }
   return output;

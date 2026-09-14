@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { HybridEngine } from "../src/embeddings.js";
-import { ContextVault } from "../src/store.js";
+import { ContextVault, estimateSerializedTokens } from "../src/store.js";
 
 function publishOrderGraph(vault) {
   const controller = {
@@ -115,6 +115,88 @@ test("graph-only never embeds, while legacy hybrid eagerly includes semantic can
     assert.equal(embedder.queryCalls, 1);
     assert.equal(hybrid.results[0].id, semantic.record.id);
     assert.equal(hybrid.retrieval.semantic_fallback_used, false);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("context packs expose actual graph, fallback, hybrid, and unavailable retrieval telemetry", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-context-pack-modes-"));
+  const vault = new ContextVault(root);
+  const embedder = countingEmbedder();
+  try {
+    publishOrderGraph(vault);
+    const engine = new HybridEngine(vault, embedder);
+    const common = {
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "main",
+      token_budget: 1200,
+    };
+
+    const graphOnly = await engine.contextPack({ ...common, task: "OrderController", retrieval_mode: "graph-only" });
+    assert.equal(graphOnly.retrieval_mode, "graph-only");
+    assert.equal(graphOnly.retrieval.requested_mode, "graph-only");
+    assert.equal(graphOnly.retrieval.semantic_fallback_used, false);
+    assert.equal(embedder.queryCalls, 0);
+
+    const graphFirst = await engine.contextPack({ ...common, task: "OrderController", retrieval_mode: "graph-first" });
+    assert.equal(graphFirst.retrieval_mode, "graph-first");
+    assert.equal(graphFirst.retrieval.effective_mode, "graph-first");
+    assert.equal(graphFirst.retrieval.semantic_fallback_used, false);
+    assert.equal(embedder.queryCalls, 0);
+
+    const fallback = await engine.contextPack({
+      ...common,
+      task: "where should unknown distributed responsibilities be implemented",
+      retrieval_mode: "graph-first",
+    });
+    assert.equal(fallback.retrieval_mode, "hybrid");
+    assert.equal(fallback.retrieval.requested_mode, "graph-first");
+    assert.equal(fallback.retrieval.semantic_fallback_used, true);
+    assert.ok(["no_seed", "insufficient_candidates", "low_path_confidence", "conceptual_query"]
+      .includes(fallback.retrieval.fallback_reason));
+    assert.equal(embedder.queryCalls, 1);
+
+    const hybrid = await engine.contextPack({ ...common, task: "OrderController", retrieval_mode: "hybrid" });
+    assert.equal(hybrid.retrieval_mode, "hybrid");
+    assert.equal(hybrid.retrieval.requested_mode, "hybrid");
+    assert.equal(hybrid.retrieval.semantic_fallback_used, false);
+    assert.equal(embedder.queryCalls, 2);
+
+    const unavailable = await new HybridEngine(vault).contextPack({
+      ...common,
+      task: "where should unknown distributed responsibilities be implemented",
+      retrieval_mode: "graph-first",
+      branch: "missing",
+    });
+    assert.equal(unavailable.retrieval_mode, "lexical+graph");
+    assert.equal(unavailable.retrieval.semantic_fallback_used, false);
+    assert.equal(unavailable.retrieval.fallback_reason, "semantic_unavailable");
+
+    const hybridUnavailable = await new HybridEngine(vault).contextPack({
+      ...common,
+      task: "OrderController",
+      retrieval_mode: "hybrid",
+    });
+    assert.equal(hybridUnavailable.retrieval_mode, "lexical+graph");
+    assert.equal(hybridUnavailable.retrieval.requested_mode, "hybrid");
+    assert.equal(hybridUnavailable.retrieval.semantic_fallback_used, false);
+    assert.equal(hybridUnavailable.retrieval.fallback_reason, null);
+
+    const tiny = await engine.contextPack({ ...common, task: "OrderController", retrieval_mode: "graph-only", token_budget: 64 });
+    assert.ok(estimateSerializedTokens(tiny) <= 64, JSON.stringify(tiny));
+    const tinyUnavailable = await new HybridEngine(vault).contextPack({
+      ...common,
+      task: "unknown responsibility",
+      retrieval_mode: "graph-first",
+      branch: "missing",
+      token_budget: 64,
+    });
+    assert.ok(estimateSerializedTokens(tinyUnavailable) <= 64, JSON.stringify(tinyUnavailable));
+    assert.equal(tinyUnavailable.retrieval.effective_mode, "lexical+graph");
+    assert.equal(tinyUnavailable.retrieval.fallback_reason, "semantic_unavailable");
   } finally {
     vault.close();
     rmSync(root, { recursive: true, force: true });
