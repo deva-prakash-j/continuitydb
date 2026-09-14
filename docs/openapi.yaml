@@ -88,9 +88,11 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [results]
+                required: [results, retrieval]
                 properties:
                   results: { type: array, items: { $ref: "#/components/schemas/MemoryResult" } }
+                  retrieval: { $ref: "#/components/schemas/RetrievalMetadata" }
+        "400": { description: Invalid retrieval mode, depth, graph budget, or search field }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
   /v1/context-packs:
@@ -113,8 +115,14 @@ paths:
                 as_of: { type: string, format: date-time }
                 include_stale: { type: boolean, default: false }
                 exclude_types: { type: array, maxItems: 32, items: { type: string } }
+                retrieval_mode: { type: string, enum: [hybrid, graph-only, graph-first], default: hybrid }
+                graph_depth: { type: integer, minimum: 0, maximum: 3, default: 2 }
+                strict_evidence: { type: boolean, default: false }
+                graph_max_visited: { type: integer, minimum: 25, maximum: 2000, default: 400 }
+                graph_max_paths: { type: integer, minimum: 1, maximum: 200, default: 40 }
       responses:
         "200": { description: Token-bounded cited context pack }
+        "400": { description: Invalid retrieval mode, depth, graph budget, or context field }
   /v1/memories/proposals:
     post:
       operationId: proposeMemory
@@ -342,6 +350,63 @@ components:
         as_of: { type: string, format: date-time }
         include_stale: { type: boolean, default: false }
         exclude_types: { type: array, maxItems: 32, items: { type: string } }
+        retrieval_mode:
+          type: string
+          enum: [hybrid, graph-only, graph-first]
+          default: hybrid
+          description: Hybrid preserves eager semantic retrieval; graph-only never embeds; graph-first embeds only after insufficient graph coverage.
+        graph_depth: { type: integer, minimum: 0, maximum: 3, default: 2 }
+        strict_evidence: { type: boolean, default: false }
+        graph_max_visited: { type: integer, minimum: 25, maximum: 2000, default: 400 }
+        graph_max_paths: { type: integer, minimum: 1, maximum: 200, default: 40 }
+    RetrievalMetadata:
+      type: object
+      required: [requested_mode, effective_mode, semantic_fallback_used, fallback_reason, graph_generation]
+      properties:
+        requested_mode: { type: string, enum: [hybrid, graph-only, graph-first] }
+        effective_mode: { type: string, enum: [hybrid, graph-only, graph-first, lexical+graph] }
+        semantic_fallback_used: { type: boolean }
+        fallback_reason:
+          type: [string, "null"]
+          enum: [no_seed, insufficient_candidates, low_path_confidence, conceptual_query, semantic_unavailable, null]
+        graph_generation:
+          anyOf:
+            - type: "null"
+            - $ref: "#/components/schemas/GraphGeneration"
+            - type: object
+              required: [generations, total_count, truncated]
+              properties:
+                generations: { type: array, maxItems: 20, items: { $ref: "#/components/schemas/GraphGeneration" } }
+                total_count: { type: integer, minimum: 1 }
+                truncated: { type: boolean }
+            - type: object
+              required: [total_count, truncated]
+              properties:
+                total_count: { type: integer, minimum: 1 }
+                truncated: { type: boolean }
+    GraphGeneration:
+      type: object
+      required: [id, project_id]
+      properties:
+        id: { type: string }
+        project_id: { type: string }
+        branch: { type: [string, "null"] }
+        commit: { type: string }
+    GraphPathHop:
+      type: object
+      required: [edge_id, source_id, source_label, target_id, target_label, relation, direction, provenance, weight]
+      properties:
+        edge_id: { type: string }
+        source_id: { type: string }
+        source_label: { type: string }
+        target_id: { type: string }
+        target_label: { type: string }
+        relation: { type: string }
+        direction: { type: string, enum: [incoming, outgoing] }
+        provenance: { type: string, enum: [extracted, resolved, inferred] }
+        weight: { type: number, minimum: 0, maximum: 1 }
+        source_location: { type: [string, "null"] }
+        commit: { type: string }
     MemoryInput:
       type: object
       required: [body, namespace_id]
@@ -435,3 +500,4 @@ components:
         score: { type: number }
         score_signals: { type: object, additionalProperties: { type: number } }
         citation: { type: object, additionalProperties: true }
+        graph_path: { type: array, maxItems: 3, items: { $ref: "#/components/schemas/GraphPathHop" } }

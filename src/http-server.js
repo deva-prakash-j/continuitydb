@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { ContextVault } from "./store.js";
-import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { createEmbedderFromEnv, HybridEngine, normalizeSearchRequest } from "./embeddings.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { REVIEW_UI } from "./review-ui.js";
 import { ContinuityMcpHttpEndpoint } from "./mcp-http.js";
@@ -96,21 +96,7 @@ async function readJson(request) {
 }
 
 function boundedSearch(body, identity) {
-  return {
-    query: body.query,
-    project_id: body.project_id || null,
-    dependency_depth: body.dependency_depth,
-    top_k: body.top_k,
-    token_budget: body.token_budget,
-    branch: body.branch || null,
-    as_of: body.as_of || null,
-    include_stale: Boolean(body.include_stale),
-    exclude_types: body.exclude_types || [],
-    tenant_id: identity.tenant_id,
-    owner_id: identity.owner_id,
-    allowed_projects: identity.allowed_projects,
-    allowed_sensitivities: identity.allowed_sensitivities,
-  };
+  return normalizeSearchRequest(body, identity);
 }
 
 function boundedWrite(body, identity, idempotencyKey = null) {
@@ -307,7 +293,7 @@ export function createContinuityServer({
       if (request.method === "POST" && url.pathname === "/v1/search") {
         requireScope(identity, "memory:read");
         const body = await readJson(request);
-        return json(response, 200, { results: await engine.search(boundedSearch(body, identity)) }, requestId);
+        return json(response, 200, await engine.searchDetailed(boundedSearch(body, identity)), requestId);
       }
       if (request.method === "POST" && url.pathname === "/v1/context-packs") {
         requireScope(identity, "memory:read");

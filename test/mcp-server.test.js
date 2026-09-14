@@ -164,6 +164,57 @@ test("stdio MCP read-only profile exposes only annotated retrieval tools", async
   }
 });
 
+test("MCP search accepts bounded graph options and returns additive retrieval metadata", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-graph-options-"));
+  const serverPath = fileURLToPath(new URL("../src/mcp-server.js", import.meta.url));
+  const client = new Client({ name: "continuitydb-graph-options", version: "0.8.0" });
+  try {
+    await client.connect(new StdioClientTransport({
+      command: process.execPath,
+      args: [serverPath],
+      env: {
+        ...process.env,
+        CONTINUITYDB_HOME: root,
+        CONTINUITYDB_MCP_SCOPES: "memory:read",
+        CONTINUITYDB_ALLOWED_PROJECTS: "orders",
+        CONTINUITYDB_EMBEDDING_PROVIDER: "none",
+      },
+    }));
+    const found = await client.callTool({
+      name: "memory_search",
+      arguments: {
+        query: "OrderController",
+        project_id: "orders",
+        retrieval_mode: "graph-first",
+        graph_depth: 3,
+        graph_max_visited: 25,
+        graph_max_paths: 1,
+        strict_evidence: true,
+      },
+    });
+    assert.deepEqual(found.structuredContent.results, []);
+    assert.deepEqual(Object.keys(found.structuredContent.retrieval).sort(), [
+      "effective_mode", "fallback_reason", "graph_generation", "requested_mode", "semantic_fallback_used",
+    ]);
+    assert.equal(found.structuredContent.retrieval.requested_mode, "graph-first");
+    assert.equal(found.structuredContent.retrieval.fallback_reason, "semantic_unavailable");
+
+    for (const arguments_ of [
+      { query: "x", project_id: "orders", graph_depth: 4 },
+      { query: "x", project_id: "orders", graph_max_visited: 2001 },
+      { query: "x", project_id: "orders", graph_max_paths: 201 },
+    ]) {
+      const invalid = await client.callTool({ name: "memory_search", arguments: arguments_ });
+      assert.equal(invalid.isError, true);
+    }
+    const tools = await client.listTools();
+    assert.equal(tools.tools.every((tool) => tool.annotations.readOnlyHint === true), true);
+  } finally {
+    await client.close().catch(() => {});
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("authenticated Streamable HTTP MCP transfers context and binds sessions to identity", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-streamable-mcp-test-"));
   const vault = new ContextVault(root);

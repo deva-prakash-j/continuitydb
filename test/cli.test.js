@@ -132,6 +132,66 @@ test("CLI version matches the package version", () => {
   }
 });
 
+test("CLI builds and queries repository graphs without mutating on preview", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-graph-"));
+  const repo = join(root, "orders");
+  const home = join(root, "vault");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  const git = (...args) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+  try {
+    mkdirSync(join(repo, "src", "main", "java", "com", "acme"), { recursive: true });
+    writeFileSync(join(repo, "src", "main", "java", "com", "acme", "OrderService.java"),
+      "package com.acme;\npublic class OrderService {\n  public void load() {}\n}\n");
+    writeFileSync(join(repo, "src", "main", "java", "com", "acme", "OrderController.java"),
+      "package com.acme;\npublic class OrderController {\n  private OrderService service;\n  public void list() { service.load(); }\n}\n");
+    assert.equal(git("init").status, 0);
+    assert.equal(git("config", "user.name", "Fixture").status, 0);
+    assert.equal(git("config", "user.email", "fixture@example.invalid").status, 0);
+    assert.equal(git("add", ".").status, 0);
+    assert.equal(git("commit", "-m", "initial").status, 0);
+
+    const common = [cli, "graph", "build", "--repo", repo, "--project", "orders", "--home", home];
+    const preview = spawnSync(process.execPath, common, { encoding: "utf8" });
+    assert.equal(preview.status, 0, preview.stderr);
+    assert.equal(JSON.parse(preview.stdout).applied, false);
+    assert.equal(existsSync(home), false, "graph build preview must not create or mutate the vault");
+
+    const applied = spawnSync(process.execPath, [...common, "--apply"], { encoding: "utf8" });
+    assert.equal(applied.status, 0, applied.stderr);
+    assert.equal(JSON.parse(applied.stdout).applied, true);
+
+    const commands = [
+      ["graph", "status", "--project", "orders"],
+      ["graph", "explain", "--project", "orders", "--node", "com.acme.OrderController"],
+      ["graph", "path", "--project", "orders", "--from", "com.acme.OrderController", "--to", "com.acme.OrderService"],
+      ["search", "--query", "OrderController", "--project", "orders", "--mode", "graph-first", "--depth", "2"],
+    ];
+    const values = [];
+    for (const args of commands) {
+      const result = spawnSync(process.execPath, [cli, ...args, "--home", home], {
+        encoding: "utf8",
+        env: { ...process.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" },
+      });
+      assert.equal(result.status, 0, `${args.join(" ")}: ${result.stderr}`);
+      const value = JSON.parse(result.stdout);
+      values.push(value);
+      assert.equal(JSON.stringify(value).includes(repo), false, "host repository path must not be exposed");
+    }
+    assert.equal(values[0].nodes > 0, true);
+    assert.equal(values[1].node.qualified_name, "com.acme.OrderController");
+    assert.ok(values[2] === null || values[2].qualified_name === "com.acme.OrderService");
+    const searched = spawnSync(process.execPath, [
+      cli, "search", "--query", "OrderController", "--project", "orders",
+      "--mode", "graph-first", "--depth", "2", "--home", home,
+    ], { encoding: "utf8", env: { ...process.env, CONTINUITYDB_EMBEDDING_PROVIDER: "none" } });
+    const searchValue = JSON.parse(searched.stdout);
+    assert.equal(searchValue.results.length > 0, true);
+    assert.equal(searchValue.retrieval.requested_mode, "graph-first");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("CLI setup previews and applies all project agent connections idempotently", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-setup-"));
   const project = join(root, "project");

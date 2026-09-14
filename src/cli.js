@@ -13,12 +13,14 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { ContextVault } from "./store.js";
 import { createContinuityServer } from "./http-server.js";
 import { scanRepository } from "./repo-ingest.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity } from "./security.js";
-import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { createEmbedderFromEnv, HybridEngine, normalizeSearchRequest } from "./embeddings.js";
+import { buildRepositoryGraph } from "./graph/repository-graph.js";
 import {
   acquireLocalModelCacheLock,
   BUILTIN_LOCAL_MODEL,
@@ -110,8 +112,12 @@ Usage:
   continuitydb capture --body TEXT --project ID [--kind working|inference|git-fact|decision]
   continuitydb commit MEMORY_ID
   continuitydb correct MEMORY_ID [--body TEXT | --handoff-file HANDOFF.json] [--reason TEXT]
-  continuitydb search QUERY [--project ID] [--allow-projects A,B] [--top-k N]
+  continuitydb search QUERY|--query QUERY [--project ID] [--allow-projects A,B] [--top-k N] [--mode MODE] [--depth 0..3]
   continuitydb context TASK [--project ID] [--allow-projects A,B] [--token-budget N]
+  continuitydb graph build --repo PATH --project ID [--apply]
+  continuitydb graph status --project ID [--branch REF]
+  continuitydb graph explain --project ID --node QUALIFIED_NAME [--branch REF]
+  continuitydb graph path --project ID --from QUALIFIED_NAME --to QUALIFIED_NAME [--branch REF]
   continuitydb handoff-save --file HANDOFF.json
   continuitydb handoff-latest TASK_ID --project ID [--branch REF]
   continuitydb link-project SOURCE TARGET --provenance TEXT [--relation depends-on]
@@ -760,6 +766,24 @@ try {
     };
     process.on("SIGINT", shutdown);
     process.on("SIGTERM", shutdown);
+  } else if (command === "graph" && positional[0] === "build" && !flags.apply) {
+    if (!flags.repo) throw new Error("graph build requires --repo PATH");
+    if (!flags.project) throw new Error("graph build requires --project ID");
+    const previewRoot = mkdtempSync(join(tmpdir(), "continuitydb-graph-preview-"));
+    const previewVault = new ContextVault(previewRoot);
+    try {
+      output({
+        ...buildRepositoryGraph(previewVault, resolve(flags.repo), {
+          projectId: flags.project,
+          tenantId: cliTenantId,
+        }),
+        preview: true,
+        applied: false,
+      });
+    } finally {
+      previewVault.close();
+      rmSync(previewRoot, { recursive: true, force: true });
+    }
   } else {
     const vault = new ContextVault(home);
     const embedder = createEmbedderFromEnv({
@@ -769,7 +793,43 @@ try {
     });
     const engine = new HybridEngine(vault, embedder);
     try {
-      if (command === "propose") {
+      if (command === "graph") {
+        const action = positional.shift();
+        if (!flags.project) throw new Error(`graph ${action || "command"} requires --project ID`);
+        const scope = {
+          tenant_id: cliTenantId,
+          owner_id: cliOwnerId,
+          project_id: flags.project,
+          ...(flags.branch ? { branch: flags.branch } : {}),
+          allowed_projects: [flags.project],
+          allowed_sensitivities: listFlag(flags.sensitivities || "public,private"),
+          graph_depth: numberFlag(flags.depth, 2),
+          graph_max_visited: numberFlag(flags.graph_max_visited ?? flags.max_visited, 400),
+          graph_max_paths: numberFlag(flags.graph_max_paths ?? flags.max_paths, 40),
+          strict_evidence: Boolean(flags.strict_evidence),
+        };
+        // Reuse the external request validator for graph traversal budgets.
+        normalizeSearchRequest({ query: flags.node || flags.from || flags.project, ...scope });
+        if (action === "build") {
+          if (!flags.repo) throw new Error("graph build requires --repo PATH");
+          output({
+            ...buildRepositoryGraph(vault, resolve(flags.repo), {
+              projectId: flags.project,
+              tenantId: cliTenantId,
+            }),
+            preview: false,
+            applied: true,
+          });
+        } else if (action === "status") {
+          output(vault.graphStatus(scope));
+        } else if (action === "explain") {
+          if (!flags.node) throw new Error("graph explain requires --node QUALIFIED_NAME");
+          output(vault.explainGraphNode({ ...scope, node: flags.node }));
+        } else if (action === "path") {
+          if (!flags.from || !flags.to) throw new Error("graph path requires --from and --to");
+          output(vault.findGraphPath({ ...scope, from: flags.from, to: flags.to }));
+        } else throw new Error(`unknown graph action: ${action}`);
+      } else if (command === "propose") {
         output(vault.propose({
           body: flags.body,
           title: flags.title,
@@ -849,20 +909,28 @@ try {
         }).filter(([, value]) => value !== undefined));
         output(vault.correct(positional[0], replacement, flags.reason || "cli-correction"));
       } else if (command === "search") {
-        output({ results: await engine.search({
-          query: positional.join(" "),
+        const allowed_projects = listFlag(flags.allow_projects || flags.project);
+        const request = normalizeSearchRequest({
+          query: flags.query === true ? "" : (flags.query || positional.join(" ")),
           project_id: flags.project || null,
-          allowed_projects: listFlag(flags.allow_projects || flags.project),
-          allowed_sensitivities: listFlag(flags.sensitivities || "public,private"),
-          dependency_depth: numberFlag(flags.depth, 2),
+          dependency_depth: numberFlag(flags.dependency_depth ?? flags.depth, 2),
           top_k: numberFlag(flags.top_k, 8),
           token_budget: numberFlag(flags.token_budget, 1200),
           branch: flags.branch || null,
           as_of: flags.as_of || null,
           include_stale: Boolean(flags.include_stale),
+          retrieval_mode: flags.mode || flags.retrieval_mode || "hybrid",
+          graph_depth: numberFlag(flags.depth, 2),
+          strict_evidence: Boolean(flags.strict_evidence),
+          graph_max_visited: numberFlag(flags.graph_max_visited ?? flags.max_visited, 400),
+          graph_max_paths: numberFlag(flags.graph_max_paths ?? flags.max_paths, 40),
+        }, {
           tenant_id: cliTenantId,
           owner_id: cliOwnerId,
-        }) });
+          allowed_projects,
+          allowed_sensitivities: listFlag(flags.sensitivities || "public,private"),
+        });
+        output(await engine.searchDetailed(request));
       } else if (command === "context") {
         output(await engine.contextPack({
           task: positional.join(" "),

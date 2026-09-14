@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { ContextVault } from "./store.js";
-import { createEmbedderFromEnv, HybridEngine } from "./embeddings.js";
+import { createEmbedderFromEnv, HybridEngine, normalizeSearchRequest } from "./embeddings.js";
 import { VERSION } from "./version.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { normalizeIdentity, TokenBucketLimiter } from "./security.js";
@@ -49,8 +49,6 @@ export function createContinuityMcpServer(options = {}) {
   const vault = options.vault === undefined ? (apiClient ? null : new ContextVault()) : options.vault;
   const engine = options.engine || (apiClient ? null : new HybridEngine(vault, createEmbedderFromEnv(options.env || process.env)));
   const identity = options.identity || identityFromEnv(options.env || process.env);
-  const allowedProjects = identity.allowed_projects;
-  const allowedSensitivities = identity.allowed_sensitivities;
   const capturePolicy = options.capturePolicy || (apiClient ? null : new CapturePolicy(loadCapturePolicy(
     (options.env || process.env).CONTINUITYDB_CAPTURE_POLICY_FILE || null,
   )));
@@ -90,17 +88,19 @@ if (canRead) server.registerTool(
       branch: z.string().optional(),
       as_of: z.string().datetime().optional(),
       include_stale: z.boolean().default(false),
+      retrieval_mode: z.enum(["hybrid", "graph-only", "graph-first"]).default("hybrid"),
+      graph_depth: z.number().int().min(0).max(3).default(2),
+      strict_evidence: z.boolean().default(false),
+      graph_max_visited: z.number().int().min(25).max(2_000).default(400),
+      graph_max_paths: z.number().int().min(1).max(200).default(40),
     },
   },
-  async (input) => response(apiClient
-    ? await apiClient.search(input)
-    : await engine.search({
-      ...input,
-      tenant_id: identity.tenant_id,
-      owner_id: identity.owner_id,
-      allowed_projects: allowedProjects,
-      allowed_sensitivities: allowedSensitivities,
-    })),
+  async (input) => {
+    const request = normalizeSearchRequest(input, apiClient ? null : identity);
+    return response(apiClient
+      ? await apiClient.request("v1/search", { method: "POST", body: request })
+      : await engine.searchDetailed(request));
+  },
 );
 
 if (canRead) server.registerTool(
@@ -118,17 +118,18 @@ if (canRead) server.registerTool(
       branch: z.string().optional(),
       as_of: z.string().datetime().optional(),
       include_stale: z.boolean().default(false),
+      retrieval_mode: z.enum(["hybrid", "graph-only", "graph-first"]).default("hybrid"),
+      graph_depth: z.number().int().min(0).max(3).default(2),
+      strict_evidence: z.boolean().default(false),
+      graph_max_visited: z.number().int().min(25).max(2_000).default(400),
+      graph_max_paths: z.number().int().min(1).max(200).default(40),
     },
   },
-  async (input) => response(apiClient
-    ? await apiClient.contextPack(input)
-    : await engine.contextPack({
-      ...input,
-      tenant_id: identity.tenant_id,
-      owner_id: identity.owner_id,
-      allowed_projects: allowedProjects,
-      allowed_sensitivities: allowedSensitivities,
-    })),
+  async (input) => {
+    const normalized = normalizeSearchRequest({ ...input, query: input.task }, apiClient ? null : identity);
+    const request = { ...normalized, task: input.task };
+    return response(apiClient ? await apiClient.contextPack(request) : await engine.contextPack(request));
+  },
 );
 
 if (canCapture) server.registerTool(

@@ -11,6 +11,86 @@ function validateVector(vector) {
   return normalized;
 }
 
+const RETRIEVAL_MODES = new Set(["hybrid", "graph-only", "graph-first"]);
+
+function boundedInteger(value, fallback, minimum, maximum, name) {
+  const normalized = value === undefined || value === null ? fallback : value;
+  if (!Number.isInteger(normalized) || normalized < minimum || normalized > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return normalized;
+}
+
+function retrievalSettings(input = {}) {
+  const retrieval_mode = input.retrieval_mode ?? "hybrid";
+  if (!RETRIEVAL_MODES.has(retrieval_mode)) {
+    throw new Error("retrieval_mode must be hybrid, graph-only, or graph-first");
+  }
+  if (input.strict_evidence !== undefined && typeof input.strict_evidence !== "boolean") {
+    throw new Error("strict_evidence must be a boolean");
+  }
+  return {
+    retrieval_mode,
+    graph_depth: boundedInteger(input.graph_depth, 2, 0, 3, "graph_depth"),
+    graph_max_visited: boundedInteger(input.graph_max_visited, 400, 25, 2_000, "graph_max_visited"),
+    graph_max_paths: boundedInteger(input.graph_max_paths, 40, 1, 200, "graph_max_paths"),
+    strict_evidence: input.strict_evidence ?? false,
+  };
+}
+
+/**
+ * Normalizes the common untrusted search surface used by MCP and HTTP. Caller
+ * identity is appended after request fields so tenant and ACL scope cannot be
+ * supplied or widened by a client.
+ */
+export function normalizeSearchRequest(input = {}, identity = null) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("search request must be an object");
+  if (typeof input.query !== "string" || input.query.trim() === "") throw new Error("query must be a non-empty string");
+  if (input.project_id !== undefined && input.project_id !== null
+    && (typeof input.project_id !== "string" || input.project_id.trim() === "")) {
+    throw new Error("project_id must be a non-empty string");
+  }
+  const project_id = input.project_id?.trim() || null;
+  if (identity && project_id && !identity.allowed_projects.includes(project_id)) {
+    throw Object.assign(new Error(`project ${project_id} is not allowed for this caller`), { code: "FORBIDDEN" });
+  }
+  if (input.branch !== undefined && input.branch !== null && typeof input.branch !== "string") {
+    throw new Error("branch must be a string");
+  }
+  if (input.as_of !== undefined && input.as_of !== null
+    && (typeof input.as_of !== "string" || !Number.isFinite(Date.parse(input.as_of)))) {
+    throw new Error("as_of must be a valid date-time string");
+  }
+  if (input.include_stale !== undefined && typeof input.include_stale !== "boolean") {
+    throw new Error("include_stale must be a boolean");
+  }
+  if (input.exclude_types !== undefined
+    && (!Array.isArray(input.exclude_types) || input.exclude_types.length > 32
+      || input.exclude_types.some((value) => typeof value !== "string"))) {
+    throw new Error("exclude_types must be an array of at most 32 strings");
+  }
+  const normalized = {
+    query: input.query.trim(),
+    project_id,
+    dependency_depth: boundedInteger(input.dependency_depth, 2, 0, 5, "dependency_depth"),
+    top_k: boundedInteger(input.top_k, 8, 1, 50, "top_k"),
+    token_budget: boundedInteger(input.token_budget, 1200, 64, 32_000, "token_budget"),
+    branch: input.branch || null,
+    as_of: input.as_of || null,
+    include_stale: input.include_stale ?? false,
+    exclude_types: input.exclude_types || [],
+    ...retrievalSettings(input),
+  };
+  if (!identity) return normalized;
+  return {
+    ...normalized,
+    tenant_id: identity.tenant_id,
+    owner_id: identity.owner_id,
+    allowed_projects: identity.allowed_projects,
+    allowed_sensitivities: identity.allowed_sensitivities,
+  };
+}
+
 function endpointUrl(value, allowRemote) {
   const url = new URL(value);
   if (url.username || url.password || url.search || url.hash) throw new Error("embedding endpoint must not contain credentials, query, or fragment");
@@ -118,18 +198,70 @@ export class HybridEngine {
     this.embedder = embedder;
   }
 
-  async search(input) {
-    if (!this.embedder) return this.vault.search(input);
+  async semanticCandidates(input) {
     const queryVector = this.embedder.embedQuery
       ? await this.embedder.embedQuery(input.query)
       : (await this.embedder.embed(input.query))[0];
-    const semanticCandidates = this.vault.semanticCandidates({
+    return this.vault.semanticCandidates({
       ...input,
       query_embedding: queryVector,
       model_id: this.embedder.id,
       limit: Math.max(24, Math.min(200, Number(input.top_k || 8) * 8)),
     });
-    return this.vault.search({ ...input, semantic_candidates: semanticCandidates });
+  }
+
+  async searchDetailed(input = {}) {
+    const settings = retrievalSettings(input);
+    const request = { ...input, ...settings };
+    if (settings.retrieval_mode === "graph-only") {
+      return this.vault.searchDetailed({ ...request, semantic_candidates: [] });
+    }
+
+    if (settings.retrieval_mode === "hybrid") {
+      const semanticCandidates = this.embedder ? await this.semanticCandidates(request) : [];
+      const detailed = this.vault.searchDetailed({ ...request, semantic_candidates: semanticCandidates });
+      return {
+        ...detailed,
+        retrieval: {
+          ...detailed.retrieval,
+          requested_mode: "hybrid",
+          effective_mode: this.embedder ? "hybrid" : "lexical+graph",
+          semantic_fallback_used: false,
+          fallback_reason: null,
+        },
+      };
+    }
+
+    const graphFirst = this.vault.searchDetailed({ ...request, semantic_candidates: [] });
+    const coverageReason = graphFirst.retrieval.fallback_reason;
+    if (!coverageReason) return graphFirst;
+    if (!this.embedder) {
+      return {
+        ...graphFirst,
+        retrieval: {
+          ...graphFirst.retrieval,
+          effective_mode: "lexical+graph",
+          semantic_fallback_used: false,
+          fallback_reason: "semantic_unavailable",
+        },
+      };
+    }
+    const semanticCandidates = await this.semanticCandidates(request);
+    const detailed = this.vault.searchDetailed({ ...request, semantic_candidates: semanticCandidates });
+    return {
+      ...detailed,
+      retrieval: {
+        ...detailed.retrieval,
+        requested_mode: "graph-first",
+        effective_mode: "hybrid",
+        semantic_fallback_used: true,
+        fallback_reason: coverageReason,
+      },
+    };
+  }
+
+  async search(input) {
+    return (await this.searchDetailed(input)).results;
   }
 
   async contextPack(input) {

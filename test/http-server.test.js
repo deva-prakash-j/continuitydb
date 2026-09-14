@@ -162,6 +162,63 @@ test("HTTP API binds identity server-side and supports approved lifecycle", asyn
   }
 });
 
+test("HTTP search validates graph bounds, binds authorization, and returns retrieval metadata", async () => {
+  const f = fixture();
+  let detailedCalls = 0;
+  const originalSearchDetailed = f.vault.searchDetailed.bind(f.vault);
+  f.vault.searchDetailed = (input) => {
+    detailedCalls += 1;
+    return originalSearchDetailed(input);
+  };
+  try {
+    const address = await f.service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    const search = await fetch(`${base}/v1/search`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        query: "OrderController",
+        project_id: "api",
+        retrieval_mode: "graph-first",
+        graph_depth: 3,
+        graph_max_visited: 25,
+        graph_max_paths: 1,
+        strict_evidence: true,
+      }),
+    });
+    assert.equal(search.status, 200);
+    const value = await search.json();
+    assert.deepEqual(value.results, []);
+    assert.equal(value.retrieval.requested_mode, "graph-first");
+    assert.equal(value.retrieval.fallback_reason, "semantic_unavailable");
+    assert.equal(detailedCalls, 1);
+
+    for (const input of [
+      { query: "x", project_id: "api", graph_depth: 4 },
+      { query: "x", project_id: "api", graph_max_visited: 2001 },
+      { query: "x", project_id: "api", graph_max_paths: 201 },
+    ]) {
+      const invalid = await fetch(`${base}/v1/search`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      });
+      assert.equal(invalid.status, 400);
+    }
+    const callsBeforeDenied = detailedCalls;
+    const denied = await fetch(`${base}/v1/search`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ query: "PayrollController", project_id: "payroll", retrieval_mode: "graph-only" }),
+    });
+    assert.equal(denied.status, 403);
+    assert.equal(detailedCalls, callsBeforeDenied, "authorization must run before graph traversal");
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("review inbox exposes held memories and can explicitly approve quarantined captures", async () => {
   const f = fixture();
   try {

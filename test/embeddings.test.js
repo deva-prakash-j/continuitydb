@@ -6,6 +6,164 @@ import test from "node:test";
 import { HybridEngine } from "../src/embeddings.js";
 import { ContextVault } from "../src/store.js";
 
+function publishOrderGraph(vault) {
+  const controller = {
+    repo_path: "src/main/java/com/acme/OrderController.java",
+    kind: "class",
+    qualified_name: "com.acme.OrderController",
+    label: "OrderController",
+    language: "java",
+  };
+  return vault.publishGraph({
+    project_id: "orders",
+    branch: "main",
+    commit: "abc123",
+    extractor_version: "test-v1",
+    source_states: [{ repo_path: controller.repo_path, git_object_id: "controller-v1" }],
+    nodes: [controller],
+    edges: [],
+  });
+}
+
+function countingEmbedder(vector = [1, 0, 0, 0, 0, 0, 0, 0]) {
+  return {
+    id: "fixture:counting",
+    queryCalls: 0,
+    async embedQuery() {
+      this.queryCalls += 1;
+      return vector;
+    },
+    async embedDocuments(texts) { return texts.map(() => vector); },
+  };
+}
+
+test("graph-first embeds at most once and only when graph coverage requests fallback", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-graph-first-test-"));
+  const vault = new ContextVault(root);
+  const embedder = countingEmbedder();
+  try {
+    publishOrderGraph(vault);
+    const semantic = vault.propose({
+      project_id: "orders",
+      namespace_id: "project/orders",
+      title: "Checkout consistency",
+      body: "Use an outbox when coordinating state across service boundaries.",
+    });
+    vault.commit(semantic.record.id);
+    const engine = new HybridEngine(vault, embedder);
+    await engine.indexMemory(semantic.record.id);
+
+    const exact = await engine.searchDetailed({
+      query: "OrderController",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "main",
+      retrieval_mode: "graph-first",
+    });
+    assert.equal(embedder.queryCalls, 0);
+    assert.equal(exact.retrieval.semantic_fallback_used, false);
+    assert.equal(exact.retrieval.fallback_reason, null);
+
+    const conceptual = await engine.searchDetailed({
+      query: "how should distributed checkout writes stay consistent",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "main",
+      retrieval_mode: "graph-first",
+    });
+    assert.equal(embedder.queryCalls, 1);
+    assert.equal(conceptual.retrieval.semantic_fallback_used, true);
+    assert.ok(["no_seed", "insufficient_candidates", "low_path_confidence", "conceptual_query"]
+      .includes(conceptual.retrieval.fallback_reason));
+    assert.equal(conceptual.results.some((item) => item.id === semantic.record.id), true);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("graph-only never embeds, while legacy hybrid eagerly includes semantic candidates", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-retrieval-modes-test-"));
+  const vault = new ContextVault(root);
+  const embedder = countingEmbedder();
+  try {
+    const semantic = vault.propose({
+      project_id: "orders",
+      namespace_id: "project/orders",
+      title: "Reliable publication",
+      body: "Use a transactional outbox for cross-system publication.",
+    });
+    vault.commit(semantic.record.id);
+    const engine = new HybridEngine(vault, embedder);
+    await engine.indexMemory(semantic.record.id);
+
+    const graphOnly = await engine.searchDetailed({
+      query: "avoid inconsistent dual writes",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      retrieval_mode: "graph-only",
+    });
+    assert.equal(embedder.queryCalls, 0);
+    assert.equal(graphOnly.retrieval.semantic_fallback_used, false);
+
+    const hybrid = await engine.searchDetailed({
+      query: "avoid inconsistent dual writes",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      retrieval_mode: "hybrid",
+    });
+    assert.equal(embedder.queryCalls, 1);
+    assert.equal(hybrid.results[0].id, semantic.record.id);
+    assert.equal(hybrid.retrieval.semantic_fallback_used, false);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("unauthorized or stale graphs cannot suppress fallback and unavailable semantics are truthful", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-fallback-scope-test-"));
+  const vault = new ContextVault(root);
+  const embedder = countingEmbedder();
+  try {
+    publishOrderGraph(vault);
+    const engine = new HybridEngine(vault, embedder);
+    const stale = await engine.searchDetailed({
+      query: "OrderController",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "feature/missing",
+      retrieval_mode: "graph-first",
+    });
+    assert.equal(embedder.queryCalls, 1);
+    assert.equal(stale.retrieval.semantic_fallback_used, true);
+    assert.equal(stale.retrieval.fallback_reason, "no_seed");
+
+    const unavailable = await new HybridEngine(vault).searchDetailed({
+      query: "where is an unknown conceptual responsibility implemented",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      branch: "feature/missing",
+      retrieval_mode: "graph-first",
+    });
+    assert.equal(unavailable.retrieval.semantic_fallback_used, false);
+    assert.equal(unavailable.retrieval.fallback_reason, "semantic_unavailable");
+
+    const legacyWithoutEmbedder = await new HybridEngine(vault).searchDetailed({
+      query: "unknown legacy query",
+      project_id: "orders",
+      allowed_projects: ["orders"],
+      retrieval_mode: "hybrid",
+    });
+    assert.equal(legacyWithoutEmbedder.retrieval.effective_mode, "lexical+graph");
+    assert.equal(legacyWithoutEmbedder.retrieval.semantic_fallback_used, false);
+    assert.equal(legacyWithoutEmbedder.retrieval.fallback_reason, null);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("hybrid engine returns ACL-filtered semantic candidates when lexical search has no hit", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-embedding-test-"));
   const vault = new ContextVault(root);
