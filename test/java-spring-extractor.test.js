@@ -50,8 +50,24 @@ test("extracts deterministic Java and Spring graph facts", () => {
     "imports:src/main/java/com/acme/OrderController.java->org.springframework.web.bind.annotation.RestController",
     "reads-config:com.acme.OrderController->orders.page-size",
   ]);
-  assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme" && node.kind === "package"));
-  assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme.OrderController.list"));
+  assert.deepEqual([...new Set(result.nodes.map((node) => node.qualified_name))], [
+    "com.acme",
+    "com.acme.OrderController",
+    "com.acme.OrderController.list",
+    "com.acme.OrderController.OrderController",
+    "com.acme.OrderController.overloaded/1",
+    "com.acme.OrderController.overloaded/1-2",
+    "com.acme.OrderController.service",
+    "com.acme.OrderPort",
+    "com.acme.OrderService",
+    "com.acme.OrderService.findAll",
+    "GET /orders",
+    "orders.page-size",
+    "org.springframework.beans.factory.annotation.Value",
+    "org.springframework.web.bind.annotation.GetMapping",
+    "org.springframework.web.bind.annotation.RestController",
+    "src/main/java/com/acme/OrderController.java",
+  ]);
   assert.ok(!result.nodes.some((node) => node.qualified_name.includes("Pretend") || node.qualified_name.includes("nope")));
   assert.ok(result.nodes.some((node) => node.qualified_name === "com.acme.OrderController.overloaded/1"));
   assert.deepEqual(result, extractJavaSpring(input));
@@ -81,4 +97,14 @@ class A {
   const interfaceExtends = result.edges.find((edge) => edge.relation === "extends" && nodeById.get(edge.source_id).qualified_name === "com.acme.ChildPort");
   assert.equal(nodeById.get(classExtends.target_id).kind, "class");
   assert.equal(nodeById.get(interfaceExtends.target_id).kind, "interface");
+});
+
+test("skips literal @Value content rather than storing it as a configuration key", () => {
+  const result = extractJavaSpring({
+    ...input,
+    text: `package com.acme;
+class A { @Value("do-not-leak") String value; }`,
+  });
+  assert.ok(!JSON.stringify(result).includes("do-not-leak"));
+  assert.ok(!result.edges.some((edge) => edge.relation === "reads-config"));
 });

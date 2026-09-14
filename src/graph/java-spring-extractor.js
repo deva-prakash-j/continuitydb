@@ -271,7 +271,7 @@ export function mapJavaStructureToGraph(input, syntax) {
     for (const annotation of syntax.annotations.filter((item) => item.start > type.open && item.end < type.close)) {
       if (annotation.simpleName !== "Value") continue;
       const value = annotation.args.find((token) => token.type === "string")?.value || "";
-      const key = value.match(/\$?\{?([A-Za-z0-9_.-]+)\}?/)?.[1];
+      const key = value.match(/^\$\{([A-Za-z0-9_.-]+)\}$/)?.[1];
       if (key && !SECRET_CONFIGURATION_KEY.test(key)) {
         addEdge(source, addNode("configuration-key", key, annotation.token), "reads-config", annotation.token);
       }
