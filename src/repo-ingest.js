@@ -81,7 +81,7 @@ function extractManifestFacts(path, text) {
   return [...new Set(facts)].slice(0, 1000);
 }
 
-export function scanRepository(inputPath, {
+export function readCommittedSnapshot(inputPath, {
   projectId,
   since = null,
   maxFiles = 20_000,
@@ -113,7 +113,7 @@ export function scanRepository(inputPath, {
     return { mode: match[1], objectType: match[2], objectId: match[3], repoPath: match[4] };
   }).filter((entry) => !changed || changed.has(entry.repoPath));
   const tracked = tree.slice(0, maxFiles);
-  const records = [];
+  const files = [];
   const skipped = { denied: 0, symlink: 0, too_large: 0, unsupported: 0, unreadable: 0 };
 
   for (const entry of tracked) {
@@ -133,43 +133,68 @@ export function scanRepository(inputPath, {
         encoding: "buffer",
         maxBuffer: Math.max(objectSize + 1, 64 * 1024),
       });
-      const text = contents.toString("utf8");
-      if (text.includes("\u0000")) { skipped.unsupported += 1; continue; }
+      if (contents.includes(0)) { skipped.unsupported += 1; continue; }
       const checksum = createHash("sha256").update(contents).digest("hex");
-      const symbols = CODE_EXTENSIONS.has(extension) ? extractSymbols(text) : [];
-      const dependencies = extractManifestFacts(repoPath, text);
-      if (symbols.length || dependencies.length || DOC_EXTENSIONS.has(extension)) {
-        const summary = [
-          symbols.length ? `Symbols: ${symbols.map((item) => `${item.name}:${item.line}`).join(", ")}` : null,
-          dependencies.length ? `Dependencies: ${dependencies.join(", ")}` : null,
-          DOC_EXTENSIONS.has(extension) ? text.slice(0, 24_000) : null,
-        ].filter(Boolean).join("\n");
-        records.push({
-          project_id: inferredProject,
-          namespace_id: `project/${inferredProject}`,
-          type: symbols.length ? "code-index" : dependencies.length ? "dependency-manifest" : "documentation",
-          title: `${repoPath} at ${commit.slice(0, 12)}`,
-          body: summary,
-          source_type: "git",
-          source_uri: remote ? `${remote}#${commit}:${repoPath}` : `git://${inferredProject}/${repoPath}`,
-          repo_path: repoPath,
-          git_commit: commit,
-          branch,
-          tags: ["git-grounded", symbols.length ? "code" : dependencies.length ? "dependency" : "docs"],
-          metadata: { checksum, symbols, dependencies, provenance_mode: "committed-blob", git_object: entry.objectId },
-          idempotency_key: `git:${inferredProject}:${commit}:${repoPath}:${checksum}`,
-        });
-      }
+      files.push({ repo_path: repoPath, git_object_id: entry.objectId, checksum, bytes: contents });
     } catch {
       skipped.unreadable += 1;
     }
   }
-  return {
+  const snapshot = {
     repository: { project_id: inferredProject, root, remote, commit, branch },
-    scanned_files: tracked.length,
-    produced_records: records.length,
     truncated: tree.length > tracked.length,
     skipped,
+    files,
+  };
+  Object.defineProperty(snapshot, "scanned_files", { value: tracked.length, enumerable: false });
+  return snapshot;
+}
+
+// The record-facing API intentionally derives text only while producing memory
+// records; raw committed bytes remain confined to the snapshot and graph paths.
+export function scanRepository(inputPath, options = {}) {
+  const snapshot = readCommittedSnapshot(inputPath, options);
+  const { repository, files } = snapshot;
+  const records = [];
+  for (const file of files) {
+    const text = file.bytes.toString("utf8");
+    const extension = extname(file.repo_path);
+    const symbols = CODE_EXTENSIONS.has(extension) ? extractSymbols(text) : [];
+    const dependencies = extractManifestFacts(file.repo_path, text);
+    if (!symbols.length && !dependencies.length && !DOC_EXTENSIONS.has(extension)) continue;
+    const summary = [
+      symbols.length ? `Symbols: ${symbols.map((item) => `${item.name}:${item.line}`).join(", ")}` : null,
+      dependencies.length ? `Dependencies: ${dependencies.join(", ")}` : null,
+      DOC_EXTENSIONS.has(extension) ? text.slice(0, 24_000) : null,
+    ].filter(Boolean).join("\n");
+    records.push({
+      project_id: repository.project_id,
+      namespace_id: `project/${repository.project_id}`,
+      type: symbols.length ? "code-index" : dependencies.length ? "dependency-manifest" : "documentation",
+      title: `${file.repo_path} at ${repository.commit.slice(0, 12)}`,
+      body: summary,
+      source_type: "git",
+      source_uri: repository.remote ? `${repository.remote}#${repository.commit}:${file.repo_path}` : `git://${repository.project_id}/${file.repo_path}`,
+      repo_path: file.repo_path,
+      git_commit: repository.commit,
+      branch: repository.branch,
+      tags: ["git-grounded", symbols.length ? "code" : dependencies.length ? "dependency" : "docs"],
+      metadata: {
+        checksum: file.checksum,
+        symbols,
+        dependencies,
+        provenance_mode: "committed-blob",
+        git_object: file.git_object_id,
+      },
+      idempotency_key: `git:${repository.project_id}:${repository.commit}:${file.repo_path}:${file.checksum}`,
+    });
+  }
+  return {
+    repository,
+    scanned_files: snapshot.scanned_files,
+    produced_records: records.length,
+    truncated: snapshot.truncated,
+    skipped: snapshot.skipped,
     records,
   };
 }
