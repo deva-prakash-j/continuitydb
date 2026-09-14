@@ -104,6 +104,62 @@ function fixture() {
   };
 }
 
+function graphFixture({ commit, danglingEdge = false } = {}) {
+  const source = {
+    repo_path: "src/main/java/com/acme/Api.java",
+    kind: "class",
+    qualified_name: "com.acme.Api",
+    language: "java",
+  };
+  const target = {
+    repo_path: "src/main/java/com/acme/Service.java",
+    kind: "class",
+    qualified_name: "com.acme.Service",
+    language: "java",
+  };
+  return {
+    project_id: "api",
+    branch: "main",
+    commit,
+    extractor_version: "graph-v1",
+    source_states: [
+      { repo_path: source.repo_path, git_object_id: `${commit}-api`, extractor_version: "graph-v1" },
+      { repo_path: target.repo_path, git_object_id: `${commit}-service`, extractor_version: "graph-v1" },
+    ],
+    nodes: [source, target],
+    edges: [{
+      source,
+      target: danglingEdge ? { ...target, qualified_name: "com.acme.Missing" } : target,
+      relation: "calls",
+      repo_path: source.repo_path,
+      start_line: 18,
+      provenance: "resolved",
+    }],
+  };
+}
+
+test("publishing a graph atomically supersedes the previous generation", () => {
+  const f = fixture();
+  try {
+    const first = f.vault.publishGraph(graphFixture({ commit: "a" }));
+    const second = f.vault.publishGraph(graphFixture({ commit: "b" }));
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, second.id);
+    assert.equal(f.vault.graphStatus({ project_id: "api" }).generations.superseded, 1);
+    assert.notEqual(first.id, second.id);
+    assert.equal(f.vault.graphStatus({ project_id: "api" }).nodes, 2);
+    assert.equal(f.vault.verifyAuditLog().valid, true);
+  } finally { f.cleanup(); }
+});
+
+test("an invalid projection leaves the active generation unchanged", () => {
+  const f = fixture();
+  try {
+    const active = f.vault.publishGraph(graphFixture({ commit: "a" }));
+    assert.throws(() => f.vault.publishGraph(graphFixture({ commit: "b", danglingEdge: true })), /unknown target node/);
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, active.id);
+  } finally { f.cleanup(); }
+});
+
 test("concurrent processes can initialize the same empty vault", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-first-open-test-"));
   try {

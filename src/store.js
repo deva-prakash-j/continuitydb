@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 import { acquireVaultInitializationLock } from "./file-lock.js";
+import { normalizeGraphProjection } from "./graph/model.js";
 import {
   freshnessScore,
   maxMarginalRelevance,
@@ -51,6 +52,27 @@ function clamp(value, min, max) {
 
 function hashText(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function normalizeGraphScope(scope = {}) {
+  if (!scope || typeof scope !== "object" || Array.isArray(scope)) throw new Error("graph scope must be an object");
+  const branchProvided = scope.branch !== undefined;
+  let branch = null;
+  if (branchProvided) {
+    if (scope.branch !== null && scope.branch !== "") branch = requiredIdentifier(scope.branch, "branch");
+    else branch = "";
+  }
+  return {
+    tenant_id: requiredIdentifier(scope.tenant_id || LOCAL_TENANT, "tenant_id"),
+    project_id: requiredIdentifier(scope.project_id, "project_id"),
+    branch,
+    branchProvided,
+  };
+}
+
+function graphGenerationFromRow(row) {
+  if (!row) return null;
+  return { ...row, branch: row.branch || null };
 }
 
 function inspectLegacyAudit(contents) {
@@ -648,6 +670,103 @@ export class ContextVault {
         reason TEXT,
         migrated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS graph_generations (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        branch TEXT NOT NULL DEFAULT '',
+        "commit" TEXT NOT NULL,
+        extractor_version TEXT NOT NULL,
+        projection_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('staging', 'active', 'superseded')),
+        created_at TEXT NOT NULL,
+        activated_at TEXT,
+        superseded_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_generations_scope_status
+        ON graph_generations(tenant_id, project_id, branch, status, activated_at DESC);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_graph_generations_one_active
+        ON graph_generations(tenant_id, project_id, branch) WHERE status = 'active';
+
+      CREATE TABLE IF NOT EXISTS graph_source_states (
+        tenant_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        git_object_id TEXT NOT NULL,
+        content_hash TEXT,
+        extractor_version TEXT NOT NULL,
+        PRIMARY KEY(tenant_id, generation_id, repo_path),
+        FOREIGN KEY(generation_id) REFERENCES graph_generations(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS graph_nodes (
+        tenant_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        repo_path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        qualified_name TEXT NOT NULL,
+        label TEXT NOT NULL,
+        branch TEXT,
+        "commit" TEXT NOT NULL,
+        content_hash TEXT,
+        language TEXT,
+        start_line INTEGER,
+        start_column INTEGER,
+        end_line INTEGER,
+        end_column INTEGER,
+        extractor_version TEXT NOT NULL,
+        provenance TEXT NOT NULL,
+        valid_from TEXT,
+        valid_to TEXT,
+        stale INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(tenant_id, generation_id, id),
+        FOREIGN KEY(generation_id) REFERENCES graph_generations(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_nodes_qualified_name
+        ON graph_nodes(tenant_id, generation_id, qualified_name);
+      CREATE INDEX IF NOT EXISTS idx_graph_nodes_repo_path
+        ON graph_nodes(tenant_id, generation_id, repo_path);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS graph_node_fts USING fts5(
+        tenant_id UNINDEXED,
+        generation_id UNINDEXED,
+        node_id UNINDEXED,
+        label,
+        qualified_name,
+        repo_path,
+        tokenize = 'unicode61'
+      );
+
+      CREATE TABLE IF NOT EXISTS graph_edges (
+        tenant_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        id TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        relation TEXT NOT NULL,
+        source_location TEXT NOT NULL,
+        repo_path TEXT,
+        start_line INTEGER,
+        start_column INTEGER,
+        end_line INTEGER,
+        end_column INTEGER,
+        weight REAL NOT NULL,
+        provenance TEXT NOT NULL,
+        "commit" TEXT NOT NULL,
+        extractor_version TEXT NOT NULL,
+        valid_from TEXT,
+        valid_to TEXT,
+        stale INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(tenant_id, generation_id, id),
+        FOREIGN KEY(generation_id) REFERENCES graph_generations(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_outgoing
+        ON graph_edges(tenant_id, generation_id, source_id);
+      CREATE INDEX IF NOT EXISTS idx_graph_edges_incoming
+        ON graph_edges(tenant_id, generation_id, target_id);
     `));
 
     // Schema upgrades and legacy evidence import must be one serialized
@@ -861,6 +980,219 @@ export class ContextVault {
     } finally {
       this.transactionDepth -= 1;
     }
+  }
+
+  publishGraph(projection) {
+    // Complete normalization happens before BEGIN IMMEDIATE so invalid input can
+    // never contend with readers or alter the currently active generation.
+    const normalized = normalizeGraphProjection({
+      ...projection,
+      tenant_id: projection?.tenant_id || LOCAL_TENANT,
+    });
+    const generation = {
+      id: randomUUID(),
+      tenant_id: normalized.tenant_id,
+      project_id: normalized.project_id,
+      branch: normalized.branch || "",
+      commit: normalized.commit,
+      extractor_version: normalized.extractor_version,
+      projection_hash: normalized.hash,
+      status: "staging",
+      created_at: nowIso(),
+      activated_at: null,
+      superseded_at: null,
+    };
+    return this.runTransaction(() => {
+      this.db.prepare(`
+        INSERT INTO graph_generations(
+          id, tenant_id, project_id, branch, "commit", extractor_version,
+          projection_hash, status, created_at, activated_at, superseded_at
+        ) VALUES (
+          @id, @tenant_id, @project_id, @branch, @commit, @extractor_version,
+          @projection_hash, @status, @created_at, @activated_at, @superseded_at
+        )
+      `).run(generation);
+      const insertSourceState = this.db.prepare(`
+        INSERT INTO graph_source_states(
+          tenant_id, generation_id, repo_path, git_object_id, content_hash, extractor_version
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const source of normalized.source_states) {
+        insertSourceState.run(
+          generation.tenant_id,
+          generation.id,
+          source.repo_path,
+          source.git_object_id,
+          source.content_hash,
+          source.extractor_version,
+        );
+      }
+      const insertNode = this.db.prepare(`
+        INSERT INTO graph_nodes(
+          tenant_id, generation_id, id, project_id, repo_path, kind, qualified_name, label,
+          branch, "commit", content_hash, language, start_line, start_column, end_line, end_column,
+          extractor_version, provenance, valid_from, valid_to, stale
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+      `);
+      const insertNodeFts = this.db.prepare(`
+        INSERT INTO graph_node_fts(tenant_id, generation_id, node_id, label, qualified_name, repo_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const node of normalized.nodes) {
+        insertNode.run(
+          generation.tenant_id,
+          generation.id,
+          node.id,
+          node.project_id,
+          node.repo_path,
+          node.kind,
+          node.qualified_name,
+          node.label,
+          node.branch,
+          node.commit,
+          node.content_hash,
+          node.language,
+          node.start_line,
+          node.start_column,
+          node.end_line,
+          node.end_column,
+          node.extractor_version,
+          node.provenance,
+          node.valid_from,
+          node.valid_to,
+          node.stale,
+        );
+        insertNodeFts.run(
+          generation.tenant_id,
+          generation.id,
+          node.id,
+          node.label,
+          node.qualified_name,
+          node.repo_path,
+        );
+      }
+      const insertEdge = this.db.prepare(`
+        INSERT INTO graph_edges(
+          tenant_id, generation_id, id, source_id, target_id, relation, source_location, repo_path,
+          start_line, start_column, end_line, end_column, weight, provenance, "commit",
+          extractor_version, valid_from, valid_to, stale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const edge of normalized.edges) {
+        insertEdge.run(
+          generation.tenant_id,
+          generation.id,
+          edge.id,
+          edge.source_id,
+          edge.target_id,
+          edge.relation,
+          edge.source_location,
+          edge.repo_path,
+          edge.start_line,
+          edge.start_column,
+          edge.end_line,
+          edge.end_column,
+          edge.weight,
+          edge.provenance,
+          edge.commit,
+          edge.extractor_version,
+          edge.valid_from,
+          edge.valid_to,
+          edge.stale,
+        );
+      }
+      const missingEndpoint = this.db.prepare(`
+        SELECT e.source_id, e.target_id,
+          CASE WHEN source.id IS NULL THEN 'source' ELSE 'target' END AS missing
+        FROM graph_edges e
+        LEFT JOIN graph_nodes source
+          ON source.tenant_id = e.tenant_id
+         AND source.generation_id = e.generation_id
+         AND source.id = e.source_id
+        LEFT JOIN graph_nodes target
+          ON target.tenant_id = e.tenant_id
+         AND target.generation_id = e.generation_id
+         AND target.id = e.target_id
+        WHERE e.tenant_id = ? AND e.generation_id = ?
+          AND (source.id IS NULL OR target.id IS NULL)
+        ORDER BY e.id
+        LIMIT 1
+      `).get(generation.tenant_id, generation.id);
+      if (missingEndpoint) {
+        const id = missingEndpoint.missing === "source" ? missingEndpoint.source_id : missingEndpoint.target_id;
+        throw new Error(`unknown ${missingEndpoint.missing} node: ${id}`);
+      }
+      const activatedAt = nowIso();
+      this.db.prepare(`
+        UPDATE graph_generations
+        SET status = 'superseded', superseded_at = ?
+        WHERE tenant_id = ? AND project_id = ? AND branch = ? AND status = 'active'
+      `).run(activatedAt, generation.tenant_id, generation.project_id, generation.branch);
+      this.db.prepare(`
+        UPDATE graph_generations SET status = 'active', activated_at = ? WHERE id = ?
+      `).run(activatedAt, generation.id);
+      this.audit("graph-publish", generation.id, `active:${generation.projection_hash}`);
+      return graphGenerationFromRow({ ...generation, status: "active", activated_at: activatedAt });
+    });
+  }
+
+  activeGraphGeneration(scope) {
+    const normalized = normalizeGraphScope(scope);
+    const branchClause = normalized.branchProvided ? " AND branch = ?" : "";
+    const values = [normalized.tenant_id, normalized.project_id];
+    if (normalized.branchProvided) values.push(normalized.branch);
+    const row = this.db.prepare(`
+      SELECT * FROM graph_generations
+      WHERE tenant_id = ? AND project_id = ?${branchClause} AND status = 'active'
+      ORDER BY activated_at DESC, id ASC
+      LIMIT 1
+    `).get(...values);
+    return graphGenerationFromRow(row);
+  }
+
+  graphStatus(scope) {
+    const normalized = normalizeGraphScope(scope);
+    const branchClause = normalized.branchProvided ? " AND branch = ?" : "";
+    const values = [normalized.tenant_id, normalized.project_id];
+    if (normalized.branchProvided) values.push(normalized.branch);
+    const counts = { staging: 0, active: 0, superseded: 0 };
+    for (const row of this.db.prepare(`
+      SELECT status, count(*) AS count FROM graph_generations
+      WHERE tenant_id = ? AND project_id = ?${branchClause}
+      GROUP BY status
+    `).all(...values)) counts[row.status] = Number(row.count);
+    const generationClause = normalized.branchProvided ? " AND g.branch = ?" : "";
+    const activeValues = [normalized.tenant_id, normalized.project_id];
+    if (normalized.branchProvided) activeValues.push(normalized.branch);
+    const nodes = Number(this.db.prepare(`
+      SELECT count(*) AS count
+      FROM graph_nodes n JOIN graph_generations g ON g.id = n.generation_id AND g.tenant_id = n.tenant_id
+      WHERE g.tenant_id = ? AND g.project_id = ?${generationClause} AND g.status = 'active'
+    `).get(...activeValues).count);
+    const edges = Number(this.db.prepare(`
+      SELECT count(*) AS count
+      FROM graph_edges e JOIN graph_generations g ON g.id = e.generation_id AND g.tenant_id = e.tenant_id
+      WHERE g.tenant_id = ? AND g.project_id = ?${generationClause} AND g.status = 'active'
+    `).get(...activeValues).count);
+    const source_states = Number(this.db.prepare(`
+      SELECT count(*) AS count
+      FROM graph_source_states s JOIN graph_generations g ON g.id = s.generation_id AND g.tenant_id = s.tenant_id
+      WHERE g.tenant_id = ? AND g.project_id = ?${generationClause} AND g.status = 'active'
+    `).get(...activeValues).count);
+    return {
+      scope: {
+        tenant_id: normalized.tenant_id,
+        project_id: normalized.project_id,
+        branch: normalized.branchProvided ? normalized.branch || null : null,
+      },
+      active_generation: this.activeGraphGeneration(scope),
+      generations: counts,
+      source_states,
+      nodes,
+      edges,
+    };
   }
 
   nextHandoffSequence() {
