@@ -160,6 +160,18 @@ test("an invalid projection leaves the active generation unchanged", () => {
   } finally { f.cleanup(); }
 });
 
+test("graph publication rejects a scope that graph reads cannot address", () => {
+  const f = fixture();
+  try {
+    assert.throws(
+      () => f.vault.publishGraph({ ...graphFixture({ commit: "a" }), project_id: "api team" }),
+      /project_id contains invalid characters or length/,
+    );
+    const published = f.vault.publishGraph(graphFixture({ commit: "b" }));
+    assert.equal(f.vault.activeGraphGeneration({ project_id: "api" }).id, published.id);
+  } finally { f.cleanup(); }
+});
+
 test("concurrent processes can initialize the same empty vault", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-first-open-test-"));
   try {

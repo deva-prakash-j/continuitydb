@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { posix as path } from "node:path";
+import { requiredIdentifier } from "../security.js";
 
 export const GRAPH_RELATIONS = new Set([
   "contains", "declares", "imports", "calls", "implements", "extends",
@@ -43,7 +44,7 @@ function optionalInteger(value, name) {
 }
 
 function normalizeProvenance(value, name = "edge provenance") {
-  const provenance = value || "extracted";
+  const provenance = value === undefined || value === null ? "extracted" : value;
   if (!GRAPH_PROVENANCE.has(provenance)) throw new Error(`${name} is invalid`);
   return provenance;
 }
@@ -71,10 +72,13 @@ function hash(value) {
 
 function normalizeScope(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("graph projection must be an object");
+  const branch = input.branch === undefined || input.branch === null || input.branch === ""
+    ? null
+    : requiredIdentifier(input.branch, "branch");
   return {
-    tenant_id: requiredString(input.tenant_id, "tenant_id"),
-    project_id: requiredString(input.project_id, "project_id"),
-    branch: optionalString(input.branch, "branch"),
+    tenant_id: requiredIdentifier(input.tenant_id, "tenant_id"),
+    project_id: requiredIdentifier(input.project_id, "project_id"),
+    branch,
     commit: requiredString(input.commit, "commit"),
     extractor_version: requiredString(input.extractor_version, "extractor_version"),
   };
@@ -82,8 +86,8 @@ function normalizeScope(input) {
 
 export function graphNodeId(input) {
   const identity = [
-    requiredString(input?.tenant_id, "tenant_id"),
-    requiredString(input?.project_id, "project_id"),
+    requiredIdentifier(input?.tenant_id, "tenant_id"),
+    requiredIdentifier(input?.project_id, "project_id"),
     normalizeGraphPath(input?.repo_path),
     requiredString(input?.kind, "kind"),
     requiredString(input?.qualified_name, "qualified_name"),
@@ -103,6 +107,9 @@ export function graphEdgeId(input) {
 function canonicalSourceLocation(input) {
   if (input?.source_location !== undefined && input?.source_location !== null) {
     const raw = requiredString(input.source_location, "source_location");
+    if (/^(?:[a-z]:[\\/]|[\\/])/i.test(raw)) {
+      throw new Error("source_location must be a repository-relative path");
+    }
     const separator = raw.indexOf(":");
     const repoPath = separator === -1 ? raw : raw.slice(0, separator);
     return `${normalizeGraphPath(repoPath, "source_location")}${separator === -1 ? "" : raw.slice(separator)}`;

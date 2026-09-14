@@ -67,3 +67,43 @@ test("graph projections normalize paths, validate provenance, and hash independe
     /edge provenance is invalid/,
   );
 });
+
+test("graph projections use the same identifier scope contract as graph reads", () => {
+  const projection = {
+    tenant_id: "tenant-a",
+    project_id: "api team",
+    branch: "main",
+    commit: "abcdef1",
+    extractor_version: "graph-v1",
+    source_states: [],
+    nodes: [],
+    edges: [],
+  };
+  assert.throws(() => normalizeGraphProjection(projection), /project_id contains invalid characters or length/);
+  assert.throws(() => normalizeGraphProjection({ ...projection, project_id: "api", branch: "main branch" }), /branch contains invalid characters or length/);
+  assert.throws(() => normalizeGraphProjection({ ...projection, project_id: "api", branch: " main " }), /branch contains invalid characters or length/);
+});
+
+test("graph normalization rejects absolute source locations and falsey explicit provenance", () => {
+  assert.throws(
+    () => graphEdgeId({ source_id: "gn_source", target_id: "gn_target", relation: "calls", source_location: "C:/repo/file:1" }),
+    /source_location must be a repository-relative path/,
+  );
+  assert.throws(
+    () => graphEdgeId({ source_id: "gn_source", target_id: "gn_target", relation: "calls", source_location: "C:\\repo\\file:1" }),
+    /source_location must be a repository-relative path/,
+  );
+  assert.throws(
+    () => normalizeGraphProjection({
+      tenant_id: "tenant-a",
+      project_id: "api",
+      branch: "main",
+      commit: "abcdef1",
+      extractor_version: "graph-v1",
+      source_states: [],
+      nodes: [{ repo_path: "src/Api.java", kind: "class", qualified_name: "com.acme.Api", provenance: "" }],
+      edges: [],
+    }),
+    /node provenance is invalid/,
+  );
+});
