@@ -86,6 +86,7 @@
     "benchmark:scale": "node benchmarks/scale-benchmark.js",
     "benchmark:quality": "node benchmarks/quality-benchmark.js",
     "benchmark:hybrid": "node benchmarks/hybrid-quality-benchmark.js",
+    "benchmark:graph-first": "node benchmarks/graph-first-benchmark.js",
     "benchmark:local": "node benchmarks/local-quality-benchmark.js",
     "benchmark:local:performance": "node benchmarks/local-embedding-benchmark.js",
     "release:check": "npm test && npm run validate:openapi && npm run validate:clients && npm run validate:release-workflow && npm run benchmark:quality && npm audit --omit=dev && npm run package:check && npm run test:codex-config && npm run test:opencode-global"

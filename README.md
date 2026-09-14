@@ -179,6 +179,12 @@ and credentials when their trust domains differ.
 
 - SQLite WAL and FTS5/BM25 lexical retrieval for identifiers, paths, errors, and keywords;
 - built-in local BGE-small quantized embeddings plus optional Ollama or OpenAI-compatible providers;
+- native, versioned Java/Spring code graphs built from committed Git blobs, with
+  Maven/Gradle, YAML/JSON, and Markdown evidence;
+- selectable `hybrid`, `graph-only`, and `graph-first` retrieval; graph-first
+  invokes semantic retrieval only after an explicit coverage failure;
+- bounded graph traversal (depth 0–3), cited evidence paths, active-generation
+  status, and repository-relative source locations;
 - bounded exact vector scan for embedded mode;
 - project dependency closure and typed memory-graph expansion;
 - Reciprocal Rank Fusion across lexical, semantic, and graph candidates;
@@ -238,7 +244,8 @@ and credentials when their trust domains differ.
 - legacy audit events retain their original hashes; corrupted or divergent
   history is reported invalid rather than rewritten into a valid-looking chain.
 
-See the [architecture](docs/architecture.md) and
+See the [architecture](docs/architecture.md), the
+[graph-first retrieval guide](docs/graph-first-retrieval.md), and the
 [competitor-derived capability review](docs/competitive-research-2026-09-09.md)
 for design details and deliberate exclusions.
 

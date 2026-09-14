@@ -20,7 +20,8 @@ local MCP --------> identity + capture policy ----------------> SQLite records/F
 remote MCP ------> authenticated Streamable HTTP MCP ----------^        |
 remote stdio MCP -> authenticated HTTP v1 -> authoritative API          |
 lifecycle hooks ---------------------------------------------+          +-> canonical Markdown
-review inbox ------------------------------------------------+          +-> serialized audit table
+review inbox ------------------------------------------------+          +-> versioned code-graph projections
+                                                                        +-> serialized audit table
 ```
 
 - SQLite WAL is the query/index engine for one host.
@@ -29,6 +30,9 @@ review inbox ------------------------------------------------+          +-> seri
   Ollama, or an OpenAI-compatible endpoint and are stored as model/content-hash
   versioned derived rows. Local vector retrieval is an exact bounded scan.
 - Project and memory edges provide bounded graph expansion.
+- Committed Java/Spring, manifest, configuration, and Markdown evidence is
+  stored in atomically published graph generations. Exact/FTS graph seeds and
+  authorized typed traversal run before optional semantic fallback.
 - RRF fuses lexical, semantic and graph ranks; MMR reduces repeated context.
 - Automatic capture has a separate write-rate limit, per-agent/project quota,
   TTL caps, recursive credential rejection and conflict quarantine.
@@ -85,12 +89,22 @@ Typed project and memory edges carry weight, provenance and validity windows.
 2. Compute explicit project dependency closure within the caller allowlist.
 3. Apply tenant, owner, namespace, sensitivity, status, branch, expiry, valid-time
    and stale filters inside every retriever.
-4. Retrieve lexical candidates and optional semantic candidates.
-5. Expand graph neighbors from bounded seeds.
-6. Fuse ranks using weighted Reciprocal Rank Fusion.
-7. Apply project proximity, confidence, importance, freshness and exact-score boosts.
-8. Use Maximal Marginal Relevance to reduce duplicate evidence.
-9. Pack the full serialized envelope within the caller budget and return citations plus score signals.
+4. Resolve exact symbol/path/configuration/dependency seeds, then graph FTS seeds.
+5. Traverse authorized typed graph edges with depth, visited-node, and path budgets.
+6. Evaluate graph coverage. In `graph-first`, invoke semantic retrieval only for
+   `no_seed`, `insufficient_candidates`, `low_path_confidence`, or
+   `conceptual_query`; `graph-only` never embeds and `hybrid` embeds eagerly.
+7. Fuse lexical, semantic (when used), record, and graph-path ranks using weighted RRF.
+8. Apply project proximity, confidence, importance, freshness and exact-score boosts.
+9. Use Maximal Marginal Relevance to reduce duplicate evidence.
+10. Pack the full serialized envelope within the caller budget and return
+    citations, evidence paths, requested/effective mode, fallback reason, and
+    active generation metadata.
+
+`hybrid` remains the compatibility default until the frozen ablation demonstrates
+no downstream answer-accuracy regression, at least 20% lower median context
+tokens, at least 60% embedding avoidance on exact/structural questions, and zero
+scope or stale-generation failures. See [graph-first retrieval](graph-first-retrieval.md).
 
 ## Consistency and failure behavior
 
@@ -104,6 +118,11 @@ Typed project and memory edges carry weight, provenance and validity windows.
   and prior-checkpoint supersession run under one `BEGIN IMMEDIATE` transaction,
   so concurrent processes cannot exceed quota or publish two active successors.
 - Embeddings must match canonical content hash; stale projections are ignored.
+- A graph build publishes a complete staging generation in one transaction;
+  readers see either the prior active generation or the complete replacement.
+  Changed-file builds reuse unchanged extracted facts, while extractor-version
+  changes force reparsing. Graph projections remain rebuildable and do not
+  replace governed records.
 - Forgetting tombstones the record and removes it from all local retrieval paths.
 - Distributed mode uses canonical transaction + outbox/log; projectors are
   idempotent and query responses expose index generation/freshness.

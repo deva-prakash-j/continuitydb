@@ -7,6 +7,7 @@ import { spawnSync } from "node:child_process";
 import test from "node:test";
 import { parse } from "yaml";
 import { validateCiWorkflow, validateReleaseWorkflow } from "../scripts/validate-release-workflow.js";
+import { runGraphFirstBenchmark, summarizeBenchmarkObservations } from "../benchmarks/graph-first-benchmark.js";
 
 const workflow = parse(readFileSync(new URL("../.github/workflows/release-binaries.yml", import.meta.url), "utf8"));
 const ciWorkflow = parse(readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8"));
@@ -775,4 +776,75 @@ test("release check builds once before generated Codex and real OpenCode integra
     "npm run build:binary && node scripts/codex-generated-config-probe.js",
   );
   assert.match(packageDocument.scripts["release:check"], /npm run test:codex-config && npm run test:opencode-global$/);
+});
+
+test("graph-first release benchmark uses the frozen representative fixture and reports every ablation", () => {
+  assert.equal(packageDocument.scripts["benchmark:graph-first"], "node benchmarks/graph-first-benchmark.js");
+  const fixture = JSON.parse(readFileSync(new URL("../benchmarks/graph-first-fixture.json", import.meta.url), "utf8"));
+  assert.equal(fixture.version, 1);
+  assert.equal(fixture.top_k, 5);
+  assert.equal(fixture.queries.length, 30);
+  assert.ok(fixture.queries.filter((query) => query.forbidden_projects.length > 0).length >= 5);
+  for (const query of fixture.queries) {
+    assert.ok(query.authorized_projects.length > 0);
+    assert.equal(typeof query.branch, "string");
+    assert.ok(query.gold_node_ids.length > 0 || query.gold_memory_ids.length > 0);
+    assert.ok(Array.isArray(query.required_citation_edges));
+    assert.equal(Number.isInteger(query.maximum_acceptable_staleness), true);
+  }
+
+  const run = spawnSync(process.execPath, ["benchmarks/graph-first-benchmark.js"], {
+    cwd: new URL("..", import.meta.url),
+    encoding: "utf8",
+  });
+  assert.equal(run.status, 0, run.stderr || run.stdout);
+  const report = JSON.parse(run.stdout);
+  assert.deepEqual(Object.keys(report.modes).sort(), ["graph-first", "graph-only", "hybrid"]);
+  assert.equal(report.security.cross_scope_failures, 0);
+  assert.equal(report.security.stale_generation_failures, 0);
+  assert.equal(Number.isFinite(report.modes["graph-first"].median_context_tokens), true);
+  assert.equal(Number.isFinite(report.modes["graph-first"].embedding_avoidance_rate), true);
+  assert.deepEqual(Object.keys(report.by_query_class).sort(), [
+    "call-path", "conceptual", "configuration-flow", "cross-project-path",
+    "dependency-impact", "exact-symbol", "historical-decision",
+  ]);
+  assert.equal(report.recommended_default, "hybrid");
+  assert.equal(report.release_gates.no_answer_accuracy_regression, false);
+
+  const failedPromotion = spawnSync(process.execPath, [
+    "benchmarks/graph-first-benchmark.js", "--promote-default=graph-first",
+  ], {
+    cwd: new URL("..", import.meta.url),
+    encoding: "utf8",
+  });
+  assert.notEqual(failedPromotion.status, 0, "an ineligible graph-first promotion must fail");
+});
+
+test("graph-first benchmark avoidance is based on queries, not raw embed calls", () => {
+  const summary = summarizeBenchmarkObservations([
+    {
+      class: "exact-symbol", gold_hits: 1, gold_total: 1,
+      required_path_hits: 0, required_path_total: 0, latency_ms: 1,
+      context_tokens: 10, embedding_invocations: 2,
+      stale_generation_failure: false, cross_scope_failure: false,
+    },
+    {
+      class: "exact-symbol", gold_hits: 1, gold_total: 1,
+      required_path_hits: 0, required_path_total: 0, latency_ms: 1,
+      context_tokens: 10, embedding_invocations: 0,
+      stale_generation_failure: false, cross_scope_failure: false,
+    },
+  ]);
+  assert.equal(summary.embedding_invocations, 2);
+  assert.equal(summary.embedding_avoidance_rate, 0.5);
+  assert.equal(summary.structural_embedding_avoidance_rate, 0.5);
+});
+
+test("graph-first benchmark has deterministic non-timing metrics", async () => {
+  const stableReport = (report) => JSON.parse(JSON.stringify(report, (key, value) => (
+    key.endsWith("latency_ms") ? undefined : value
+  )));
+  const first = await runGraphFirstBenchmark();
+  const second = await runGraphFirstBenchmark();
+  assert.deepEqual(stableReport(first), stableReport(second));
 });
