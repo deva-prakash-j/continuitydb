@@ -80,3 +80,42 @@ test("temporal recall and memory graph expansion are tenant scoped", () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("code graph seeds and paths enforce node and edge validity before traversal", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-temporal-code-graph-"));
+  const vault = new ContextVault(root);
+  try {
+    const source = {
+      repo_path: "src/Caller.java", kind: "method", qualified_name: "com.acme.Caller.call",
+      valid_from: "2026-01-01T00:00:00Z",
+    };
+    const target = {
+      repo_path: "src/Target.java", kind: "method", qualified_name: "com.acme.Target.run",
+      valid_from: "2026-01-01T00:00:00Z",
+    };
+    vault.publishGraph({
+      tenant_id: "acme", project_id: "api", branch: "main", commit: "abc", extractor_version: "test-v1",
+      source_states: [
+        { repo_path: source.repo_path, git_object_id: "caller" },
+        { repo_path: target.repo_path, git_object_id: "target" },
+      ],
+      nodes: [source, target],
+      edges: [{
+        source, target, relation: "calls", repo_path: source.repo_path,
+        valid_from: "2026-03-01T00:00:00Z", valid_to: "2026-09-01T00:00:00Z",
+      }],
+    });
+    const input = {
+      tenant_id: "acme", project_id: "api", allowed_projects: ["api"], branch: "main",
+      query: "com.acme.Target.run", retrieval_mode: "graph-only", direction: "incoming",
+    };
+    assert.equal(vault.searchDetailed({ ...input, as_of: "2025-12-01T00:00:00Z" }).results.length, 0);
+    const active = vault.searchDetailed({ ...input, as_of: "2026-06-01T00:00:00Z" }).results;
+    assert.ok(active.some((result) => result.citation.symbol === "com.acme.Caller.call"));
+    const expired = vault.searchDetailed({ ...input, as_of: "2026-10-01T00:00:00Z" }).results;
+    assert.equal(expired.some((result) => result.citation.symbol === "com.acme.Caller.call"), false);
+  } finally {
+    vault.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

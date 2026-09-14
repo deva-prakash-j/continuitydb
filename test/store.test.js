@@ -166,6 +166,24 @@ test("active graph projection exposes only the scoped active generation", () => 
   } finally { f.cleanup(); }
 });
 
+test("detailed graph search preserves the legacy array search contract", () => {
+  const f = fixture();
+  try {
+    const generation = f.vault.publishGraph(graphFixture({ commit: "a" }));
+    const input = {
+      query: "com.acme.Api",
+      project_id: "api",
+      allowed_projects: ["api"],
+      branch: "main",
+      retrieval_mode: "graph-only",
+    };
+    const detailed = f.vault.searchDetailed(input);
+    assert.equal(detailed.retrieval.graph_generation.id, generation.id);
+    assert.ok(detailed.results.some((result) => result.citation.symbol === "com.acme.Api"));
+    assert.deepEqual(f.vault.search(input), detailed.results);
+  } finally { f.cleanup(); }
+});
+
 test("an invalid projection leaves the active generation unchanged", () => {
   const f = fixture();
   try {

@@ -13,6 +13,12 @@ import { pathToFileURL } from "node:url";
 import { acquireVaultInitializationLock } from "./file-lock.js";
 import { normalizeGraphProjection } from "./graph/model.js";
 import {
+  evaluateGraphCoverage,
+  graphGenerationSummary,
+  resolveGraphSeeds,
+  traverseGraph,
+} from "./graph/retrieval.js";
+import {
   freshnessScore,
   maxMarginalRelevance,
   normalizeBm25,
@@ -1529,7 +1535,138 @@ export class ContextVault {
     return visited;
   }
 
-  search({
+  search(input = {}) {
+    return this.searchDetailed(input).results;
+  }
+
+  searchDetailed(input = {}) {
+    const requestedMode = input.retrieval_mode || "hybrid";
+    if (!["hybrid", "graph-only", "graph-first"].includes(requestedMode)) {
+      throw new Error("retrieval_mode must be hybrid, graph-only, or graph-first");
+    }
+    // Resolve and traverse before ranking so graph authorization is complete
+    // before any node label or path enters a candidate object.
+    const seeds = input.project_id ? resolveGraphSeeds(this, input) : [];
+    const graphCandidates = input.project_id ? traverseGraph(this, { ...input, seeds }) : [];
+    const coverage = evaluateGraphCoverage({ query: input.query, seeds, candidates: graphCandidates });
+    const candidateTopK = clamp(Number(input.top_k ?? 8) * 4, 8, 100);
+    const memoryResults = requestedMode === "graph-only" ? [] : this.searchMemoryResults({
+      ...input,
+      top_k: candidateTopK,
+      token_budget: 32_000,
+    });
+    const graphResults = graphCandidates.map((node) => ({
+      id: node.id,
+      title: node.label,
+      body: `${node.kind} ${node.qualified_name}`,
+      type: "graph-node",
+      namespace_id: `project/${node.project_id}`,
+      project_id: node.project_id,
+      tenant_id: input.tenant_id || LOCAL_TENANT,
+      tags: [node.kind, node.language].filter(Boolean),
+      confidence: node.score,
+      score: node.score,
+      score_signals: { graph: node.score, [node.seed_match === "exact" ? "exact" : "lexical"]: node.score },
+      feedback: { helpful: 0, incorrect: 0, outdated: 0 },
+      temporal: {
+        valid_from: node.valid_from,
+        valid_to: node.valid_to,
+        observed_at: null,
+        stale: Boolean(node.stale),
+      },
+      citation: {
+        source_uri: null,
+        repo_path: node.repo_path,
+        symbol: node.qualified_name,
+        git_commit: node.commit,
+        branch: node.branch,
+      },
+      graph_path: node.graph_path,
+    }));
+    const rankings = requestedMode === "graph-only"
+      ? [graphResults.map((item) => ({ id: item.id, signal: "graph" }))]
+      : [
+          memoryResults.map((item) => ({ id: item.id, signal: "record" })),
+          graphResults.map((item) => ({ id: item.id, signal: "graph" })),
+        ];
+    const fused = reciprocalRankFusion(rankings, { weights: requestedMode === "graph-only" ? [1] : [1, 0.85] });
+    const byId = new Map([...memoryResults, ...graphResults].map((item) => [item.id, item]));
+    const ranked = fused.map((fusedItem) => {
+      const item = byId.get(fusedItem.id);
+      return {
+        ...item,
+        score: fusedItem.score + 0.02 * Math.max(0, Math.min(1, Number(item.score || 0))),
+        score_signals: { ...item.score_signals, ...fusedItem.signals },
+      };
+    }).sort((left, right) => right.score - left.score || left.id.localeCompare(right.id));
+    const diverse = maxMarginalRelevance(ranked, {
+      topK: clamp(Number(input.top_k ?? 8) * 2, 1, 100),
+      lambda: 0.82,
+      text: (item) => `${item.title || ""}\n${item.body || ""}\n${(item.graph_path || []).map((hop) => hop.edge_id).join(" ")}`,
+    });
+    const results = [];
+    const topK = clamp(Number(input.top_k ?? 8), 1, 50);
+    const tokenBudget = input.token_budget ?? 1200;
+    for (const item of diverse) {
+      if (results.length >= topK) break;
+      let candidate = item;
+      while (candidate.graph_path?.length > 1 && estimateSerializedTokens({ results: [...results, candidate] }) > clamp(Number(tokenBudget), 64, 32_000)) {
+        candidate = { ...candidate, graph_path: candidate.graph_path.slice(0, -1) };
+      }
+      const fitted = fitResultWithinEnvelope(results, candidate, tokenBudget);
+      if (!fitted) break;
+      results.push(fitted);
+    }
+    return {
+      results,
+      retrieval: {
+        requested_mode: requestedMode,
+        effective_mode: requestedMode,
+        semantic_fallback_used: false,
+        fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
+        graph_generation: graphGenerationSummary(this, input),
+      },
+    };
+  }
+
+  explainGraphNode(input = {}) {
+    const query = input.node || input.node_id || input.query;
+    const seeds = resolveGraphSeeds(this, { ...input, query, seed_limit: 20 });
+    const node = seeds.find((seed) => seed.id === input.node_id || seed.qualified_name === query) || seeds[0];
+    if (!node) return null;
+    const traversalInput = { ...input, query, seeds: [node], depth: 1, maxPaths: input.graph_max_paths ?? 40 };
+    const incoming = traverseGraph(this, { ...traversalInput, direction: "incoming" })
+      .filter((candidate) => candidate.depth === 1);
+    const outgoing = traverseGraph(this, { ...traversalInput, direction: "outgoing" })
+      .filter((candidate) => candidate.depth === 1);
+    return {
+      node,
+      incoming,
+      outgoing,
+      graph_generation: graphGenerationSummary(this, input),
+    };
+  }
+
+  findGraphPath(input = {}) {
+    const from = requiredString(input.from || input.from_node_id, "from");
+    const to = requiredString(input.to || input.to_node_id, "to");
+    const fromSeeds = resolveGraphSeeds(this, { ...input, query: from, seed_limit: 40 });
+    const toSeeds = resolveGraphSeeds(this, { ...input, query: to, seed_limit: 40 });
+    const source = fromSeeds.find((seed) => seed.id === from || seed.qualified_name === from) || fromSeeds[0];
+    const target = toSeeds.find((seed) => seed.id === to || seed.qualified_name === to) || toSeeds[0];
+    if (!source || !target) return null;
+    if (source.id === target.id) return source;
+    return traverseGraph(this, {
+      ...input,
+      query: from,
+      seeds: [source],
+      depth: input.depth ?? input.graph_depth ?? 2,
+      maxPaths: input.maxPaths ?? input.graph_max_paths ?? 200,
+      direction: input.direction || "both",
+    }).find((candidate) => candidate.id === target.id) || null;
+  }
+
+  searchMemoryResults({
     query,
     project_id = null,
     dependency_depth = 2,
