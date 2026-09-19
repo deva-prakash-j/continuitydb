@@ -650,6 +650,9 @@ try {
         tenantId: flags.tenant || cliTenantId,
         ownerId: flags.owner || cliOwnerId,
         sensitivities: listFlag(flags.sensitivities || process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private"),
+        capturePolicyFile: (flags.policy || process.env.CONTINUITYDB_CAPTURE_POLICY_FILE)
+          ? resolve(flags.policy || process.env.CONTINUITYDB_CAPTURE_POLICY_FILE)
+          : null,
         apply: Boolean(flags.apply),
       }));
     } else if (action === "ensure") {
@@ -1033,14 +1036,45 @@ try {
           maxFileBytes: numberFlag(flags.max_file_bytes, 1_000_000),
           includeDocs: !flags.no_docs,
         });
-        let ingested = [];
-        if (flags.ingest) ingested = vault.ingestBatch(result.records.map((record) => ({
-          ...record,
-          tenant_id: cliTenantId,
-          owner_id: cliOwnerId,
-          agent_id: cliAgentId,
-        })), { commit: Boolean(flags.commit) });
-        output({ ...result, records: flags.include_records ? result.records : undefined, ingested: ingested.length, committed: Boolean(flags.commit) });
+        const ingested = [];
+        const ingestedStatuses = {};
+        if (flags.ingest) {
+          // The scanner can produce more records than one bounded store batch.
+          // Each completed batch retains its retry identity if a later one fails.
+          for (let offset = 0; offset < result.records.length; offset += 1000) {
+            const batch = result.records.slice(offset, offset + 1000).map((record) => ({
+              ...record,
+              tenant_id: cliTenantId,
+              owner_id: cliOwnerId,
+              agent_id: cliAgentId,
+            }));
+            try {
+              const completed = vault.ingestBatch(batch, { commit: Boolean(flags.commit) });
+              ingested.push(...completed);
+              for (const record of completed) ingestedStatuses[record.status] = (ingestedStatuses[record.status] || 0) + 1;
+            } catch (error) {
+              // Counts describe only returned batches, not an uncertain failed
+              // batch. Preserve the original committed-recovery outcome below.
+              error.ingestion = {
+                complete: false,
+                total_records: result.records.length,
+                completed_batches: offset / 1000,
+                completed_records: ingested.length,
+                completed_statuses: ingestedStatuses,
+                failed_batch: { offset, records: batch.length },
+                retry: "Retry the same repository revision and options after resolving the error.",
+              };
+              throw error;
+            }
+          }
+        }
+        output({
+          ...result,
+          records: flags.include_records ? result.records : undefined,
+          ingested: ingested.length,
+          ingested_statuses: ingestedStatuses,
+          committed: Boolean(flags.ingest && flags.commit) && ingested.every((record) => record.status === "active"),
+        });
       } else if (command === "embeddings-status") {
         output(localModelStatus({ home, cacheDir: flags.cache || process.env.CONTINUITYDB_MODEL_CACHE }));
       } else if (command === "embeddings-pull") {
@@ -1068,6 +1102,7 @@ try {
       ? "Operation committed; canonical records need recovery. Reopen the vault to complete recovery before retrying."
       : error.message,
     command,
+    ...(error.ingestion ? { ingestion: error.ingestion } : {}),
     ...(recoveryPending ? { code: "CANONICAL_PROJECTION_PENDING", committed: true, recovery_pending: true } : {}),
   })}\n`);
   process.exitCode = 1;

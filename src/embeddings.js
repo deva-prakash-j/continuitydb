@@ -1,5 +1,5 @@
 import { isLoopback } from "./security.js";
-import { fitContextPack } from "./store.js";
+import { fitContextPack, fitSearchEnvelope } from "./store.js";
 import { LocalOnnxEmbedder } from "./local-embeddings.js";
 
 function validateVector(vector) {
@@ -220,7 +220,7 @@ export class HybridEngine {
     if (settings.retrieval_mode === "hybrid") {
       const semanticCandidates = this.embedder ? await this.semanticCandidates(request) : [];
       const detailed = this.vault.searchDetailed({ ...request, semantic_candidates: semanticCandidates });
-      return {
+      return fitSearchEnvelope({
         ...detailed,
         retrieval: {
           ...detailed.retrieval,
@@ -229,14 +229,14 @@ export class HybridEngine {
           semantic_fallback_used: false,
           fallback_reason: null,
         },
-      };
+      }, input.token_budget ?? 1200);
     }
 
     const graphFirst = this.vault.searchDetailed({ ...request, semantic_candidates: [] });
     const coverageReason = graphFirst.retrieval.fallback_reason;
     if (!coverageReason) return graphFirst;
     if (!this.embedder) {
-      return {
+      return fitSearchEnvelope({
         ...graphFirst,
         retrieval: {
           ...graphFirst.retrieval,
@@ -244,11 +244,11 @@ export class HybridEngine {
           semantic_fallback_used: false,
           fallback_reason: "semantic_unavailable",
         },
-      };
+      }, input.token_budget ?? 1200);
     }
     const semanticCandidates = await this.semanticCandidates(request);
     const detailed = this.vault.searchDetailed({ ...request, semantic_candidates: semanticCandidates });
-    return {
+    return fitSearchEnvelope({
       ...detailed,
       retrieval: {
         ...detailed.retrieval,
@@ -257,7 +257,7 @@ export class HybridEngine {
         semantic_fallback_used: true,
         fallback_reason: coverageReason,
       },
-    };
+    }, input.token_budget ?? 1200);
   }
 
   async search(input) {

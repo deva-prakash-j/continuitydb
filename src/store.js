@@ -187,6 +187,62 @@ function graphGenerationVariants(summary) {
   ));
 }
 
+export function fitSearchEnvelope({ results: candidates, retrieval: metadata }, tokenBudget = 1200) {
+  const retrievalVariants = graphGenerationVariants(metadata.graph_generation)
+    .map((graph_generation) => ({ ...metadata, graph_generation }));
+  const results = [];
+  const limit = clamp(Number(tokenBudget), 64, 32_000);
+  let retrievalIndex = retrievalVariants.findIndex((candidate) => (
+    estimateSerializedTokens({ results, retrieval: candidate }) <= limit
+  ));
+  // The fixed retrieval fields fit the public minimum budget; this final
+  // variant explicitly reports omitted generation detail.
+  if (retrievalIndex < 0) retrievalIndex = retrievalVariants.length - 1;
+  let retrieval = retrievalVariants[retrievalIndex];
+  for (const item of candidates) {
+    const optionalMetadata = { ...item };
+    delete optionalMetadata.feedback;
+    delete optionalMetadata.tags;
+    const compactMetadata = { ...optionalMetadata };
+    delete compactMetadata.score_signals;
+    let fitted = null;
+    const variants = [item, optionalMetadata, compactMetadata];
+    for (const candidate of variants) {
+      for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+        const candidateRetrieval = retrievalVariants[index];
+        if (estimateSerializedTokens({ results: [...results, candidate], retrieval: candidateRetrieval }) <= limit) {
+          fitted = candidate;
+          retrievalIndex = index;
+          retrieval = candidateRetrieval;
+          break;
+        }
+      }
+      if (fitted) break;
+    }
+    // Preserve the cited graph path while compacting optional metadata first;
+    // body text is the final elastic field in the existing result contract.
+    if (!fitted) {
+      for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+        const candidateRetrieval = retrievalVariants[index];
+        fitted = fitResultWithinEnvelope(
+          results,
+          compactMetadata,
+          tokenBudget,
+          (items) => ({ results: items, retrieval: candidateRetrieval }),
+        );
+        if (fitted) {
+          retrievalIndex = index;
+          retrieval = candidateRetrieval;
+          break;
+        }
+      }
+    }
+    if (!fitted) break;
+    results.push(fitted);
+  }
+  return { results, retrieval };
+}
+
 export function fitContextPack(payload, tokenBudget) {
   const requestedTokens = clamp(Number(tokenBudget), 64, 32_000);
   const candidates = payload.memories || [];
@@ -2064,8 +2120,6 @@ export class ContextVault {
       semantic_fallback_used: false,
       fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
     };
-    const retrievalVariants = graphGenerationVariants(nativeGraphEnabled ? graphGenerationSummary(this, input) : null)
-      .map((graph_generation) => ({ ...retrievalBase, graph_generation }));
     const candidateTopK = clamp(Number(input.top_k ?? 8) * 4, 8, 100);
     const memoryResults = requestedMode === "graph-only" ? [] : this.searchMemoryResults({
       ...input,
@@ -2122,60 +2176,13 @@ export class ContextVault {
       lambda: 0.82,
       text: (item) => `${item.title || ""}\n${item.body || ""}\n${(item.graph_path || []).map((hop) => hop.edge_id).join(" ")}`,
     });
-    const results = [];
-    const topK = clamp(Number(input.top_k ?? 8), 1, 50);
-    const tokenBudget = input.token_budget ?? 1200;
-    const limit = clamp(Number(tokenBudget), 64, 32_000);
-    let retrievalIndex = retrievalVariants.findIndex((candidate) => (
-      estimateSerializedTokens({ results, retrieval: candidate }) <= limit
-    ));
-    // The fixed retrieval fields fit the public minimum budget; this final
-    // variant explicitly reports omitted generation detail.
-    if (retrievalIndex < 0) retrievalIndex = retrievalVariants.length - 1;
-    let retrieval = retrievalVariants[retrievalIndex];
-    for (const item of diverse) {
-      if (results.length >= topK) break;
-      const optionalMetadata = { ...item };
-      delete optionalMetadata.feedback;
-      delete optionalMetadata.tags;
-      const compactMetadata = { ...optionalMetadata };
-      delete compactMetadata.score_signals;
-      let fitted = null;
-      const candidates = [item, optionalMetadata, compactMetadata];
-      for (const candidate of candidates) {
-        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
-          const candidateRetrieval = retrievalVariants[index];
-          if (estimateSerializedTokens({ results: [...results, candidate], retrieval: candidateRetrieval }) <= limit) {
-            fitted = candidate;
-            retrievalIndex = index;
-            retrieval = candidateRetrieval;
-            break;
-          }
-        }
-        if (fitted) break;
-      }
-      // Preserve the cited graph path while compacting optional metadata first;
-      // body text is the final elastic field in the existing result contract.
-      if (!fitted) {
-        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
-          const candidateRetrieval = retrievalVariants[index];
-          fitted = fitResultWithinEnvelope(
-            results,
-            compactMetadata,
-            tokenBudget,
-            (items) => ({ results: items, retrieval: candidateRetrieval }),
-          );
-          if (fitted) {
-            retrievalIndex = index;
-            retrieval = candidateRetrieval;
-            break;
-          }
-        }
-      }
-      if (!fitted) break;
-      results.push(fitted);
-    }
-    return { results, retrieval };
+    return fitSearchEnvelope({
+      results: diverse.slice(0, clamp(Number(input.top_k ?? 8), 1, 50)),
+      retrieval: {
+        ...retrievalBase,
+        graph_generation: nativeGraphEnabled ? graphGenerationSummary(this, input) : null,
+      },
+    }, input.token_budget ?? 1200);
   }
 
   explainGraphNode(input = {}) {
