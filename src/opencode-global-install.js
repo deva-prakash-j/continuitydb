@@ -227,7 +227,10 @@ function discoverLegacyAdapters(workspaceRoots, budget = DEFAULT_SCAN_BUDGET) {
   return found.sort((left, right) => left.projectDir.localeCompare(right.projectDir));
 }
 
-function normalizedOptions({ configDir = defaultOpenCodeConfigDir(), workspaceRoots, home, binary } = {}) {
+function normalizedOptions({
+  configDir = defaultOpenCodeConfigDir(), workspaceRoots, home, binary,
+  tenantId = "local", ownerId = "local-user", sensitivities = ["public", "private"],
+} = {}) {
   const fixedConfigDir = canonicalOpenCodeConfigDir(configDir);
   if (!Array.isArray(workspaceRoots) || workspaceRoots.length < 1 || workspaceRoots.length > 64) {
     throw new Error("one to sixty-four workspace roots are required");
@@ -250,6 +253,9 @@ function normalizedOptions({ configDir = defaultOpenCodeConfigDir(), workspaceRo
     workspaceRoots: roots,
     home: resolve(home),
     executable: resolve(binary),
+    tenantId,
+    ownerId,
+    sensitivities,
   };
 }
 
@@ -281,9 +287,9 @@ export function installGlobalOpenCode(rawOptions = {}) {
     home: options.home,
     apply: Boolean(rawOptions.apply),
     transport: "stdio",
-    tenantId: rawOptions.tenantId || "local",
-    ownerId: rawOptions.ownerId || "local-user",
-    sensitivities: rawOptions.sensitivities || ["public", "private"],
+    tenantId: options.tenantId,
+    ownerId: options.ownerId,
+    sensitivities: options.sensitivities,
   };
   if (legacy.length) migrateManagedOpenCodeProjects(legacy, { ...migrationOptions, apply: false });
   if (!rawOptions.apply) {

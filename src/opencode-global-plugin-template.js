@@ -43,7 +43,7 @@ export function renderGlobalOpenCodePlugin({
     + `const MAX_TASK_CHARS = 8000;\n`
     + `const PROJECT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;\n`
     + `const tasks = new Map();\n`
-    + `const injected = new Map();\n\n`
+    + `const injected = new WeakMap();\n\n`
     + `function childEnvironment(projectId = null) {\n`
     + `  const environment = {};\n`
     + `  for (const name of ["PATH","SystemRoot","SYSTEMROOT","WINDIR","TEMP","TMP","TMPDIR","HOME","USERPROFILE"]) if (process.env[name]) environment[name] = process.env[name];\n`
@@ -74,7 +74,7 @@ export function renderGlobalOpenCodePlugin({
     + `  return value.project;\n`
     + `}\n\n`
     + `function fixedArgs(project, command, values) {\n`
-    + `  return [command, ...values, "--project", project.id, "--home", CONFIG.home];\n`
+    + `  return [command, ...values, "--project", project.id, "--home", CONFIG.home, ...(["search", "context"].includes(command) ? ["--sensitivities", CONFIG.sensitivities.join(",")] : [])];\n`
     + `}\n\n`
     + `function captureKey(project, body, title, kind, sensitivity) {\n`
     + `  return createHash("sha256").update(JSON.stringify([project.id, body, title || "", kind, sensitivity])).digest("hex");\n`
@@ -105,12 +105,22 @@ export function renderGlobalOpenCodePlugin({
     + `    "chat.message": async (input, output) => { const text = (output.parts || []).filter((part) => part && part.type === "text" && typeof part.text === "string").map((part) => part.text).join("\\n").slice(0, MAX_TASK_CHARS); if (text) tasks.set(input.sessionID, text); },\n`
     + `    "experimental.chat.system.transform": async (input, output) => {\n`
     + `      const task = tasks.get(input.sessionID) || "Continue work in this repository";\n`
-    + `      if (injected.get(input.sessionID) === task) return;\n`
-    + `      try { const value = await contextFor(input.sessionID, task); if (!output.system.length) output.system.push(value); else output.system[0] += "\\n\\n" + value; injected.set(input.sessionID, task); }\n`
+    + `      const alreadyPresent = () => { const previous = injected.get(output.system); return previous?.task === task && output.system.some((part) => part.includes(previous.value)); };\n`
+    + `      if (alreadyPresent()) return;\n`
+    + `      try {\n`
+    + `        const value = await contextFor(input.sessionID, task);\n`
+    + `        if (alreadyPresent()) return;\n`
+    + `        const previous = injected.get(output.system);\n`
+    + `        const index = previous ? output.system.findIndex((part) => part.includes(previous.value)) : -1;\n`
+    + `        if (index >= 0) output.system[index] = output.system[index].replace(previous.value, () => value);\n`
+    + `        else if (!output.system.length) output.system.push(value);\n`
+    + `        else output.system[0] += "\\n\\n" + value;\n`
+    + `        injected.set(output.system, { task, value });\n`
+    + `      }\n`
     + `      catch (error) { await client.app.log({ body: { service: "continuitydb", level: "warn", message: error.message } }).catch(() => {}); }\n`
     + `    },\n`
     + `    "experimental.session.compacting": async (input, output) => { try { output.context.push(await contextFor(input.sessionID, tasks.get(input.sessionID))); } catch (error) { await client.app.log({ body: { service: "continuitydb", level: "warn", message: error.message } }).catch(() => {}); } },\n`
-    + `    event: async ({ event }) => { if (event.type === "session.deleted") { tasks.delete(event.properties?.info?.id || event.properties?.id); injected.delete(event.properties?.info?.id || event.properties?.id); } },\n`
+    + `    event: async ({ event }) => { if (event.type === "session.deleted") tasks.delete(event.properties?.info?.id || event.properties?.id); },\n`
     + `    tool: {\n`
     + `      continuitydb_memory_search: tool({ description: "Search durable memory for the current Git project only.", args: { query: tool.schema.string().min(1).max(8000) }, execute: async ({ query }, context) => { const project = await projectFor(context.directory || context.worktree); return JSON.stringify(await run(fixedArgs(project, "search", [query, "--allow-projects", project.id, "--top-k", "8"]), project.id), null, 2); } }),\n`
     + `      continuitydb_context: tool({ description: "Retrieve a bounded ContinuityDB context pack for the current Git project.", args: { task: tool.schema.string().min(1).max(8000) }, execute: async ({ task }, context) => contextFor(context.sessionID, task, context.directory || context.worktree) }),\n`

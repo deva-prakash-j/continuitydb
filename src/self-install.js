@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   rmdirSync,
   realpathSync,
   renameSync,
@@ -63,6 +64,22 @@ function isManagedLauncher(path, managedRoot) {
   const target = resolve(dirname(path), readlinkSync(path));
   const value = relative(managedRoot, target);
   return value === "" || (value !== ".." && !value.startsWith(`..${sep}`));
+}
+
+function isManagedWindowsLauncher(path, managedRoot) {
+  // Windows launchers are copies, not links. Match an already installed release
+  // before staging the incoming version, including installs predating manifests.
+  if (!lstatSync(path).isFile()) return false;
+  assertNoSymlinkAncestors(managedRoot);
+  if (!existsSync(managedRoot)) return false;
+  const digest = sha256(path);
+  return readdirSync(managedRoot, { withFileTypes: true }).some((entry) => {
+    if (!entry.isDirectory() || entry.isSymbolicLink()
+      || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(entry.name)) return false;
+    const binary = join(managedRoot, entry.name, "continuitydb.exe");
+    const metadata = lstatSafe(binary);
+    return Boolean(metadata?.isFile() && !metadata.isSymbolicLink() && sha256(binary) === digest);
+  });
 }
 
 function backupLauncher(path, installationPrefix, createdDirectories) {
@@ -209,12 +226,11 @@ export function installStandaloneBinary({
   if (existsSync(versionedBinary) && sha256(versionedBinary) !== sha256(sourcePath)) {
     throw new Error(`versioned installation already exists with different content: ${versionedBinary}`);
   }
-  if (originalLauncher.existed && platform !== "win32") {
-    const managed = originalLauncher.type === "link"
-      && isManagedLauncher(launcher, join(installationPrefix, "lib", "continuitydb"));
-    if (!managed && !force) throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
-  } else if (originalLauncher.existed && platform === "win32"
-    && !(originalLauncher.type === "file" && originalVersioned.existed && sha256(launcher) === sha256(versionedBinary)) && !force) {
+  const managedRoot = join(installationPrefix, "lib", "continuitydb");
+  const launcherManaged = originalLauncher.existed && (platform === "win32"
+    ? originalLauncher.type === "file" && isManagedWindowsLauncher(launcher, managedRoot)
+    : originalLauncher.type === "link" && isManagedLauncher(launcher, managedRoot));
+  if (originalLauncher.existed && !launcherManaged && !force) {
     throw new Error(`refusing to replace existing launcher without --force: ${launcher}`);
   }
 
@@ -248,9 +264,7 @@ export function installStandaloneBinary({
     }
 
     if (originalLauncher.existed) {
-      const managed = platform !== "win32" && originalLauncher.type === "link"
-        && isManagedLauncher(launcher, join(installationPrefix, "lib", "continuitydb"));
-      if (!managed) launcherBackup = backupLauncher(launcher, installationPrefix, createdDirectories);
+      if (!launcherManaged) launcherBackup = backupLauncher(launcher, installationPrefix, createdDirectories);
       unlinkSync(launcher);
       launcherExpected = entrySnapshot(launcher);
     }

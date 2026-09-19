@@ -191,6 +191,58 @@ test("standalone installer refuses to replace an unmanaged launcher", () => {
   }
 });
 
+test("Windows managed launcher upgrades without force and keeps previous version bytes", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-upgrade-"));
+  const source = join(root, "downloaded-continuitydb.exe");
+  const prefix = join(root, "prefix");
+  const options = { source, prefix, standalone: true, platform: "win32", apply: true };
+  try {
+    writeFileSync(source, "old-version");
+    const first = installStandaloneBinary({ ...options, version: "1.0.0" });
+    writeFileSync(source, "new-version");
+    const second = installStandaloneBinary({ ...options, version: "1.1.0" });
+    assert.equal(second.installed, true);
+    assert.equal(second.launcher_backup, null);
+    assert.equal(readFileSync(second.launcher, "utf8"), "new-version");
+    assert.equal(readFileSync(first.versioned_binary, "utf8"), "old-version");
+    assert.equal(readFileSync(second.versioned_binary, "utf8"), "new-version");
+    assert.equal(installStandaloneBinary({ ...options, version: "1.1.0" }).installed, true);
+
+    writeFileSync(second.launcher, "user-owned-replacement");
+    assert.throws(() => installStandaloneBinary({ ...options, version: "1.2.0" }), /without --force/);
+    assert.equal(readFileSync(second.launcher, "utf8"), "user-owned-replacement");
+    assert.equal(existsSync(join(prefix, "lib", "continuitydb", "1.2.0")), false);
+    const forced = installStandaloneBinary({ ...options, version: "1.2.0", force: true });
+    assert.equal(readFileSync(forced.launcher_backup, "utf8"), "user-owned-replacement");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Windows managed upgrade restores the prior launcher when commit fails", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-rollback-"));
+  const source = join(root, "downloaded-continuitydb.exe");
+  const prefix = join(root, "prefix");
+  const options = { source, prefix, standalone: true, platform: "win32", apply: true };
+  const previousNodeEnv = process.env.NODE_ENV;
+  try {
+    process.env.NODE_ENV = "test";
+    writeFileSync(source, "old-version");
+    const first = installStandaloneBinary({ ...options, version: "1.0.0" });
+    writeFileSync(source, "new-version");
+    assert.throws(() => installStandaloneBinary({
+      ...options, version: "1.1.0",
+      _testBeforeLauncherCommit: () => { throw new Error("forced Windows launcher failure"); },
+    }), /forced Windows launcher failure/);
+    assert.equal(readFileSync(first.launcher, "utf8"), "old-version");
+    assert.equal(readFileSync(first.versioned_binary, "utf8"), "old-version");
+    assert.equal(existsSync(join(prefix, "lib", "continuitydb", "1.1.0")), false);
+    assert.equal(installStandaloneBinary({ ...options, version: "1.1.0" }).installed, true);
+  } finally {
+    if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+    else process.env.NODE_ENV = previousNodeEnv;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("standalone installer rolls back a failed fresh installation", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-fresh-rollback-"));
   const source = join(root, "downloaded-continuitydb");
