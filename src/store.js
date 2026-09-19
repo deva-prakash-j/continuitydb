@@ -9,7 +9,6 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
 import { acquireVaultInitializationLock } from "./file-lock.js";
 import { normalizeGraphProjection } from "./graph/model.js";
 import {
@@ -33,6 +32,16 @@ const LOCAL_TENANT = "local";
 const MAX_BODY_BYTES = 1_000_000;
 const HANDOFF_TRANSITION = Symbol("validated-handoff-transition");
 const DEFAULT_HANDOFF_ACTIVATION_TTL_SECONDS = 86_400;
+
+export class CanonicalProjectionError extends Error {
+  constructor(cause) {
+    super(`Memory transaction committed; canonical projection is pending recovery: ${cause.message}`, { cause });
+    this.name = "CanonicalProjectionError";
+    this.code = "CANONICAL_PROJECTION_PENDING";
+    this.committed = true;
+    this.recovery_pending = true;
+  }
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -512,11 +521,11 @@ export class ContextVault {
     this.indexDir = join(rootDir, "index");
     this.linksPath = join(rootDir, "project-links.json");
     this.auditPath = join(rootDir, "audit.jsonl");
+    this.readOnly = readOnly;
     this.transactionDepth = 0;
+    this.transactionCanonicalWrites = false;
     if (readOnly) {
-      const databaseUrl = pathToFileURL(join(this.indexDir, "context-vault.db"));
-      databaseUrl.searchParams.set("immutable", "1");
-      this.db = new DatabaseSync(databaseUrl.href, { readOnly: true });
+      this.db = new DatabaseSync(join(this.indexDir, "context-vault.db"), { readOnly: true });
       this.db.exec("PRAGMA foreign_keys = ON;");
       return;
     }
@@ -572,6 +581,11 @@ export class ContextVault {
         idempotency_key TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS canonical_record_writes (
+        record_id TEXT PRIMARY KEY,
+        contents TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS idx_memory_scope_status
@@ -858,6 +872,9 @@ export class ContextVault {
     const canonicalCount = readdirSync(this.recordsDir).filter((name) => name.endsWith(".md")).length;
     if (Number(indexed) === 0 && canonicalCount > 0) this.rebuildIndex();
       this.loadProjectLinks();
+    } catch (error) {
+      this.db?.close();
+      throw error;
     } finally {
       releaseInitializationLock();
     }
@@ -973,10 +990,55 @@ export class ContextVault {
   }
 
   writeCanonical(record) {
-    const destination = this.recordPath(record.id);
+    if (this.transactionDepth === 0) {
+      throw new Error("canonical writes require a memory transaction");
+    }
+    this.db.prepare(`
+      INSERT INTO canonical_record_writes(record_id, contents) VALUES (?, ?)
+      ON CONFLICT(record_id) DO UPDATE SET contents = excluded.contents
+    `).run(record.id, serializeRecord(record));
+    this.transactionCanonicalWrites = true;
+  }
+
+  writeCanonicalFile(id, contents) {
+    const destination = this.recordPath(id);
     const temporary = `${destination}.${process.pid}.tmp`;
-    writeFileSync(temporary, serializeRecord(record), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
     renameSync(temporary, destination);
+  }
+
+  // Only drain previously committed writes, before staging any new writes in
+  // this transaction. Holding SQLite's writer lock prevents an older projection
+  // from overwriting a newer committed revision or tombstone.
+  flushCanonicalWritesUnsafe() {
+    if (this.transactionCanonicalWrites) {
+      throw new Error("cannot project canonical writes before their transaction commits");
+    }
+    try {
+      const pending = this.db.prepare("SELECT record_id, contents FROM canonical_record_writes ORDER BY record_id").all();
+      const remove = this.db.prepare("DELETE FROM canonical_record_writes WHERE record_id = ?");
+      for (const item of pending) {
+        this.writeCanonicalFile(item.record_id, item.contents);
+        remove.run(item.record_id);
+      }
+    } catch (error) {
+      throw new CanonicalProjectionError(error);
+    }
+  }
+
+  flushCanonicalWrites() {
+    if (this.transactionDepth > 0) throw new Error("cannot flush canonical writes inside a memory transaction");
+    let started = false;
+    try {
+      if (!this.db.prepare("SELECT 1 FROM canonical_record_writes LIMIT 1").get()) return;
+      this.db.exec("BEGIN IMMEDIATE");
+      started = true;
+      this.flushCanonicalWritesUnsafe();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      if (started) this.db.exec("ROLLBACK");
+      throw error instanceof CanonicalProjectionError ? error : new CanonicalProjectionError(error);
+    }
   }
 
   audit(operation, targetId, result, actor = "local-user") {
@@ -1116,16 +1178,22 @@ export class ContextVault {
     if (this.transactionDepth > 0) return operation();
     this.db.exec("BEGIN IMMEDIATE");
     this.transactionDepth += 1;
+    let result;
     try {
-      const result = operation();
+      result = operation();
       this.db.exec("COMMIT");
-      return result;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     } finally {
       this.transactionDepth -= 1;
+      this.transactionCanonicalWrites = false;
     }
+    // Canonical files are a replayable projection of committed transactions.
+    // Never put this flush inside the rollback catch: the memory transaction
+    // has already committed, even if a filesystem write subsequently fails.
+    this.flushCanonicalWrites();
+    return result;
   }
 
   addGraphMemoryEvidence(normalized) {
@@ -1639,7 +1707,7 @@ export class ContextVault {
       ? normalized.metadata_json
       : JSON.stringify(normalized.metadata_json || {});
     this.db.prepare(`
-        INSERT OR REPLACE INTO memory_records (
+        INSERT INTO memory_records (
           id, tenant_id, owner_id, agent_id, namespace_id, project_id, type, subject_key, title, body, status,
           importance, confidence, sensitivity, source_type, source_uri,
           repo_path, symbol, git_commit, branch, tags_json, metadata_json,
@@ -1652,6 +1720,40 @@ export class ContextVault {
           @valid_from, @valid_to, @observed_at, @stale, @version, @expires_at, @supersedes_id, @handoff_sequence,
           @content_hash, @idempotency_key, @created_at, @updated_at
         )
+        ON CONFLICT(id) DO UPDATE SET
+          tenant_id = excluded.tenant_id,
+          owner_id = excluded.owner_id,
+          agent_id = excluded.agent_id,
+          namespace_id = excluded.namespace_id,
+          project_id = excluded.project_id,
+          type = excluded.type,
+          subject_key = excluded.subject_key,
+          title = excluded.title,
+          body = excluded.body,
+          status = excluded.status,
+          importance = excluded.importance,
+          confidence = excluded.confidence,
+          sensitivity = excluded.sensitivity,
+          source_type = excluded.source_type,
+          source_uri = excluded.source_uri,
+          repo_path = excluded.repo_path,
+          symbol = excluded.symbol,
+          git_commit = excluded.git_commit,
+          branch = excluded.branch,
+          tags_json = excluded.tags_json,
+          metadata_json = excluded.metadata_json,
+          valid_from = excluded.valid_from,
+          valid_to = excluded.valid_to,
+          observed_at = excluded.observed_at,
+          stale = excluded.stale,
+          version = excluded.version,
+          expires_at = excluded.expires_at,
+          supersedes_id = excluded.supersedes_id,
+          handoff_sequence = excluded.handoff_sequence,
+          content_hash = excluded.content_hash,
+          idempotency_key = excluded.idempotency_key,
+          created_at = excluded.created_at,
+          updated_at = excluded.updated_at
       `).run(normalized);
 
     this.db.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(normalized.id);
@@ -1675,127 +1777,140 @@ export class ContextVault {
   }
 
   propose(input, { actor = "local-user", handoffSequence = null } = {}) {
-    assertContentLimits(input);
-    assertNoCredentialLikeContent(input);
-    const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
-    const ownerId = requiredString(input.owner_id || "local-user", "owner_id");
-    const namespaceId = requiredString(input.namespace_id || PERSONAL_NAMESPACE, "namespace_id");
-    const body = requiredString(input.body, "body");
-    const idempotencyKey = input.idempotency_key?.trim() || null;
-    const agentId = input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null;
+    return this.runTransaction(() => {
+      assertContentLimits(input);
+      assertNoCredentialLikeContent(input);
+      const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
+      const ownerId = requiredString(input.owner_id || "local-user", "owner_id");
+      const namespaceId = requiredString(input.namespace_id || PERSONAL_NAMESPACE, "namespace_id");
+      const body = requiredString(input.body, "body");
+      const idempotencyKey = input.idempotency_key?.trim() || null;
+      const agentId = input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null;
 
-    if (idempotencyKey) {
-      const existing = this.db
-        .prepare("SELECT * FROM memory_records WHERE tenant_id = ? AND owner_id = ? AND namespace_id = ? AND COALESCE(agent_id, '') = COALESCE(?, '') AND idempotency_key = ?")
-        .get(tenantId, ownerId, namespaceId, agentId, idempotencyKey);
-      if (existing) return { duplicate: true, record: existing };
-    }
+      if (idempotencyKey) {
+        const existing = this.db
+          .prepare("SELECT * FROM memory_records WHERE tenant_id = ? AND owner_id = ? AND namespace_id = ? AND COALESCE(agent_id, '') = COALESCE(?, '') AND idempotency_key = ?")
+          .get(tenantId, ownerId, namespaceId, agentId, idempotencyKey);
+        if (existing) return { duplicate: true, record: existing };
+      }
 
-    const contentHash = hashText(
-      `${tenantId}\u0000${ownerId}\u0000${namespaceId}\u0000${input.branch || ""}\u0000${input.type || "fact"}\u0000${body.toLowerCase()}`,
-    );
-    if (!input.allow_duplicate_content) {
-      const duplicate = this.db
-        .prepare("SELECT * FROM memory_records WHERE tenant_id = ? AND content_hash = ? AND status != 'tombstoned'")
-        .get(tenantId, contentHash);
-      if (duplicate) return { duplicate: true, record: duplicate };
-    }
+      const contentHash = hashText(
+        `${tenantId}\u0000${ownerId}\u0000${namespaceId}\u0000${input.branch || ""}\u0000${input.type || "fact"}\u0000${body.toLowerCase()}`,
+      );
+      if (!input.allow_duplicate_content) {
+        const effectiveTime = nowIso();
+        const duplicate = this.db.prepare(`
+          SELECT * FROM memory_records
+          WHERE tenant_id = ? AND content_hash = ?
+            AND status IN ('active', 'proposed', 'quarantined')
+            AND (expires_at IS NULL OR expires_at > ?)
+            AND (valid_from IS NULL OR valid_from <= ?)
+            AND (valid_to IS NULL OR valid_to > ?)
+            AND stale = 0
+        `).get(tenantId, contentHash, effectiveTime, effectiveTime, effectiveTime);
+        if (duplicate) return { duplicate: true, record: duplicate };
+      }
 
-    const timestamp = nowIso();
-    const record = {
-      id: randomUUID(),
-      tenant_id: tenantId,
-      owner_id: ownerId,
-      agent_id: agentId,
-      namespace_id: namespaceId,
-      project_id: input.project_id?.trim() || null,
-      type: input.type?.trim() || "fact",
-      subject_key: input.subject_key ? requiredIdentifier(input.subject_key, "subject_key") : null,
-      title: input.title?.trim() || body.slice(0, 100),
-      body,
-      status: PROPOSED,
-      importance: clamp(Number(input.importance ?? 0.5), 0, 1),
-      confidence: clamp(Number(input.confidence ?? 1), 0, 1),
-      sensitivity: input.sensitivity?.trim() || "private",
-      source_type: input.source_type?.trim() || "user-explicit",
-      source_uri: input.source_uri?.trim() || null,
-      repo_path: input.repo_path?.trim() || null,
-      symbol: input.symbol?.trim() || null,
-      git_commit: input.git_commit?.trim() || null,
-      branch: input.branch?.trim() || null,
-      tags_json: JSON.stringify(normalizeTags(input.tags)),
-      metadata_json: JSON.stringify(input.metadata && typeof input.metadata === "object" ? input.metadata : {}),
-      valid_from: optionalIso(input.valid_from, "valid_from"),
-      valid_to: optionalIso(input.valid_to, "valid_to"),
-      observed_at: optionalIso(input.observed_at, "observed_at") || timestamp,
-      stale: input.stale ? 1 : 0,
-      version: Number.isInteger(input.version) && input.version > 0 ? input.version : 1,
-      expires_at: optionalIso(input.expires_at, "expires_at"),
-      supersedes_id: input.supersedes_id || null,
-      handoff_sequence: handoffSequence,
-      content_hash: contentHash,
-      idempotency_key: idempotencyKey,
-      created_at: timestamp,
-      updated_at: timestamp,
-    };
+      const timestamp = nowIso();
+      const record = {
+        id: randomUUID(),
+        tenant_id: tenantId,
+        owner_id: ownerId,
+        agent_id: agentId,
+        namespace_id: namespaceId,
+        project_id: input.project_id?.trim() || null,
+        type: input.type?.trim() || "fact",
+        subject_key: input.subject_key ? requiredIdentifier(input.subject_key, "subject_key") : null,
+        title: input.title?.trim() || body.slice(0, 100),
+        body,
+        status: PROPOSED,
+        importance: clamp(Number(input.importance ?? 0.5), 0, 1),
+        confidence: clamp(Number(input.confidence ?? 1), 0, 1),
+        sensitivity: input.sensitivity?.trim() || "private",
+        source_type: input.source_type?.trim() || "user-explicit",
+        source_uri: input.source_uri?.trim() || null,
+        repo_path: input.repo_path?.trim() || null,
+        symbol: input.symbol?.trim() || null,
+        git_commit: input.git_commit?.trim() || null,
+        branch: input.branch?.trim() || null,
+        tags_json: JSON.stringify(normalizeTags(input.tags)),
+        metadata_json: JSON.stringify(input.metadata && typeof input.metadata === "object" ? input.metadata : {}),
+        valid_from: optionalIso(input.valid_from, "valid_from"),
+        valid_to: optionalIso(input.valid_to, "valid_to"),
+        observed_at: optionalIso(input.observed_at, "observed_at") || timestamp,
+        stale: input.stale ? 1 : 0,
+        version: Number.isInteger(input.version) && input.version > 0 ? input.version : 1,
+        expires_at: optionalIso(input.expires_at, "expires_at"),
+        supersedes_id: input.supersedes_id || null,
+        handoff_sequence: handoffSequence,
+        content_hash: contentHash,
+        idempotency_key: idempotencyKey,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
 
-    if (record.valid_from && record.valid_to && record.valid_from >= record.valid_to) {
-      throw new Error("valid_from must be earlier than valid_to");
-    }
+      if (record.valid_from && record.valid_to && record.valid_from >= record.valid_to) {
+        throw new Error("valid_from must be earlier than valid_to");
+      }
 
-    this.writeCanonical(record);
-    this.indexRecord(record);
-    this.audit("propose", record.id, "created", actor);
-    return { duplicate: false, record };
+      this.writeCanonical(record);
+      this.indexRecord(record);
+      this.audit("propose", record.id, "created", actor);
+      return { duplicate: false, record };
+    });
   }
 
   commit(id, { actor = "local-user", handoffTransition = null } = {}) {
-    const current = this.get(id, { includeInactive: true });
-    if (!current) throw new Error(`memory ${id} not found`);
-    if (current.status === ACTIVE) return current;
-    if (current.status !== PROPOSED) throw new Error(`memory ${id} is ${current.status}, not proposed`);
-    if (current.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
-      throw new Error("handoff transitions must use saveHandoff or approve so lineage and quota policy is enforced");
-    }
+    return this.runTransaction(() => {
+      const current = this.get(id, { includeInactive: true });
+      if (!current) throw new Error(`memory ${id} not found`);
+      if (current.status === ACTIVE) return current;
+      if (current.status !== PROPOSED) throw new Error(`memory ${id} is ${current.status}, not proposed`);
+      if (current.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
+        throw new Error("handoff transitions must use saveHandoff or approve so lineage and quota policy is enforced");
+      }
 
-    const record = { ...current, status: ACTIVE, updated_at: nowIso() };
-    this.writeCanonical(record);
-    this.indexRecord(record);
-    this.audit("commit", id, "active", actor);
-    return record;
+      const record = { ...current, status: ACTIVE, updated_at: nowIso() };
+      this.writeCanonical(record);
+      this.indexRecord(record);
+      this.audit("commit", id, "active", actor);
+      return record;
+    });
   }
 
   capture(assessment, { actor = "local-agent", handoffSequence = null, handoffTransition = null } = {}) {
-    if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
-      throw new Error("capture assessment has an invalid disposition");
-    }
-    if (assessment.record?.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
-      throw new Error("handoff captures must use saveHandoff so lineage and quota policy is enforced");
-    }
-    const proposed = this.propose(assessment.record, { actor, handoffSequence });
-    if (proposed.duplicate) {
+    return this.runTransaction(() => {
+      if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
+        throw new Error("capture assessment has an invalid disposition");
+      }
+      if (assessment.record?.type === "handoff" && handoffTransition !== HANDOFF_TRANSITION) {
+        throw new Error("handoff captures must use saveHandoff so lineage and quota policy is enforced");
+      }
+      const proposed = this.propose(assessment.record, { actor, handoffSequence });
+      if (proposed.duplicate) {
+        return {
+          duplicate: true,
+          disposition: proposed.record.status,
+          reason: "matching memory already exists",
+          record: proposed.record,
+        };
+      }
+      let record = proposed.record;
+      if (assessment.disposition === ACTIVE) record = this.commit(record.id, { actor, handoffTransition });
+      else if (assessment.disposition === "quarantined") {
+        record = { ...record, status: "quarantined", updated_at: nowIso() };
+        this.writeCanonical(record);
+        this.indexRecord(record);
+        this.audit("capture-quarantine", record.id, assessment.reason, actor);
+      }
+      this.audit("capture-decision", record.id, `${assessment.disposition}:${assessment.reason}`, actor);
       return {
-        duplicate: true,
-        disposition: proposed.record.status,
-        reason: "matching memory already exists",
-        record: proposed.record,
+        duplicate: false,
+        disposition: assessment.disposition,
+        reason: assessment.reason,
+        record,
       };
-    }
-    let record = proposed.record;
-    if (assessment.disposition === ACTIVE) record = this.commit(record.id, { actor, handoffTransition });
-    else if (assessment.disposition === "quarantined") {
-      record = { ...record, status: "quarantined", updated_at: nowIso() };
-      this.writeCanonical(record);
-      this.indexRecord(record);
-      this.audit("capture-quarantine", record.id, assessment.reason, actor);
-    }
-    this.audit("capture-decision", record.id, `${assessment.disposition}:${assessment.reason}`, actor);
-    return {
-      duplicate: false,
-      disposition: assessment.disposition,
-      reason: assessment.reason,
-      record,
-    };
+    });
   }
 
   findActiveConflict({ tenant_id, owner_id, project_id, subject_key, body, branch = null }) {
@@ -2845,100 +2960,106 @@ export class ContextVault {
   }
 
   revisePending(id, replacement, reason, { actor = "local-user" } = {}) {
-    const current = this.get(id, { includeInactive: true });
-    if (!current) throw new Error(`memory ${id} not found`);
-    if (![PROPOSED, "quarantined"].includes(current.status)) {
-      throw new Error(`memory ${id} is ${current.status}, not reviewable`);
-    }
-    const correctionReason = requiredString(reason, "reason");
-    const confidence = replacement.confidence === undefined ? current.confidence : Number(replacement.confidence);
-    const importance = replacement.importance === undefined ? current.importance : Number(replacement.importance);
-    if (!Number.isFinite(confidence) || !Number.isFinite(importance)) throw new Error("confidence and importance must be finite numbers");
-    const handoffFields = correctedHandoffFields(current, replacement);
-    const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
-    const next = {
-      ...current,
-      title: effectiveReplacement.title === undefined ? current.title : requiredString(effectiveReplacement.title, "title"),
-      body: effectiveReplacement.body === undefined ? current.body : requiredString(effectiveReplacement.body, "body"),
-      branch: effectiveReplacement.branch === undefined
-        ? current.branch
-        : effectiveReplacement.branch ? requiredIdentifier(effectiveReplacement.branch, "branch") : null,
-      git_commit: effectiveReplacement.git_commit === undefined ? current.git_commit : effectiveReplacement.git_commit,
-      confidence: clamp(confidence, 0, 1),
-      importance: clamp(importance, 0, 1),
-      tags_json: effectiveReplacement.tags === undefined ? current.tags_json : JSON.stringify(normalizeTags(effectiveReplacement.tags)),
-      metadata_json: effectiveReplacement.metadata === undefined
-        ? current.metadata_json
-        : JSON.stringify(effectiveReplacement.metadata),
-      status: PROPOSED,
-      source_type: "human-reviewed-proposal",
-      updated_at: nowIso(),
-    };
-    assertContentLimits({ ...next, metadata: JSON.parse(next.metadata_json || "{}") });
-    assertNoCredentialLikeContent({ ...next, correction_reason: correctionReason });
-    next.content_hash = hashText(
-      `${next.tenant_id}\u0000${next.owner_id}\u0000${next.namespace_id}\u0000${next.branch || ""}\u0000${next.type}\u0000${next.body.toLowerCase()}`,
-    );
-    this.writeCanonical(next);
-    this.indexRecord(next);
-    this.audit("revise-pending", id, correctionReason, actor);
-    return next;
+    return this.runTransaction(() => {
+      const current = this.get(id, { includeInactive: true });
+      if (!current) throw new Error(`memory ${id} not found`);
+      if (![PROPOSED, "quarantined"].includes(current.status)) {
+        throw new Error(`memory ${id} is ${current.status}, not reviewable`);
+      }
+      const correctionReason = requiredString(reason, "reason");
+      const confidence = replacement.confidence === undefined ? current.confidence : Number(replacement.confidence);
+      const importance = replacement.importance === undefined ? current.importance : Number(replacement.importance);
+      if (!Number.isFinite(confidence) || !Number.isFinite(importance)) throw new Error("confidence and importance must be finite numbers");
+      const handoffFields = correctedHandoffFields(current, replacement);
+      const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
+      const next = {
+        ...current,
+        title: effectiveReplacement.title === undefined ? current.title : requiredString(effectiveReplacement.title, "title"),
+        body: effectiveReplacement.body === undefined ? current.body : requiredString(effectiveReplacement.body, "body"),
+        branch: effectiveReplacement.branch === undefined
+          ? current.branch
+          : effectiveReplacement.branch ? requiredIdentifier(effectiveReplacement.branch, "branch") : null,
+        git_commit: effectiveReplacement.git_commit === undefined ? current.git_commit : effectiveReplacement.git_commit,
+        confidence: clamp(confidence, 0, 1),
+        importance: clamp(importance, 0, 1),
+        tags_json: effectiveReplacement.tags === undefined ? current.tags_json : JSON.stringify(normalizeTags(effectiveReplacement.tags)),
+        metadata_json: effectiveReplacement.metadata === undefined
+          ? current.metadata_json
+          : JSON.stringify(effectiveReplacement.metadata),
+        status: PROPOSED,
+        source_type: "human-reviewed-proposal",
+        updated_at: nowIso(),
+      };
+      assertContentLimits({ ...next, metadata: JSON.parse(next.metadata_json || "{}") });
+      assertNoCredentialLikeContent({ ...next, correction_reason: correctionReason });
+      next.content_hash = hashText(
+        `${next.tenant_id}\u0000${next.owner_id}\u0000${next.namespace_id}\u0000${next.branch || ""}\u0000${next.type}\u0000${next.body.toLowerCase()}`,
+      );
+      this.writeCanonical(next);
+      this.indexRecord(next);
+      this.audit("revise-pending", id, correctionReason, actor);
+      return next;
+    });
   }
 
   correct(id, replacement, reason) {
-    const current = this.get(id);
-    if (!current) throw new Error(`active memory ${id} not found`);
-    const correctionReason = requiredString(reason, "reason");
-    assertNoCredentialLikeContent({ body: correctionReason });
-    const handoffFields = correctedHandoffFields(current, replacement);
-    const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
-    const proposal = this.propose({
-      title: current.title,
-      body: current.body,
-      sensitivity: current.sensitivity,
-      source_uri: current.source_uri,
-      repo_path: current.repo_path,
-      symbol: current.symbol,
-      git_commit: current.git_commit,
-      branch: current.branch,
-      tags: JSON.parse(current.tags_json || "[]"),
-      metadata: JSON.parse(current.metadata_json || "{}"),
-      valid_from: current.valid_from,
-      valid_to: current.valid_to,
-      expires_at: current.expires_at,
-      importance: current.importance,
-      confidence: current.confidence,
-      ...effectiveReplacement,
-      tenant_id: current.tenant_id,
-      owner_id: current.owner_id,
-      agent_id: current.agent_id,
-      namespace_id: replacement.namespace_id || current.namespace_id,
-      project_id: replacement.project_id ?? current.project_id,
-      type: replacement.type || current.type,
-      subject_key: current.subject_key,
-      source_type: "user-correction",
-      supersedes_id: id,
-      version: Number(current.version || 1) + 1,
-      allow_duplicate_content: true,
-    }, { handoffSequence: current.type === "handoff" ? this.nextHandoffSequence() : null });
-    const committed = this.commit(proposal.record.id, {
-      handoffTransition: current.type === "handoff" ? HANDOFF_TRANSITION : null,
+    return this.runTransaction(() => {
+      const current = this.get(id);
+      if (!current) throw new Error(`active memory ${id} not found`);
+      const correctionReason = requiredString(reason, "reason");
+      assertNoCredentialLikeContent({ body: correctionReason });
+      const handoffFields = correctedHandoffFields(current, replacement);
+      const effectiveReplacement = handoffFields === null ? replacement : { ...replacement, ...handoffFields };
+      const proposal = this.propose({
+        title: current.title,
+        body: current.body,
+        sensitivity: current.sensitivity,
+        source_uri: current.source_uri,
+        repo_path: current.repo_path,
+        symbol: current.symbol,
+        git_commit: current.git_commit,
+        branch: current.branch,
+        tags: JSON.parse(current.tags_json || "[]"),
+        metadata: JSON.parse(current.metadata_json || "{}"),
+        valid_from: current.valid_from,
+        valid_to: current.valid_to,
+        expires_at: current.expires_at,
+        importance: current.importance,
+        confidence: current.confidence,
+        ...effectiveReplacement,
+        tenant_id: current.tenant_id,
+        owner_id: current.owner_id,
+        agent_id: current.agent_id,
+        namespace_id: replacement.namespace_id || current.namespace_id,
+        project_id: replacement.project_id ?? current.project_id,
+        type: replacement.type || current.type,
+        subject_key: current.subject_key,
+        source_type: "user-correction",
+        supersedes_id: id,
+        version: Number(current.version || 1) + 1,
+        allow_duplicate_content: true,
+      }, { handoffSequence: current.type === "handoff" ? this.nextHandoffSequence() : null });
+      const committed = this.commit(proposal.record.id, {
+        handoffTransition: current.type === "handoff" ? HANDOFF_TRANSITION : null,
+      });
+      const updatedOld = { ...current, status: "superseded", updated_at: nowIso() };
+      this.writeCanonical(updatedOld);
+      this.indexRecord(updatedOld);
+      this.audit("correct", id, `superseded-by:${committed.id};reason:${correctionReason}`);
+      return committed;
     });
-    const updatedOld = { ...current, status: "superseded", updated_at: nowIso() };
-    this.writeCanonical(updatedOld);
-    this.indexRecord(updatedOld);
-    this.audit("correct", id, `superseded-by:${committed.id};reason:${correctionReason}`);
-    return committed;
   }
 
   forget(id, reason = "user-request") {
-    const current = this.get(id, { includeInactive: true });
-    if (!current) throw new Error(`memory ${id} not found`);
-    const record = { ...current, status: "tombstoned", updated_at: nowIso() };
-    this.writeCanonical(record);
-    this.indexRecord(record);
-    this.audit("forget", id, "tombstoned");
-    return { id, status: record.status, recoverable: true };
+    return this.runTransaction(() => {
+      const current = this.get(id, { includeInactive: true });
+      if (!current) throw new Error(`memory ${id} not found`);
+      const record = { ...current, status: "tombstoned", updated_at: nowIso() };
+      this.writeCanonical(record);
+      this.indexRecord(record);
+      this.audit("forget", id, "tombstoned");
+      return { id, status: record.status, recoverable: true };
+    });
   }
 
   linkProjects({
@@ -3086,34 +3207,54 @@ export class ContextVault {
   }
 
   rebuildIndex() {
-    const records = readdirSync(this.recordsDir)
-      .filter((name) => name.endsWith(".md"))
-      .sort()
-      .map((name) => {
-        const record = parseRecord(readFileSync(join(this.recordsDir, name), "utf8"));
-        requiredString(record.id, "record.id");
-        requiredString(record.owner_id, "record.owner_id");
-        requiredString(record.namespace_id, "record.namespace_id");
-        requiredString(record.body, "record.body");
-        if (!["proposed", "active", "superseded", "tombstoned", "quarantined"].includes(record.status)) {
-          throw new Error(`invalid record status for ${record.id}`);
-        }
-        assertNoCredentialLikeContent(record);
-        return record;
-      });
-    this.runTransaction(() => {
-      this.db.exec("DELETE FROM memory_fts; DELETE FROM memory_records;");
+    if (this.transactionDepth > 0) throw new Error("cannot rebuild inside a memory transaction");
+    return this.runTransaction(() => {
+      // These are older committed writes, not writes staged by this rebuild.
+      // Drain while holding the writer lock, then read one canonical snapshot.
+      this.flushCanonicalWritesUnsafe();
+      const ids = new Set();
+      const records = readdirSync(this.recordsDir)
+        .filter((name) => name.endsWith(".md"))
+        .sort()
+        .map((name) => {
+          const record = parseRecord(readFileSync(join(this.recordsDir, name), "utf8"));
+          requiredString(record.id, "record.id");
+          requiredString(record.owner_id, "record.owner_id");
+          requiredString(record.namespace_id, "record.namespace_id");
+          requiredString(record.body, "record.body");
+          if (ids.has(record.id)) throw new Error(`duplicate canonical record id: ${record.id}`);
+          ids.add(record.id);
+          if (!["proposed", "active", "superseded", "tombstoned", "quarantined"].includes(record.status)) {
+            throw new Error(`invalid record status for ${record.id}`);
+          }
+          assertNoCredentialLikeContent(record);
+          return record;
+        });
+      for (const { id } of this.db.prepare("SELECT id FROM memory_records").all()) {
+        if (!ids.has(id)) throw new Error(`canonical record ${id} is missing; refusing a destructive rebuild`);
+      }
+      this.db.exec("DELETE FROM memory_fts;");
       for (const record of records) this.indexRecordUnsafe(record);
+      this.audit("index-rebuild", "all", `records:${records.length}`);
+      return { records: records.length };
     });
-    this.audit("index-rebuild", "all", `records:${records.length}`);
-    return { records: records.length };
   }
 
   exportJsonl() {
-    return readdirSync(this.recordsDir)
-      .filter((name) => name.endsWith(".md"))
-      .sort()
-      .map((name) => JSON.stringify(parseRecord(readFileSync(join(this.recordsDir, name), "utf8"))))
-      .join("\n");
+    if (this.transactionDepth > 0) throw new Error("cannot export inside a memory transaction");
+    if (this.readOnly) {
+      // A read-only reader cannot drain the canonical outbox. Export its
+      // committed SQLite snapshot instead of possibly stale canonical files.
+      return this.db.prepare("SELECT * FROM memory_records ORDER BY id").all()
+        .map((record) => JSON.stringify(record)).join("\n");
+    }
+    return this.runTransaction(() => {
+      this.flushCanonicalWritesUnsafe();
+      return readdirSync(this.recordsDir)
+        .filter((name) => name.endsWith(".md"))
+        .sort()
+        .map((name) => JSON.stringify(parseRecord(readFileSync(join(this.recordsDir, name), "utf8"))))
+        .join("\n");
+    });
   }
 }
