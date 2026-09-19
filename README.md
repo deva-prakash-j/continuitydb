@@ -956,8 +956,18 @@ grants tool permission or becomes executable policy.
 
 ## Storage and recovery
 
-Embedded mode stores canonical Markdown records separately from SQLite indexes.
-The index can be rebuilt from canonical records. Audit events form a hash chain
+Embedded mode stores canonical Markdown records separately from SQLite query
+projections. Since 0.9.1, each memory transaction also stores pending canonical
+contents in SQLite; files are published only after commit. Writable startup,
+export, and rebuild finish interrupted publication. A post-commit filesystem error
+reports `CANONICAL_PROJECTION_PENDING`, `committed: true`, and
+`recovery_pending: true`: resolve the I/O problem and reopen the vault, then use
+the same idempotency key when retrying. Do not interpret this result as rejection.
+
+Search can be rebuilt from canonical records without deleting existing memory
+links or feedback. SQLite also contains durable feedback, audit, and pending
+publication state, so deleting the database is not a lossless rebuild procedure.
+Record-only JSONL export is not a complete backup. Audit events form a hash chain
 inside a transactionally serialized SQLite table, so processes sharing one home
 cannot append from stale cached heads. Legacy JSONL migration validates and
 preserves the original predecessor/event hashes. A broken historical chain or a
@@ -968,6 +978,7 @@ invalid rather than silently replaced with a newly valid-looking chain.
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
 encryption and remote signed audit checkpoints are not implemented in v0.6.
+For upgrade/downgrade precautions, see [the 0.9.1 release notes](docs/releases/v0.9.1.md).
 
 ## Deployment and scale
 

@@ -5,6 +5,37 @@ after the first stable release.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-09-19
+
+### Storage and recovery
+
+- Make memory mutation, idempotency, and canonical-file recovery cooperate across
+  transaction failures and process interruptions using a durable projection outbox.
+  Report committed-but-pending projections explicitly instead of implying rejection.
+- Preserve feedback and memory links during index rebuild; stop replacement inserts
+  from deleting another acknowledged record during concurrent idempotent capture.
+- Allow equivalent fresh captures after content expiry, independently of explicit
+  retry keys, and inspect live SQLite WAL state correctly through read-only access.
+
+### Access and lifecycle
+
+- Validate Host/Origin boundaries for unauthenticated loopback HTTP/MCP access.
+- Honor configured capture policy in local lifecycle hooks, keep automatic checkpoint
+  lineage branch-specific, and preserve exact OIDC issuer identifiers.
+
+### Client and graph correctness
+
+- Reject conflicting project-root registrations before modifying the registry.
+- Preserve selected tenant/owner/sensitivity in global OpenCode installation and
+  inject recalled context into every model request, not only the first task request.
+- Recognize previously managed Windows installations during ordinary upgrades.
+- Preserve Java UTF-16 offsets around astral characters; invalidate old graph
+  extractor generations so corrected routes are rebuilt from unchanged source.
+
+See `docs/releases/v0.9.1.md` for upgrade and verification details. Older versions
+must not write concurrently with a 0.9.1 store. Back up the full stopped vault,
+not canonical records alone: feedback, audit, and pending projections are durable.
+
 ## [0.9.0] - 2026-09-14
 
 - Added deterministic native code-graph extraction for Java/Spring, structured

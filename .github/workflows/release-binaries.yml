@@ -35,6 +35,8 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run test:clients
+      - name: Verify managed Windows upgrade and rollback contract
+        run: node --test --test-name-pattern="Windows managed" test/self-install.test.js
       - run: npm run validate:clients
       - run: npm run validate:release-workflow
       - run: npm run build:binary

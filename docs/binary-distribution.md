@@ -185,11 +185,17 @@ created immutable backup artifacts; a later failure restores the original
 client files and removes backup files/directories created by that failed
 batch.
 
-For an existing valid vault, setup inspects SQLite through immutable read-only
+For an existing valid vault, setup inspects SQLite through WAL-aware read-only
 mode and never includes `index/` or `records/` in its rollback set. A failed
 connector update therefore cannot rewind WAL commits or canonical records made
 concurrently after setup began. Incomplete vault initialization and local or
 external model-cache changes retain their scoped rollback behavior.
+
+Before upgrading to 0.9.1, stop every writer and back up the full vault directory.
+The first writable open adds a canonical-publication outbox; read-only inspection
+does not migrate or drain it. Do not run an older writer concurrently, delete the
+SQLite file to rebuild search, or restore only record files over an existing vault.
+See [0.9.1 recovery notes](releases/v0.9.1.md).
 
 ## Release integrity
 

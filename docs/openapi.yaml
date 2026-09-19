@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: ContinuityDB API
-  version: 0.9.0
+  version: 0.9.1
   description: Versioned REST and Streamable HTTP MCP API for governed, portable agent memory and context packs.
 servers:
   - url: http://127.0.0.1:7331
@@ -82,6 +82,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/SearchRequest" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200":
           description: ACL-filtered results
           content:
@@ -121,6 +122,7 @@ paths:
                 graph_max_visited: { type: integer, minimum: 25, maximum: 2000, default: 400 }
                 graph_max_paths: { type: integer, minimum: 1, maximum: 200, default: 40 }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200":
           description: Token-bounded cited context pack with actual retrieval mode and fallback telemetry
           content:
@@ -140,6 +142,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/MemoryInput" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Proposal created }
         "200": { description: Existing idempotent proposal returned }
   /v1/memories:
@@ -171,6 +174,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/CaptureRequest" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Capture evaluated and persisted }
         "200": { description: Existing idempotent capture returned }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -185,6 +189,7 @@ paths:
     delete:
       operationId: forgetMemory
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200": { description: Tombstoned; purge is an asynchronous policy action }
   /v1/memories/{id}/commit:
     post:
@@ -192,6 +197,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/MemoryId"
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200": { description: Proposed or quarantined memory explicitly approved and optionally indexed }
         "409": { description: Handoff approval rejected because its predecessor is no longer the latest active checkpoint }
   /v1/memories/{id}/revisions:
@@ -220,6 +226,7 @@ paths:
                     tags: { type: array, maxItems: 64, items: { type: string } }
                     handoff: { $ref: "#/components/schemas/HandoffPatch" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200": { description: Held memory corrected and returned to proposed status }
   /v1/memories/{id}/corrections:
     post:
@@ -247,6 +254,7 @@ paths:
                     tags: { type: array, maxItems: 64, items: { type: string } }
                     handoff: { $ref: "#/components/schemas/HandoffPatch" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200": { description: New active version created; prior version superseded }
   /v1/memories/{id}/feedback:
     post:
@@ -264,17 +272,20 @@ paths:
                 signal: { type: string, enum: [helpful, incorrect, outdated] }
                 reason: { type: string, maxLength: 2000 }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "200": { description: Non-destructive feedback recorded }
         "404": { description: Memory is not visible to this caller }
   /v1/project-links:
     post:
       operationId: linkProjects
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Project graph edge created }
   /v1/memory-links:
     post:
       operationId: linkMemories
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Temporal memory graph edge created }
   /v1/handoffs:
     post:
@@ -289,6 +300,7 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/HandoffRequest" }
       responses:
+        "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Structured checkpoint evaluated by capture policy and saved as active, proposed, or quarantined }
         "200": { description: Existing idempotent checkpoint returned }
   /v1/handoffs/latest:
@@ -338,6 +350,19 @@ components:
       required: true
       schema: { type: string, format: uuid }
   responses:
+    CommittedRecoveryPending:
+      description: A memory transaction committed; canonical-file recovery is pending. Preserve the original idempotency key and recover before retrying.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error, code, committed, recovery_pending, request_id]
+            properties:
+              error: { type: string, const: "write committed; canonical recovery is pending" }
+              code: { type: string, const: CANONICAL_PROJECTION_PENDING }
+              committed: { type: boolean, const: true }
+              recovery_pending: { type: boolean, const: true }
+              request_id: { type: string }
     Unauthorized: { description: Missing or invalid bearer token }
     Forbidden: { description: Caller lacks scope or project/sensitivity grant }
   schemas:
