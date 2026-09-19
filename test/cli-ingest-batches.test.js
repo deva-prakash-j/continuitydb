@@ -110,3 +110,31 @@ test("CLI empty incremental ingestion is a successful no-op", () => {
     finally { vault.close(); }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("CLI explicit commit approves a previously proposed repository scan without changing IDs", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-approve-ingest-"));
+  const repository = join(root, "repo");
+  const home = join(root, "vault");
+  mkdirSync(repository);
+  try {
+    git(repository, "init");
+    writeFileSync(join(repository, "README.md"), "Synthetic proposal approval repository.\n");
+    git(repository, "add", ".");
+    git(repository, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture");
+    const proposed = importRepository(repository, home);
+    assert.equal(proposed.committed, false);
+    assert.deepEqual(proposed.ingested_statuses, { proposed: 1 });
+    const before = new ContextVault(home);
+    let id;
+    try { id = before.db.prepare("SELECT id FROM memory_records").get().id; }
+    finally { before.close(); }
+    const approved = importRepository(repository, home, "--commit");
+    assert.equal(approved.committed, true);
+    assert.deepEqual(approved.ingested_statuses, { active: 1 });
+    const after = new ContextVault(home);
+    try {
+      const records = after.db.prepare("SELECT id, status FROM memory_records").all();
+      assert.deepEqual(records.map((record) => ({ ...record })), [{ id, status: "active" }]);
+    } finally { after.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
