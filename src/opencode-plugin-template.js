@@ -1,8 +1,8 @@
 import { resolve } from "node:path";
 import { validateTokenEnvironmentName } from "./http-client.js";
-import { checkpointSaveOutcome, linkCheckpointToLatest } from "./lifecycle-lineage.js";
+import { checkpointSaveOutcome } from "./lifecycle-lineage.js";
 import { validateProjectId } from "./project-identity.js";
-import { requiredIdentifier } from "./security.js";
+import { committedRecoveryOutcome, requiredIdentifier } from "./security.js";
 
 const SENSITIVITIES = new Set(["public", "private", "sensitive", "restricted"]);
 
@@ -65,8 +65,12 @@ export function renderOpenCodePlugin({
     + `const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;\n`
     + `const MAX_CHECKPOINT_BYTES = 128 * 1024;\n`
     + `const CHECKPOINT_FIELDS = new Set(["project_id","task_id","goal","current_state","completed_work","unresolved_questions","next_actions","relevant_files","state","branch","git_commit","checkpoint_id","previous_checkpoint_id","sensitivity"]);\n\n`
-    + `const linkCheckpointToLatest = ${linkCheckpointToLatest.toString()};\n\n`
     + `const checkpointSaveOutcome = ${checkpointSaveOutcome.toString()};\n\n`
+    + `const committedRecoveryOutcome = ${committedRecoveryOutcome.toString()};\n\n`
+    + `function committedRecoveryError(value) {\n`
+    + `  const outcome = committedRecoveryOutcome(value);\n`
+    + `  return outcome ? Object.assign(new Error(outcome.error), outcome) : null;\n`
+    + `}\n\n`
     + `function hookArguments(action, file = null) {\n`
     + `  const args = ["hook", action, "--client", "opencode", "--project", CONFIG.projectId, "--home", CONFIG.home, "--tenant-id", CONFIG.tenantId, "--owner-id", CONFIG.ownerId, "--agent-id", "opencode", "--allowed-sensitivities", CONFIG.sensitivities.join(",")];\n`
     + `  if (action === "session-start") {\n`
@@ -85,7 +89,14 @@ export function renderOpenCodePlugin({
     + `      if (error) {\n`
     + `        let outcome = null;\n`
     + `        if (action === "checkpoint" && stdout) { try { outcome = JSON.parse(String(stdout)); } catch {} }\n`
-    + `        if (outcome && !outcome.saved) { reject(new Error("not saved: ContinuityDB handoff disposition=" + String(outcome.disposition || "missing") + " status=" + String(outcome.status || "missing") + (outcome.reason ? " (" + outcome.reason + ")" : ""))); return; }\n`
+    + `        const outputRecovery = committedRecoveryError(outcome);\n`
+    + `        if (outputRecovery) { reject(outputRecovery); return; }\n`
+    + `        for (const line of String(stderr).split(/\\r?\\n/)) {\n`
+    + `          let diagnostic; try { diagnostic = JSON.parse(line); } catch { continue; }\n`
+    + `          const recovery = committedRecoveryError(diagnostic);\n`
+    + `          if (recovery) { reject(recovery); return; }\n`
+    + `        }\n`
+    + `        if (outcome && !(outcome.accepted ?? outcome.saved)) { reject(new Error("not saved: ContinuityDB handoff disposition=" + String(outcome.disposition || "missing") + " status=" + String(outcome.status || "missing") + (outcome.reason ? " (" + outcome.reason + ")" : ""))); return; }\n`
     + `        reject(new Error((String(stderr).trim() || error.message) + " (exit " + String(error.code) + ")")); return;\n`
     + `      }\n`
     + `      resolve(String(stdout));\n`
@@ -109,7 +120,7 @@ export function renderOpenCodePlugin({
     + `  if (response.body) for await (const chunk of response.body) { size += chunk.byteLength; if (size > MAX_RESPONSE_BYTES) { await response.body.cancel().catch(() => {}); throw new Error("ContinuityDB response is too large"); } chunks.push(Buffer.from(chunk)); }\n`
     + `  const text = Buffer.concat(chunks, size).toString("utf8");\n`
     + `  const value = text ? JSON.parse(text) : {};\n`
-    + `  if (!response.ok) { const error = new Error(value.error || "ContinuityDB returned HTTP " + response.status); error.statusCode = response.status; throw error; }\n`
+    + `  if (!response.ok) { const error = committedRecoveryError(value) || new Error(value.error || "ContinuityDB returned HTTP " + response.status); error.statusCode = response.status; throw error; }\n`
     + `  return value;\n`
     + `}\n\n`
     + `async function remoteContext() {\n`
@@ -143,19 +154,12 @@ export function renderOpenCodePlugin({
     + `  } finally { await handle.close(); }\n`
     + `}\n\n`
     + `async function saveRemoteCheckpoint(checkpoint) {\n`
-    + `  const value = { ...checkpoint };\n`
-    + `  if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {\n`
-    + `    const query = new URLSearchParams({ project_id: CONFIG.projectId, task_id: value.task_id, ...(value.branch ? { branch: value.branch } : {}) });\n`
-    + `    try {\n`
-    + `      const latest = await request("v1/handoffs/latest?" + query);\n`
-    + `      Object.assign(value, linkCheckpointToLatest(value, latest));\n`
-    + `    } catch (error) { if (error.statusCode !== 404) throw new Error("not saved: " + error.message); }\n`
-    + `  }\n`
+    + `  const value = { ...checkpoint, auto_link_previous: true };\n`
     + `  let result;\n`
     + `  try { result = await request("v1/handoffs", { method: "POST", body: value, idempotencyKey: value.checkpoint_id }); }\n`
-    + `  catch (error) { throw new Error("not saved: " + error.message); }\n`
+    + `  catch (error) { if (committedRecoveryOutcome(error)) throw error; throw new Error("not saved: " + error.message); }\n`
     + `  const outcome = checkpointSaveOutcome(result);\n`
-    + `  if (!outcome.saved || outcome.checkpoint_id !== value.checkpoint_id) throw new Error("not saved: ContinuityDB handoff disposition=" + outcome.disposition + " status=" + outcome.status + " (" + outcome.reason + ")");\n`
+    + `  if (!(outcome.accepted ?? outcome.saved) || outcome.checkpoint_id !== value.checkpoint_id) throw new Error("not saved: ContinuityDB handoff disposition=" + outcome.disposition + " status=" + outcome.status + " (" + outcome.reason + ")");\n`
     + `  return outcome;\n`
     + `}\n\n`
     + `export const ContinuityDBPlugin = async ({ directory }) => ({\n`

@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from "
 import { loadLifecycleContext, saveLifecycleCheckpoint } from "./lifecycle-context.js";
 import { checkpointSaveOutcome } from "./lifecycle-lineage.js";
 import { isDirectEntrypoint } from "./direct-entry.js";
+import { committedRecoveryOutcome } from "./security.js";
 
 const MAX_CHECKPOINT_BYTES = 128 * 1024;
 const CHECKPOINT_FIELDS = new Set([
@@ -167,14 +168,14 @@ export async function runLifecycleHook(argv = process.argv.slice(2), io = proces
     });
     const outcome = checkpointSaveOutcome(result);
     io.stdout.write(`${JSON.stringify(flags.verbose || !outcome.saved ? outcome : {})}\n`);
-    if (!outcome.saved) return 1;
+    if (!(outcome.accepted ?? outcome.saved)) return 1;
   } else {
     io.stdout.write(`Usage:\n  continuitydb hook session-start --project ID [--task-id ID] [--task TEXT] [--branch REF] [--client claude|cursor]\n  continuitydb hook checkpoint --project ID --file HANDOFF.json [--verbose]\n`);
     return command ? 1 : 0;
   }
   return 0;
   } catch (error) {
-    io.stderr.write(`${JSON.stringify({ error: error.message, command })}\n`);
+    io.stderr.write(`${JSON.stringify({ ...(committedRecoveryOutcome(error) || { error: error.message }), command })}\n`);
     return 1;
   }
 }
