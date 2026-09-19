@@ -41,6 +41,40 @@ function snapshotTree(root) {
   return entries;
 }
 
+function assertSetupPreservesVault(home, before) {
+  const after = snapshotTree(home);
+  const walPath = "index/context-vault.db-wal";
+  const shmPath = "index/context-vault.db-shm";
+  const previousWal = before.find((entry) => entry.path === walPath);
+  const currentWal = after.find((entry) => entry.path === walPath);
+  const previousShm = before.find((entry) => entry.path === shmPath);
+  const currentShm = after.find((entry) => entry.path === shmPath);
+
+  // A WAL-aware reader may create empty sidecars for a checkpointed database.
+  // Never exclude an existing WAL or a newly created WAL containing any bytes.
+  const newEmptyWal = !previousWal && currentWal;
+  if (newEmptyWal) {
+    assert.equal(currentWal.type, "file");
+    assert.equal(currentWal.bytes, 0, "read-only inspection must not create WAL frames");
+  }
+  // SHM is SQLite's volatile WAL-index/read-mark coordination, not record data.
+  // Existing SHM topology, permissions and size still have to be preserved.
+  if (previousShm) {
+    assert.ok(currentShm, "setup removed existing SQLite coordination state");
+    const { sha256: _beforeHash, ...previousMetadata } = previousShm;
+    const { sha256: _afterHash, ...currentMetadata } = currentShm;
+    assert.deepEqual(currentMetadata, previousMetadata);
+  } else if (currentShm) {
+    assert.equal(currentShm.type, "file");
+    assert.ok(currentShm.bytes > 0, "new SQLite coordination state must not be empty");
+  }
+  assert.deepEqual(
+    after.filter((entry) => entry.path !== shmPath && !(newEmptyWal && entry.path === walPath)),
+    before.filter((entry) => entry.path !== shmPath),
+    "setup changed persistent vault files, existing WAL bytes, or unrelated files",
+  );
+}
+
 function forceSetupConnectorFailure({ cli, home, project }) {
   mkdirSync(join(project, ".codex"), { recursive: true });
   writeFileSync(join(project, ".codex", "config.toml"), 'model = "gpt-5"\n');
@@ -930,15 +964,24 @@ test("CLI failed setup restores a pre-existing empty index directory byte-for-by
   }
 });
 
-test("CLI failed setup restores a pre-existing valid vault database byte-for-byte", () => {
+test("CLI failed setup preserves a closed vault's persistent bytes and logical records", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-valid-db-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
   const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  let vault;
   try {
     mkdirSync(project);
     const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
     assert.equal(init.status, 0, init.stderr);
+    vault = new ContextVault(home);
+    const memory = vault.approve(vault.propose({
+      body: "Preserve the reviewed billing constraint during setup.", project_id: "cli-test",
+    }).record.id);
+    const logicalBefore = vault.stats();
+    assert.equal(logicalBefore.audit.valid, true);
+    vault.close();
+    vault = null;
     writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
     const before = snapshotTree(home);
     mkdirSync(join(project, ".codex"), { recursive: true });
@@ -947,8 +990,14 @@ test("CLI failed setup restores a pre-existing valid vault database byte-for-byt
       cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
-    assert.deepEqual(snapshotTree(home), before);
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assertSetupPreservesVault(home, before);
+    assert.equal(readFileSync(join(project, ".codex", "config.toml"), "utf8"), 'model = "gpt-5"\n');
+    vault = new ContextVault(home, { readOnly: true });
+    assert.deepEqual({ ...vault.get(memory.id) }, memory);
+    assert.deepEqual(vault.stats(), logicalBefore);
   } finally {
+    vault?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -976,18 +1025,23 @@ test("CLI setup refuses to place a new database beside pre-existing WAL or SHM s
   }
 });
 
-test("CLI failed setup preserves live SQLite WAL and SHM state across restart", { skip: process.platform === "win32" }, () => {
+test("CLI failed setup preserves live SQLite WAL bytes and logical records across restart", { skip: process.platform === "win32" }, () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-wal-rollback-"));
   const project = join(root, "project");
   const home = join(root, "vault");
   const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
-  let database;
+  let vault;
   try {
     mkdirSync(project);
     const init = spawnSync(process.execPath, [cli, "init", "--home", home], { encoding: "utf8" });
     assert.equal(init.status, 0, init.stderr);
-    database = new DatabaseSync(join(home, "index", "context-vault.db"));
-    database.exec("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS rollback_probe(value TEXT); INSERT INTO rollback_probe VALUES ('before');");
+    vault = new ContextVault(home);
+    vault.db.exec("PRAGMA wal_autocheckpoint=0; CREATE TABLE IF NOT EXISTS rollback_probe(value TEXT); INSERT INTO rollback_probe VALUES ('before');");
+    const memory = vault.approve(vault.propose({
+      body: "Preserve this committed WAL-only billing constraint.", project_id: "cli-test",
+    }).record.id);
+    const logicalBefore = vault.stats();
+    assert.equal(logicalBefore.audit.valid, true);
     assert.equal(existsSync(join(home, "index", "context-vault.db-wal")), true);
     assert.equal(existsSync(join(home, "index", "context-vault.db-shm")), true);
     writeFileSync(join(home, "backups"), "pre-existing backup blocker\n");
@@ -998,12 +1052,18 @@ test("CLI failed setup preserves live SQLite WAL and SHM state across restart", 
       cli, "setup", "--home", home, "--project-dir", project, "--project", "cli-test", "--agents", "codex", "--apply",
     ], { encoding: "utf8" });
     assert.notEqual(result.status, 0);
-    assert.deepEqual(snapshotTree(home), before);
-    database.close();
-    database = new DatabaseSync(join(home, "index", "context-vault.db"));
-    assert.equal(database.prepare("SELECT value FROM rollback_probe").get().value, "before");
+    assert.match(result.stderr, /backup parent must be a real directory/);
+    assertSetupPreservesVault(home, before);
+    assert.equal(readFileSync(join(project, ".codex", "config.toml"), "utf8"), 'model = "gpt-5"\n');
+    assert.deepEqual({ ...vault.get(memory.id) }, memory);
+    assert.deepEqual(vault.stats(), logicalBefore);
+    vault.close();
+    vault = new ContextVault(home, { readOnly: true });
+    assert.equal(vault.db.prepare("SELECT value FROM rollback_probe").get().value, "before");
+    assert.deepEqual({ ...vault.get(memory.id) }, memory);
+    assert.deepEqual(vault.stats(), logicalBefore);
   } finally {
-    database?.close();
+    vault?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

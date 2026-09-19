@@ -197,6 +197,14 @@ does not migrate or drain it. Do not run an older writer concurrently, delete th
 SQLite file to rebuild search, or restore only record files over an existing vault.
 See [0.9.1 recovery notes](releases/v0.9.1.md).
 
+SQLite read-only inspection can create an empty `context-vault.db-wal` and its
+`context-vault.db-shm` coordination file when opening a checkpointed WAL-mode
+database. It can also update read marks in an existing SHM file. These are
+SQLite coordination effects, not memory commits: the inspection does not change
+the main database, existing WAL bytes, canonical records, configuration, or
+logical records/audit state. Do not delete or restore live sidecars to make directory
+snapshots byte-identical; doing so can disrupt other database connections.
+
 ## Release integrity
 
 Each workflow artifact includes a `.sha256` file. Tagged GitHub releases also
