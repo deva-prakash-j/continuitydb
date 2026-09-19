@@ -71,6 +71,21 @@ test("registration preserves unknown config keys and writes config mode 0600", (
   }
 });
 
+test("registration rejects an alternate ID for an existing root before preview or write", () => {
+  const { root, home, identity } = fixture();
+  try {
+    registerProject(home, identity, { apply: true });
+    const path = join(home, "config.json");
+    const before = readFileSync(path);
+    for (const apply of [false, true]) {
+      assert.throws(() => registerProject(home, { ...identity, id: "renamed-project", source: "explicit" }, { apply }),
+        /root .*already registered as billing-api/);
+      assert.deepEqual(readFileSync(path), before);
+      assert.deepEqual(listRegisteredProjects(home), [identity]);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("listing a missing registry is read-only and invalid registries fail closed", () => {
   const { root, home } = fixture();
   try {

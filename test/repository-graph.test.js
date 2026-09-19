@@ -165,6 +165,19 @@ test("invalidated extractors and failed publication keep the active graph readab
   } finally { f.cleanup(); }
 });
 
+test("current extractor reparses unchanged files from the pre-Unicode-fix generation", () => {
+  const f = fixture();
+  try {
+    buildRepositoryGraph(f.vault, f.repo, { projectId: "orders", extractorVersion: "repository-graph-v1" });
+    const upgraded = buildRepositoryGraph(f.vault, f.repo, { projectId: "orders" });
+    assert.equal(upgraded.parsed_files, 4);
+    assert.equal(upgraded.reused_files, 0);
+    const repeated = buildRepositoryGraph(f.vault, f.repo, { projectId: "orders" });
+    assert.equal(repeated.parsed_files, 0);
+    assert.equal(repeated.reused_files, 4);
+  } finally { f.cleanup(); }
+});
+
 test("incomplete snapshots and extractor errors refuse publication with diagnostics", () => {
   const truncated = fixture();
   try {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { extractJavaSpring } from "../src/graph/java-spring-extractor.js";
+import { extractJavaSpring, tokenizeJava } from "../src/graph/java-spring-extractor.js";
 
 const source = `package com.acme;
 import org.springframework.web.bind.annotation.RestController;
@@ -30,6 +30,19 @@ const input = {
   tenantId: "tenant-a", projectId: "orders", repoPath: "src/main/java/com/acme/OrderController.java",
   commit: "abcdef1", branch: "main", text: source,
 };
+
+test("astral characters preserve Java source offsets and Spring routes", () => {
+  for (const prefix of ["// 🙂 comment\n", "/* 🛠 comment */\n", 'class Banner { String label = "🙂"; }\n']) {
+    const text = `${prefix}@RestController class Orders { @GetMapping("/orders/🚀") void list() {} }`;
+    const tokens = tokenizeJava(text);
+    const route = tokens.find((token) => token.type === "string" && token.value.startsWith("/orders"));
+    assert.ok(route, `route literal missing after ${prefix}`);
+    assert.equal(route.value, "/orders/🚀");
+    assert.equal(text.slice(route.start, route.end), '"/orders/🚀"');
+    const result = extractJavaSpring({ ...input, text });
+    assert.ok(result.edges.some((edge) => edge.relation === "exposes" && edge.target.qualified_name === "GET /orders/🚀"));
+  }
+});
 
 function relations(result) {
   const nodes = new Map(result.nodes.map((node) => [node.id, node]));

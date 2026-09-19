@@ -197,7 +197,7 @@ export async function saveLifecycleCheckpoint({
       principal_id: identity.principal_id,
       agent_id: identity.agent_id,
     };
-    const policy = new CapturePolicy(loadCapturePolicy(null));
+    const policy = new CapturePolicy(loadCapturePolicy(env.CONTINUITYDB_CAPTURE_POLICY_FILE || null));
     return vault.saveHandoff(input, {
       assessment: policy.evaluateHandoff(input, identity, vault),
       actor: `${identity.principal_id}/${identity.agent_id}`,

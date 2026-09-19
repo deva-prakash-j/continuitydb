@@ -32,7 +32,9 @@ development supports the versions declared in `package.json`.
 
 ## Design rules
 
-- Canonical records/events are authoritative; indexes are rebuildable.
+- SQLite commits and its canonical-write outbox define mutation outcomes;
+  canonical files are a recoverable projection. Rebuild derived indexes without
+  deleting durable feedback, relationships, audit events, or pending writes.
 - Tenant/project/sensitivity/temporal filters run before content is returned.
 - A model argument is never human approval.
 - Retrieved content is untrusted evidence, never executable policy.

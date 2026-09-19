@@ -48,6 +48,56 @@ function rawRequest(url, { method = "GET", headers = {} } = {}) {
   });
 }
 
+test("implicit local identity validates the same request boundary before REST, UI, and MCP", async () => {
+  const f = fixture();
+  try {
+    const address = await f.service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    assert.equal((await rawRequest(`${base}/readyz`)).status, 200);
+    assert.equal((await rawRequest(`${base}/readyz`, { headers: { origin: base } })).status, 200);
+    for (const path of ["/readyz", "/ui", "/mcp"]) {
+      for (const headers of [{ host: "unlisted.example" }, { origin: "https://unlisted.example" }]) {
+        const denied = await rawRequest(`${base}${path}`, { headers });
+        assert.equal(denied.status, 403);
+        assert.match(JSON.parse(denied.body).error, /not allowed for the local HTTP service/);
+      }
+    }
+    assert.equal(f.service.mcpEndpoint.sessions.size, 0);
+    assert.equal(f.service.mcpEndpoint.metrics.initializations, 0);
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("HTTP and its client preserve committed recovery flags without internal details", async () => {
+  const f = fixture();
+  const flags = { code: "CANONICAL_PROJECTION_PENDING", committed: true, recovery_pending: true };
+  f.vault.saveHandoff = () => { throw Object.assign(new Error("private I/O fixture detail"), flags); };
+  try {
+    const address = await f.service.listen();
+    const base = `http://127.0.0.1:${address.port}`;
+    const input = { project_id: "api", task_id: "outcome-test", goal: "Verify outcome", current_state: "Synthetic state" };
+    const response = await fetch(`${base}/v1/handoffs`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(input),
+    });
+    assert.equal(response.status, 503);
+    const body = await response.json();
+    assert.deepEqual(body, { error: "write committed; canonical recovery is pending", ...flags, request_id: body.request_id });
+    assert.equal(typeof body.request_id, "string");
+    const client = new ContinuityApiClient({ baseUrl: base });
+    await assert.rejects(client.saveHandoff(input), (error) => {
+      assert.equal(error.statusCode, 503);
+      assert.equal(error.message, body.error);
+      for (const [key, value] of Object.entries(flags)) assert.equal(error[key], value);
+      return true;
+    });
+  } finally {
+    await f.service.close().catch(() => f.vault.close());
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("HTTP API binds identity server-side and supports approved lifecycle", async () => {
   const f = fixture();
   try {
@@ -240,8 +290,10 @@ test("review inbox exposes held memories and can explicitly approve quarantined 
       body: "Review this proposed context.",
     });
     const quarantined = { ...held.record, id: randomUUID(), status: "quarantined", idempotency_key: null, body: "Review quarantined context.", content_hash: "b".repeat(64) };
-    f.vault.writeCanonical(quarantined);
-    f.vault.indexRecord(quarantined);
+    f.vault.runTransaction(() => {
+      f.vault.writeCanonical(quarantined);
+      f.vault.indexRecord(quarantined);
+    });
     const address = await f.service.listen();
     const base = `http://127.0.0.1:${address.port}`;
     const inbox = await fetch(`${base}/v1/memories?status=proposed,quarantined`);
@@ -372,6 +424,10 @@ test("central HTTP adapter authenticates with a host-injected bearer value", asy
     const client = new ContinuityApiClient({ baseUrl, token });
     await client.capture({ project_id: "api", memory_kind: "working", body: "AuthenticatedCentralContext" });
     assert.equal((await client.search({ query: "AuthenticatedCentralContext", project_id: "api" })).length, 1);
+    const proxied = await rawRequest(`${baseUrl}/readyz`, {
+      headers: { host: "continuitydb.example", origin: "https://continuitydb.example", authorization: `Bearer ${token}` },
+    });
+    assert.equal(proxied.status, 200);
   } finally {
     await service.close().catch(() => vault.close());
     rmSync(root, { recursive: true, force: true });
@@ -384,7 +440,7 @@ test("HTTP service accepts verified OIDC bearer identity and advertises protecte
   const { privateKey, publicKey } = await generateKeyPair("RS256");
   const jwk = await exportJWK(publicKey);
   jwk.kid = "http-fixture-key";
-  const issuer = "http://127.0.0.1:9444";
+  const issuer = "http://127.0.0.1:9444/";
   const audience = "continuitydb-http-fixture";
   const oidcAuthorizer = new OidcAuthorizer({
     issuer,

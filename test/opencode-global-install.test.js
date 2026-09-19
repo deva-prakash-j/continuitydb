@@ -33,12 +33,19 @@ function repository(parent, name) {
   return repo;
 }
 
-function run(args, cwd = process.cwd()) {
+function run(args, cwd = process.cwd(), environment = {}) {
   return spawnSync(process.execPath, [cli, ...args], { cwd, encoding: "utf8", env: {
     ...process.env,
     CONTINUITYDB_EMBEDDING_PROVIDER: "",
     CONTINUITYDB_MODEL_URL: "",
+    ...environment,
   } });
+}
+
+function pluginConfig(path) {
+  const match = readFileSync(path, "utf8").match(/^const CONFIG = Object\.freeze\((.+)\);$/m);
+  assert.ok(match, "generated plugin contains its fixed configuration");
+  return JSON.parse(match[1]);
 }
 
 function optionalText(path) {
@@ -99,6 +106,44 @@ test("global OpenCode install refuses unmanaged, drifted, and symlinked targets"
     assert.throws(() => installGlobalOpenCode({
       home: join(root, "vault"), workspaceRoots: [workspace], configDir, binary: process.execPath, apply: true,
     }), /symbolic link|real directory/i);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("global OpenCode install preserves explicit account and sensitivity settings", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-account-"));
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace);
+  try {
+    const scope = { tenantId: "team-a", ownerId: "owner-a", sensitivities: ["public"] };
+    const options = { home: join(root, "vault"), workspaceRoots: [workspace], configDir: join(root, "config"), binary: process.execPath, ...scope };
+    const result = installGlobalOpenCode({ ...options, apply: true });
+    const config = pluginConfig(result.plugin);
+    for (const [key, value] of Object.entries(scope)) assert.deepEqual(config[key], value);
+    assert.equal(installGlobalOpenCode({ ...options, apply: true }).changed, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("CLI global OpenCode install uses account environment with explicit flag precedence", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-cli-account-"));
+  const workspace = join(root, "workspace");
+  mkdirSync(workspace);
+  try {
+    for (const explicit of [false, true]) {
+      const configDir = join(root, explicit ? "flag-config" : "env-config");
+      const result = run([
+        "opencode", "install", "--workspace-root", workspace, "--home", join(root, "vault"),
+        "--opencode-config-dir", configDir, "--apply",
+        ...(explicit ? ["--tenant", "flag-team", "--owner", "flag-owner", "--sensitivities", "public,private"] : []),
+      ], root, {
+        CONTINUITYDB_TENANT_ID: "env-team", CONTINUITYDB_OWNER_ID: "env-owner",
+        CONTINUITYDB_ALLOWED_SENSITIVITIES: "public",
+      });
+      assert.equal(result.status, 0, result.stderr);
+      const config = pluginConfig(JSON.parse(result.stdout).plugin);
+      assert.equal(config.tenantId, explicit ? "flag-team" : "env-team");
+      assert.equal(config.ownerId, explicit ? "flag-owner" : "env-owner");
+      assert.deepEqual(config.sensitivities, explicit ? ["public", "private"] : ["public"]);
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -174,20 +219,23 @@ test("one global install migrates owned project-local OpenCode adapters under tr
   const repo = repository(workspace, "legacy-service");
   const home = join(root, "vault");
   const configDir = join(root, "opencode-global");
+  const scope = { tenantId: "migration-team", ownerId: "migration-owner", sensitivities: ["public"] };
   try {
     registerProject(home, { id: "default", root: repo, source: "explicit" }, { apply: true });
     connectAgent("opencode", {
       projectDir: repo, projectId: "default", home, apply: true,
       transport: "stdio", projects: ["default"], sensitivities: ["public", "private"],
-      tenantId: "local", ownerId: "local-user", binary: process.execPath,
+      ...scope, binary: process.execPath,
     });
     assert.match(readFileSync(join(repo, "opencode.json"), "utf8"), /continuitydb/);
     assert.match(readFileSync(join(repo, ".opencode", "plugins", "continuitydb.js"), "utf8"), /managed opencode ownership/);
 
     const result = installGlobalOpenCode({
-      home, workspaceRoots: [workspace], configDir, binary: process.execPath, apply: true,
+      home, workspaceRoots: [workspace], configDir, binary: process.execPath, apply: true, ...scope,
     });
     assert.equal(result.verified, true);
+    const config = pluginConfig(result.plugin);
+    for (const [key, value] of Object.entries(scope)) assert.deepEqual(config[key], value);
     assert.deepEqual(result.migrated_projects, [repo]);
     assert.equal(optionalText(join(repo, "opencode.json"))?.includes("continuitydb") || false, false);
     assert.equal(optionalText(join(repo, "AGENTS.md"))?.includes("continuitydb managed policy") || false, false);

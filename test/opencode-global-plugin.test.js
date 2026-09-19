@@ -18,7 +18,7 @@ const value = (name) => { const index = args.indexOf(name); return index < 0 ? n
 if (command === "opencode" && args[1] === "ensure") {
   process.stdout.write(JSON.stringify({ project: { id: "service", root: value("--project-dir"), source: "git" }, changed: false, applied: true }));
 } else if (command === "context") {
-  process.stdout.write(JSON.stringify({ project_id: value("--project"), memories: [{ title: "Repository convention", body: "Use billing-api naming." }] }));
+  process.stdout.write(JSON.stringify({ project_id: value("--project"), task: args[1], memories: [{ title: "Repository convention", body: "Use billing-api naming." }] }));
 } else if (command === "search") {
   process.stdout.write(JSON.stringify({ results: [{ project_id: value("--project"), body: "Scoped search result" }] }));
 } else if (command === "capture") {
@@ -31,10 +31,12 @@ if (command === "opencode" && args[1] === "ensure") {
 }
 
 async function importGenerated(source) {
-  const path = join(process.cwd(), `.opencode-global-plugin-${process.pid}-${Date.now()}-${Math.random()}.mjs`);
-  writeFileSync(path, source, { flag: "wx", mode: 0o600 });
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-generated-plugin-"));
+  const path = join(root, "plugin.mjs");
+  const moduleSource = source.replace('from "@opencode-ai/plugin";', `from ${JSON.stringify(import.meta.resolve("@opencode-ai/plugin"))};`);
+  writeFileSync(path, moduleSource, { flag: "wx", mode: 0o600 });
   try { return await import(`${pathToFileURL(path).href}?v=${Date.now()}`); }
-  finally { rmSync(path, { force: true }); }
+  finally { rmSync(root, { recursive: true, force: true }); }
 }
 
 test("global plugin automatically ensures the Git project and injects first-task context", async () => {
@@ -82,7 +84,7 @@ test("global plugin tools are fixed to the derived project and governed capture"
   const cli = fakeCli(root);
   try {
     const module = await importGenerated(renderGlobalOpenCodePlugin({
-      executable: cli.path, home: join(root, "vault"), workspaceRoots: [workspace],
+      executable: cli.path, home: join(root, "vault"), workspaceRoots: [workspace], sensitivities: ["public"],
     }));
     const hooks = await module.ContinuityDBGlobalPlugin({
       directory: repo, worktree: "/", client: { app: { log: async () => {} } },
@@ -116,6 +118,7 @@ test("global plugin tools are fixed to the derived project and governed capture"
     const calls = readFileSync(cli.log, "utf8").trim().split("\n").map(JSON.parse);
     for (const call of calls.filter((args) => args[0] === "search" || args[0] === "capture")) {
       assert.equal(call[call.indexOf("--project") + 1], "service");
+      if (call[0] === "search") assert.equal(call[call.indexOf("--sensitivities") + 1], "public");
     }
     const captures = calls.filter((args) => args[0] === "capture" && args.includes("Use billing-api naming for public routes."));
     assert.equal(captures.length, 2);
@@ -124,6 +127,51 @@ test("global plugin tools are fixed to the derived project and governed capture"
       captures[0][captures[0].indexOf("--idempotency-key") + 1],
       captures[1][captures[1].indexOf("--idempotency-key") + 1],
     );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("global plugin recalls on every fresh system output and deduplicates within one output", async () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-repeat-recall-"));
+  const workspace = join(root, "workspace");
+  const repo = join(workspace, "service");
+  mkdirSync(join(repo, ".git"), { recursive: true });
+  const cli = fakeCli(root);
+  try {
+    const module = await importGenerated(renderGlobalOpenCodePlugin({
+      executable: cli.path, home: join(root, "vault"), workspaceRoots: [workspace], sensitivities: ["public"],
+    }));
+    const hooks = await module.ContinuityDBGlobalPlugin({
+      directory: repo, client: { app: { log: async () => {} } },
+    });
+    const input = { sessionID: "session-1" };
+    await hooks["chat.message"](input, { parts: [{ type: "text", text: "Continue the billing migration" }] });
+    for (const output of [{ system: ["base prompt"] }, { system: ["base prompt"] }, { system: [] }]) {
+      await Promise.all([
+        hooks["experimental.chat.system.transform"](input, output),
+        hooks["experimental.chat.system.transform"](input, output),
+      ]);
+      assert.match(output.system[0], /Use billing-api naming/);
+      assert.equal(output.system.join("\n").split("# ContinuityDB project: service").length - 1, 1);
+      const before = [...output.system];
+      await hooks["experimental.chat.system.transform"](input, output);
+      assert.deepEqual(output.system, before);
+
+      output.system.splice(0, output.system.length, "replacement base");
+      await hooks["experimental.chat.system.transform"](input, output);
+      assert.match(output.system[0], /replacement base.*\n\n# ContinuityDB/);
+      assert.match(output.system[0], /Use billing-api naming/);
+    }
+    const reused = { system: ["base prompt"] };
+    await hooks["experimental.chat.system.transform"](input, reused);
+    await hooks["chat.message"](input, { parts: [{ type: "text", text: "Review the new naming decision" }] });
+    await hooks["experimental.chat.system.transform"](input, reused);
+    assert.match(reused.system[0], /Review the new naming decision/);
+    assert.doesNotMatch(reused.system[0], /Continue the billing migration/);
+    assert.equal(reused.system[0].split("# ContinuityDB project: service").length - 1, 1);
+    const calls = readFileSync(cli.log, "utf8").trim().split("\n").map(JSON.parse);
+    for (const call of calls.filter((args) => args[0] === "context")) {
+      assert.equal(call[call.indexOf("--sensitivities") + 1], "public");
+    }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

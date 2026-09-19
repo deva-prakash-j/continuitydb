@@ -110,7 +110,19 @@ scope or stale-generation failures. See [graph-first retrieval](graph-first-retr
 
 ## Consistency and failure behavior
 
-- Local canonical files are written atomically before the rebuildable index.
+- Local memory mutations commit record rows, audit entries, and pending canonical
+  contents together in SQLite. Canonical Markdown publication follows commit under
+  the writer lock; a durable outbox replays interrupted file publication on writable
+  startup, export, and rebuild. Uncommitted records are never published as files.
+  A post-commit I/O failure reports `CANONICAL_PROJECTION_PENDING` with
+  `committed: true` and `recovery_pending: true`; it is not a rejected write.
+- FTS/vector/graph projections are rebuildable, but SQLite also holds durable
+  feedback, audit, and pending canonical writes. Preserve the full stopped vault
+  in backups. A record-only export is not a complete database backup.
+- Index rebuild reconciles canonical records in place, retaining linked memories
+  and user feedback. Missing/duplicate canonical IDs fail closed rather than
+  silently deleting dependent data. Explicit transaction nesting cannot publish
+  newly staged canonical records through export/rebuild.
 - Tenant/owner/namespace-scoped idempotency keys prevent duplicate proposals on
   retries without colliding across project boundaries.
 - Handoff idempotency additionally includes task and branch. Retries return the

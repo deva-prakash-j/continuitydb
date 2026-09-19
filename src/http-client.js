@@ -1,4 +1,4 @@
-import { isLoopback } from "./security.js";
+import { committedRecoveryOutcome, isLoopback } from "./security.js";
 
 const MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const TOKEN_ENV_PATTERN = /^[A-Z][A-Z0-9_]{0,127}$/;
@@ -68,6 +68,8 @@ export class ContinuityApiClient {
     if (!response.ok) {
       const error = new Error(value.error || `ContinuityDB returned HTTP ${response.status}`);
       error.statusCode = response.status;
+      const committed = committedRecoveryOutcome(value);
+      if (committed) Object.assign(error, committed);
       throw error;
     }
     return value;

@@ -140,8 +140,12 @@ export function registerProject(home, identity, { apply = false } = {}) {
   try {
     const { path, config, projects } = readConfig(resolvedHome);
     const existing = projects.find((item) => item.id === project.id);
-    if (existing && existing.root !== project.root) {
+    if (existing && rootKey(existing.root) !== rootKey(project.root)) {
       throw new Error(`project ${project.id} is already registered at ${existing.root}`);
+    }
+    const existingRoot = projects.find((item) => rootKey(item.root) === rootKey(project.root));
+    if (existingRoot && existingRoot.id !== project.id) {
+      throw new Error(`project root ${project.root} is already registered as ${existingRoot.id}`);
     }
     const changed = !existing;
     const updated = changed ? [...projects, project] : projects;

@@ -136,7 +136,7 @@ export class ContinuityMcpHttpEndpoint {
     }
   }
 
-  async handle(request, response, identity, readBody) {
+  async handle(request, response, identity, readBody, transportSecurity = null) {
     if (this.closed) return rpcError(response, 503, "MCP endpoint is closed");
     await this.sweepExpired();
     if (this.closed) return rpcError(response, 503, "MCP endpoint is closed");
@@ -160,6 +160,7 @@ export class ContinuityMcpHttpEndpoint {
 
       let entry;
       const transport = new StreamableHTTPServerTransport({
+        ...transportSecurity,
         sessionIdGenerator: () => randomUUID(),
         enableJsonResponse: true,
         onsessioninitialized: (sessionId) => {

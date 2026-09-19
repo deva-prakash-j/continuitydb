@@ -4,7 +4,37 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
-import { loadTokenPolicy, normalizeIdentity, OidcAuthorizer, sha256, TokenAuthorizer, TokenBucketLimiter } from "../src/security.js";
+import {
+  committedRecoveryOutcome, loadTokenPolicy, loopbackHttpRequestSecurity,
+  normalizeIdentity, OidcAuthorizer, sha256, TokenAuthorizer, TokenBucketLimiter,
+} from "../src/security.js";
+
+test("local HTTP request validation accepts only expected loopback authorities and origins", () => {
+  for (const host of ["127.0.0.1:7331", "localhost:7331", "[::1]:7331"]) {
+    const policy = loopbackHttpRequestSecurity({ host, origin: `http://${host}` }, 7331);
+    assert.equal(policy.enableDnsRebindingProtection, true);
+    assert.ok(policy.allowedHosts.includes(host));
+    assert.ok(policy.allowedOrigins.includes(`http://${host}`));
+    assert.doesNotThrow(() => loopbackHttpRequestSecurity({ host }, 7331));
+  }
+  assert.doesNotThrow(() => loopbackHttpRequestSecurity({ host: "localhost", origin: "http://localhost" }, 80));
+  assert.doesNotThrow(() => loopbackHttpRequestSecurity({ host: "localhost:80" }, 80));
+  for (const host of [undefined, "unlisted.example:7331", "localhost:7332", "localhost", ["localhost:7331"]]) {
+    assert.throws(() => loopbackHttpRequestSecurity({ host }, 7331), { code: "FORBIDDEN" });
+  }
+  for (const origin of ["null", "https://localhost:7331", "http://localhost:7332", "https://unlisted.example", ["http://localhost:7331"]]) {
+    assert.throws(() => loopbackHttpRequestSecurity({ host: "localhost:7331", origin }, 7331), { code: "FORBIDDEN" });
+  }
+});
+
+test("committed recovery errors expose only the verified public outcome", () => {
+  const flags = { code: "CANONICAL_PROJECTION_PENDING", committed: true, recovery_pending: true };
+  const result = committedRecoveryOutcome(Object.assign(new Error("private I/O fixture detail"), flags));
+  assert.deepEqual(result, { error: "write committed; canonical recovery is pending", ...flags });
+  assert.equal(committedRecoveryOutcome(new Error("ordinary failure")), null);
+  assert.equal(committedRecoveryOutcome({ ...flags, committed: false }), null);
+  assert.equal(committedRecoveryOutcome({ ...flags, recovery_pending: "true" }), null);
+});
 
 test("token authorization returns only server-owned identity", () => {
   const identity = normalizeIdentity({ tenant_id: "acme", principal_id: "agent-1", scopes: ["memory:read"] });
@@ -104,4 +134,23 @@ test("OIDC configuration refuses plaintext non-loopback issuer and partial setti
     audience: "continuitydb",
     jwksUrl: "https://identity.example/jwks",
   }), /HTTPS/);
+});
+
+test("OIDC preserves exact configured issuer identifiers when verifying valid tokens", async () => {
+  const { privateKey, publicKey } = await generateKeyPair("RS256");
+  const jwk = await exportJWK(publicKey);
+  jwk.kid = "issuer-fixture-key";
+  const jwks = createLocalJWKSet({ keys: [jwk] });
+  for (const issuer of ["https://identity.example", "https://identity.example/", "https://identity.example/tenant/"]) {
+    const authorizer = new OidcAuthorizer({ issuer, audience: "issuer-fixture", jwks });
+    assert.equal(authorizer.issuer, issuer);
+    const token = await new SignJWT({ continuitydb_tenant: "fixture", scope: "memory:read" })
+      .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+      .setSubject("fixture-user")
+      .setIssuer(issuer)
+      .setAudience("issuer-fixture")
+      .setExpirationTime("5m")
+      .sign(privateKey);
+    assert.equal((await authorizer.authorize(`Bearer ${token}`)).principal_id, "fixture-user");
+  }
 });

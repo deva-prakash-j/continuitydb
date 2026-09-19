@@ -1,7 +1,7 @@
 import { graphEdgeId, graphNodeId, normalizeGraphPath } from "./model.js";
 import { requiredIdentifier } from "../security.js";
 
-const EXTRACTOR_VERSION = "java-spring-v1";
+const EXTRACTOR_VERSION = "java-spring-v2";
 const TYPE_WORDS = new Set(["class", "interface", "enum", "record"]);
 const MODIFIERS = new Set(["public", "private", "protected", "static", "final", "abstract", "default", "synchronized", "native", "strictfp", "sealed", "non-sealed", "volatile", "transient"]);
 const SECRET_CONFIGURATION_KEY = /(?:pass(?:word)?|secret|token|api[-_]?key|credential|private[-_]?key|authorization|auth)/i;
@@ -20,7 +20,9 @@ function scopeFor(input) {
 // Retains newlines and quote positions so token offsets remain source offsets. String
 // payload is carried only by a string token and never re-tokenized as Java source.
 function maskJava(text) {
-  const chars = [...text];
+  // Token offsets and String.slice use UTF-16 code units. Keeping both halves
+  // of an astral character preserves later offsets when its payload is masked.
+  const chars = text.split("");
   for (let index = 0; index < chars.length;) {
     if (chars[index] === "/" && chars[index + 1] === "/") {
       const start = index; index += 2;

@@ -606,6 +606,10 @@ checkpoints as well, while exact idempotent retries remain allowed. The first
 checkpoint for a task and branch uses `previous_checkpoint_id: null`; every
 successor must name the current latest checkpoint. This compare-and-set lineage
 quarantines stale or concurrent writers instead of replacing startup context.
+Automatic predecessor selection uses only an exact branch match; a branchless
+checkpoint can still be recalled as fallback without becoming a named branch's
+predecessor. Local lifecycle saves read `CONTINUITYDB_CAPTURE_POLICY_FILE` from
+the hook environment, including its working-memory TTL and per-agent quota.
 Review approval repeats that comparison inside the same write transaction: a
 held successor whose predecessor is no longer latest receives HTTP `409` and
 remains held. A valid approval supersedes its predecessor, receives a fresh
@@ -773,6 +777,12 @@ policy and a trusted frontend boundary instead.
 The complete request and response contract is in
 [`docs/openapi.yaml`](docs/openapi.yaml).
 
+A write that committed but still needs canonical-file recovery returns HTTP
+`503` with `code: "CANONICAL_PROJECTION_PENDING"`, `committed: true`, and
+`recovery_pending: true`. MCP exposes the same fields in its structured error
+result. This is not an uncommitted rejection: reconcile the original request and
+retain its idempotency key instead of submitting a new logical write.
+
 Loopback mode can use its configured local identity. A non-loopback bind refuses
 to start without either a private token-policy file containing only SHA-256
 token digests or a complete OIDC configuration, plus
@@ -782,6 +792,13 @@ expiry, subject, tenant and ContinuityDB authorization claims against the
 configured JWKS. Static policies remain useful for private deployments; larger
 installations should use OIDC workload identities or an mTLS-authenticating
 gateway.
+
+Unauthenticated loopback mode accepts only `127.0.0.1`, `localhost`, or `[::1]`
+Host values on the actual listening port. If a browser supplies Origin, it must
+be an HTTP origin for one of those same authorities. This boundary covers REST,
+the review UI, and MCP; non-browser local clients may omit Origin. Authenticated
+deployments retain their configured proxy/public-host behavior. OIDC issuer
+identifiers are matched exactly, including any trailing slash.
 
 `memory:capture`, `memory:propose`, `memory:approve`, and `memory:admin` are
 separate authorities. `memory:admin` is privileged and satisfies all scope
@@ -939,8 +956,18 @@ grants tool permission or becomes executable policy.
 
 ## Storage and recovery
 
-Embedded mode stores canonical Markdown records separately from SQLite indexes.
-The index can be rebuilt from canonical records. Audit events form a hash chain
+Embedded mode stores canonical Markdown records separately from SQLite query
+projections. Since 0.9.1, each memory transaction also stores pending canonical
+contents in SQLite; files are published only after commit. Writable startup,
+export, and rebuild finish interrupted publication. A post-commit filesystem error
+reports `CANONICAL_PROJECTION_PENDING`, `committed: true`, and
+`recovery_pending: true`: resolve the I/O problem and reopen the vault, then use
+the same idempotency key when retrying. Do not interpret this result as rejection.
+
+Search can be rebuilt from canonical records without deleting existing memory
+links or feedback. SQLite also contains durable feedback, audit, and pending
+publication state, so deleting the database is not a lossless rebuild procedure.
+Record-only JSONL export is not a complete backup. Audit events form a hash chain
 inside a transactionally serialized SQLite table, so processes sharing one home
 cannot append from stale cached heads. Legacy JSONL migration validates and
 preserves the original predecessor/event hashes. A broken historical chain or a
@@ -951,6 +978,7 @@ invalid rather than silently replaced with a newly valid-looking chain.
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
 encryption and remote signed audit checkpoints are not implemented in v0.6.
+For upgrade/downgrade precautions, see [the 0.9.1 release notes](docs/releases/v0.9.1.md).
 
 ## Deployment and scale
 

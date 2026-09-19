@@ -647,6 +647,9 @@ try {
         workspaceRoots: listFlag(flags.workspace_root),
         home,
         binary,
+        tenantId: flags.tenant || cliTenantId,
+        ownerId: flags.owner || cliOwnerId,
+        sensitivities: listFlag(flags.sensitivities || process.env.CONTINUITYDB_ALLOWED_SENSITIVITIES || "public,private"),
         apply: Boolean(flags.apply),
       }));
     } else if (action === "ensure") {
@@ -1058,6 +1061,14 @@ try {
     }
   }
 } catch (error) {
-  process.stderr.write(`${JSON.stringify({ error: error.message, command })}\n`);
+  const recoveryPending = error?.code === "CANONICAL_PROJECTION_PENDING"
+    && error.committed === true && error.recovery_pending === true;
+  process.stderr.write(`${JSON.stringify({
+    error: recoveryPending
+      ? "Operation committed; canonical records need recovery. Reopen the vault to complete recovery before retrying."
+      : error.message,
+    command,
+    ...(recoveryPending ? { code: "CANONICAL_PROJECTION_PENDING", committed: true, recovery_pending: true } : {}),
+  })}\n`);
   process.exitCode = 1;
 }

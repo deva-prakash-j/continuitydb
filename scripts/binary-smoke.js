@@ -68,6 +68,41 @@ function snapshotTree(directory) {
   return entries;
 }
 
+function assertSetupPreservesVault(home, before) {
+  const after = snapshotTree(home);
+  const walPath = "index/context-vault.db-wal";
+  const shmPath = "index/context-vault.db-shm";
+  const previousWal = before.find((entry) => entry.path === walPath);
+  const currentWal = after.find((entry) => entry.path === walPath);
+  const previousShm = before.find((entry) => entry.path === shmPath);
+  const currentShm = after.find((entry) => entry.path === shmPath);
+
+  // A WAL-aware reader may create empty sidecars for a checkpointed database.
+  // Never exclude an existing WAL or a newly created WAL containing any bytes.
+  const newEmptyWal = !previousWal && currentWal;
+  if (newEmptyWal) {
+    assert.equal(currentWal.type, "file");
+    assert.equal(currentWal.bytes, 0, "read-only inspection must not create WAL frames");
+  }
+  // SHM is SQLite's volatile WAL-index/read-mark coordination, not record data.
+  // Existing SHM topology, permissions and size still have to be preserved.
+  if (previousShm) {
+    assert.ok(currentShm, "setup removed existing SQLite coordination state");
+    const { sha256: _beforeHash, ...previousMetadata } = previousShm;
+    const { sha256: _afterHash, ...currentMetadata } = currentShm;
+    assert.deepEqual(currentMetadata, previousMetadata);
+  } else if (currentShm) {
+    assert.equal(currentShm.type, "file");
+    assert.ok(currentShm.bytes > 0, "new SQLite coordination state must not be empty");
+  }
+  assert.deepEqual(
+    after.filter((entry) => entry.path !== shmPath && !(newEmptyWal && entry.path === walPath)),
+    before.filter((entry) => entry.path !== shmPath),
+    "setup changed persistent vault files, existing WAL bytes, or unrelated files",
+  );
+}
+
+
 function assertFailedSetupPreservesVaultAndRetries(name, initialize) {
   const caseRoot = join(root, `rollback-${name}`);
   const caseProject = join(caseRoot, "project");
@@ -90,7 +125,11 @@ function assertFailedSetupPreservesVaultAndRetries(name, initialize) {
     const result = spawnSync(binary, setupArgs, { encoding: "utf8", timeout: 30_000 });
     assert.notEqual(result.status, 0, `${name} preservation probe unexpectedly succeeded`);
     assert.match(result.stderr, /backup parent must be a real directory/);
-    assert.deepEqual(snapshotTree(caseHome), before, `${name} vault changed after failed setup`);
+    if (name === "valid-db" || name === "wal-shm") {
+      assertSetupPreservesVault(caseHome, before);
+    } else {
+      assert.deepEqual(snapshotTree(caseHome), before, `${name} vault changed after failed setup`);
+    }
 
     rmSync(join(caseHome, "backups"));
     const retry = spawnSync(binary, setupArgs, { encoding: "utf8", timeout: 30_000 });
