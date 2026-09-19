@@ -2637,6 +2637,11 @@ export class ContextVault {
       throw new Error("active handoff assessment must include a bounded expiry");
     }
     const handoff = normalizeHandoff(input);
+    if (input.auto_link_previous !== undefined && typeof input.auto_link_previous !== "boolean") {
+      throw new Error("auto_link_previous must be a boolean");
+    }
+    const autoLinkPrevious = input.auto_link_previous === true
+      && !Object.prototype.hasOwnProperty.call(input, "previous_checkpoint_id");
     assertNoCredentialLikeContent(handoff);
     const namespaceId = `project/${projectId}`;
     const idempotencyKey = handoffIdempotencyKey(handoff);
@@ -2664,8 +2669,14 @@ export class ContextVault {
       });
       if (existing) {
         const persistedHandoff = JSON.parse(existing.metadata_json || "{}").handoff || null;
+        // Retry identity is resolved before consulting the latest checkpoint.
+        // Only an omitted predecessor can inherit stored lineage; an explicit
+        // predecessor (including null) must still match the original capture.
+        if (autoLinkPrevious && persistedHandoff) {
+          handoff.previous_checkpoint_id = persistedHandoff.previous_checkpoint_id;
+        }
         if (!handoffsEqual(persistedHandoff, handoff)) {
-          throw new Error("checkpoint_id was already used with different handoff data for this task and branch");
+          throw Object.assign(new Error("checkpoint_id was already used with different handoff data for this task and branch"), { statusCode: 409 });
         }
         return {
           duplicate: true,
@@ -2702,6 +2713,11 @@ export class ContextVault {
       const previousHandoff = previousRecord
         ? JSON.parse(previousRecord.metadata_json || "{}").handoff || null
         : null;
+      // This exact-branch lookup and the following write share the SQLite
+      // writer transaction. Branchless recall fallback never creates lineage.
+      if (autoLinkPrevious && previousHandoff) {
+        handoff.previous_checkpoint_id = previousHandoff.checkpoint_id;
+      }
       const continuesLatest = Boolean(
         previousRecord
         && previousHandoff
@@ -3191,8 +3207,15 @@ export class ContextVault {
     }
     const output = [];
     for (const input of inputs) {
-      const proposed = this.propose(input);
-      output.push(commit && !proposed.duplicate ? this.commit(proposed.record.id) : proposed.record);
+      output.push(this.runTransaction(() => {
+        const proposed = this.propose(input);
+        // Explicit bulk approval includes existing proposals, but must not
+        // reactivate reviewed, superseded, or forgotten records. Publish only
+        // after this input's proposal and requested activation commit together.
+        return commit && proposed.record.status === PROPOSED
+          ? this.commit(proposed.record.id)
+          : proposed.record;
+      }));
     }
     return output;
   }

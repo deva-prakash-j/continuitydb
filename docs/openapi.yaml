@@ -303,6 +303,7 @@ paths:
         "503": { $ref: "#/components/responses/CommittedRecoveryPending" }
         "201": { description: Structured checkpoint evaluated by capture policy and saved as active, proposed, or quarantined }
         "200": { description: Existing idempotent checkpoint returned }
+        "409": { description: Checkpoint identity already exists with different handoff data }
   /v1/handoffs/latest:
     get:
       operationId: getLatestHandoff
@@ -536,7 +537,11 @@ components:
         branch: { type: string, maxLength: 200 }
         git_commit: { type: string, maxLength: 64 }
         checkpoint_id: { type: string, maxLength: 200 }
-        previous_checkpoint_id: { type: string, maxLength: 200 }
+        previous_checkpoint_id: { type: [string, "null"], maxLength: 200 }
+        auto_link_previous:
+          type: boolean
+          default: false
+          description: Resolve an omitted predecessor atomically from the stored retry or latest exact-branch checkpoint. Explicit predecessors remain authoritative.
         sensitivity: { type: string, enum: [private, sensitive, restricted], default: private }
     HandoffPatch:
       type: object

@@ -1,7 +1,6 @@
 import { resolve } from "node:path";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
 import { ContinuityApiClient, validateTokenEnvironmentName } from "./http-client.js";
-import { linkCheckpointToLatest } from "./lifecycle-lineage.js";
 import { validateProjectId } from "./project-identity.js";
 import { listRegisteredProjects } from "./project-registry.js";
 import { normalizeIdentity, requiredIdentifier } from "./security.js";
@@ -149,21 +148,9 @@ export async function saveLifecycleCheckpoint({
   if (checkpoint.project_id !== fixedProjectId) {
     throw new Error(`checkpoint project ${checkpoint.project_id || "<missing>"} does not match configured project ${fixedProjectId}`);
   }
-  let value = { ...checkpoint };
+  const value = { ...checkpoint, auto_link_previous: true };
   if (remoteUrl) {
     const client = remoteClient({ remoteUrl, tokenEnv, env });
-    if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
-      try {
-        const latest = await client.latestHandoff({
-          project_id: fixedProjectId,
-          task_id: value.task_id,
-          branch: value.branch || null,
-        });
-        value = linkCheckpointToLatest(value, latest);
-      } catch (error) {
-        if (error.statusCode !== 404) throw error;
-      }
-    }
     return client.saveHandoff(value);
   }
   if (typeof home !== "string" || !home) throw new Error("CONTINUITYDB_HOME is required for local lifecycle hooks");
@@ -179,17 +166,6 @@ export async function saveLifecycleCheckpoint({
       allowed_projects: [fixedProjectId],
       allowed_sensitivities: fixedSensitivities,
     });
-    if (!Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id")) {
-      const latest = vault.latestHandoff({
-        tenant_id: identity.tenant_id,
-        owner_id: identity.owner_id,
-        project_id: fixedProjectId,
-        task_id: value.task_id,
-        branch: value.branch || null,
-        allowed_sensitivities: identity.allowed_sensitivities,
-      });
-      value = linkCheckpointToLatest(value, latest);
-    }
     const input = {
       ...value,
       tenant_id: identity.tenant_id,
