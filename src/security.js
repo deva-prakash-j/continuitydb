@@ -58,6 +58,36 @@ export function requireScope(identity, scope) {
   }
 }
 
+/** Return only the public outcome fields of a committed projection failure. */
+export function committedRecoveryOutcome(error) {
+  if (error?.code !== "CANONICAL_PROJECTION_PENDING"
+    || error.committed !== true || error.recovery_pending !== true) return null;
+  return {
+    error: "write committed; canonical recovery is pending",
+    code: "CANONICAL_PROJECTION_PENDING",
+    committed: true,
+    recovery_pending: true,
+  };
+}
+
+/** Validate the unauthenticated local boundary and reuse it for the MCP transport. */
+export function loopbackHttpRequestSecurity(headers, port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("local HTTP listening port must be an integer between 1 and 65535");
+  }
+  const names = ["127.0.0.1", "localhost", "[::1]"];
+  const allowedHosts = names.flatMap((name) => port === 80 ? [name, `${name}:80`] : [`${name}:${port}`]);
+  const allowedOrigins = names.map((name) => `http://${name}${port === 80 ? "" : `:${port}`}`);
+  if (typeof headers.host !== "string" || !allowedHosts.includes(headers.host)) {
+    throw Object.assign(new Error("Host is not allowed for the local HTTP service"), { code: "FORBIDDEN" });
+  }
+  if (headers.origin !== undefined
+    && (typeof headers.origin !== "string" || !allowedOrigins.includes(headers.origin))) {
+    throw Object.assign(new Error("Origin is not allowed for the local HTTP service"), { code: "FORBIDDEN" });
+  }
+  return { enableDnsRebindingProtection: true, allowedHosts, allowedOrigins };
+}
+
 export function loadTokenPolicy(path, { platform = process.platform } = {}) {
   if (!path) return [];
   const mode = statSync(path).mode & 0o777;
@@ -109,7 +139,8 @@ function stringArrayClaim(value, name) {
 
 export class OidcAuthorizer {
   constructor({ issuer, audience, jwksUrl = null, jwks = null }) {
-    this.issuer = secureServiceUrl(issuer, "OIDC issuer").href.replace(/\/$/, "");
+    secureServiceUrl(issuer, "OIDC issuer");
+    this.issuer = issuer;
     if (typeof audience !== "string" || !audience || audience.length > 500 || /\s/.test(audience)) {
       throw new Error("OIDC audience contains invalid characters or length");
     }

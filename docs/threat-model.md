@@ -28,6 +28,7 @@ or become a tool instruction.
 | SSRF through embedding config | endpoints come from server config; remote endpoints opt-in and HTTPS-only | egress allowlist/proxy and DNS rebinding protection |
 | Local model supply-chain drift | fixed repository and revision, size caps, pinned SHA-256 digests, atomic private cache, pinned WASM runtime | artifact attestations, SBOM and independent malware/model scanning |
 | Token theft | static policies store only SHA-256 digests; OIDC JWTs require verified signature, issuer, audience, expiry, subject and tenant; tokens are never logged | short-lived workload tokens, rotation/revocation operations, secret manager, TLS termination and optional mTLS |
+| Browser-origin access to implicit local identity | REST, UI and MCP require an expected loopback Host on the listening port and validate any supplied Origin; local MCP also enables SDK Host/Origin protection | use authenticated identities for proxy/shared deployment; protect the host user account |
 | DoS / memory exhaustion | request/body/candidate/vector/depth limits, timeouts, HTTP and MCP capture rate limits, per-agent/project record quota | distributed quotas, queue limits, circuit breakers and WAF |
 | Symlink/path escape or dirty-worktree misattribution during repo scan | committed Git blobs only; symlink tree entries denied; secret paths filtered | sandboxed workers, read-only mounts, resource limits |
 | Managed client parent substitution | target-parent chains are bound to canonical real paths and device/inode/type identity, then revalidated around replacement, removal, rollback, backup cleanup, and status reads; changed or symlinked ancestors fail closed | OS permissions or sandboxing that prevents same-UID directory mutation; stock Node.js has no portable descriptor-relative rename/remove API, leaving a final validation-to-pathname-syscall micro-window |
@@ -41,7 +42,10 @@ or become a tool instruction.
 
 - The HTTP service binds to loopback by default. Its implicit local identity is
   read/capture/feedback only unless the operator explicitly enables the review
-  UI, which adds local review authority for that process.
+  UI, which adds local review authority for that process. Before granting that
+  identity, requests must use an allowed loopback Host and any browser Origin
+  must address that service's listening port. Local non-browser clients can omit
+  Origin. Explicitly authenticated deployments retain their proxy-host boundary.
 - A non-loopback bind refuses startup without a static token policy or complete
   OIDC configuration and an explicit
   assertion that TLS terminates at the trusted proxy.

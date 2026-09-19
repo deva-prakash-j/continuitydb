@@ -9,6 +9,8 @@ import { VERSION } from "./version.js";
 import { isDirectEntrypoint } from "./direct-entry.js";
 import {
   isLoopback,
+  committedRecoveryOutcome,
+  loopbackHttpRequestSecurity,
   loadTokenPolicy,
   normalizeIdentity,
   createOidcAuthorizerFromEnv,
@@ -176,6 +178,7 @@ export function createContinuityServer({
   }
   const configuredPublicUrl = validatedPublicUrl(publicUrl, Boolean(oidcAuthorizer));
   const authorizer = new TokenAuthorizer(entries);
+  const usesLocalIdentity = !entries.length && !oidcAuthorizer && isLoopback(host);
   const fallbackIdentity = normalizeIdentity(localIdentity || {
     tenant_id: process.env.CONTINUITYDB_TENANT_ID || "local",
     principal_id: process.env.CONTINUITYDB_PRINCIPAL_ID || "local-user",
@@ -209,6 +212,9 @@ export function createContinuityServer({
     const requestId = request.headers["x-request-id"]?.slice(0, 128) || randomUUID();
     metrics.requests += 1;
     try {
+      const transportSecurity = usesLocalIdentity
+        ? loopbackHttpRequestSecurity(request.headers, request.socket.localPort)
+        : null;
       const url = new URL(request.url || "/", `http://${request.headers.host || "localhost"}`);
       if (request.method === "GET" && url.pathname === "/healthz") {
         return json(response, 200, { status: "ok", service: "continuitydb", version: VERSION }, requestId);
@@ -227,7 +233,7 @@ export function createContinuityServer({
 
       let identity = entries.length ? authorizer.authorize(request.headers.authorization) : null;
       if (!identity && oidcAuthorizer) identity = await oidcAuthorizer.authorize(request.headers.authorization);
-      if (!identity && !entries.length && !oidcAuthorizer && isLoopback(host)) identity = fallbackIdentity;
+      if (!identity && usesLocalIdentity) identity = fallbackIdentity;
       if (!identity) {
         const base = requestPublicBase(request, configuredPublicUrl);
         const metadata = oidcAuthorizer && base ? ` resource_metadata="${base}${OAUTH_METADATA_PATH}"` : "";
@@ -245,7 +251,7 @@ export function createContinuityServer({
         return json(response, 200, { status: "ready" }, requestId);
       }
       if (url.pathname === "/mcp") {
-        return await mcpEndpoint.handle(request, response, identity, readJson);
+        return await mcpEndpoint.handle(request, response, identity, readJson, transportSecurity);
       }
       if (request.method === "GET" && url.pathname === "/ui") {
         if (!enableReviewUi) return json(response, 404, { error: "review UI is disabled", request_id: requestId }, requestId);
@@ -462,6 +468,8 @@ export function createContinuityServer({
       return json(response, 404, { error: "route not found", request_id: requestId }, requestId);
     } catch (error) {
       metrics.errors += 1;
+      const committed = committedRecoveryOutcome(error);
+      if (committed) return json(response, 503, { ...committed, request_id: requestId }, requestId);
       const status = errorStatus(error);
       const message = status >= 500 ? "internal server error" : error.message;
       return json(response, status, { error: message, request_id: requestId }, requestId);

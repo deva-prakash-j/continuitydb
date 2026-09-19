@@ -203,6 +203,15 @@ test("generated remote plugin uses loopback HTTP with an environment token refer
     });
     vault.approve(proposed.record.id, { actor: "fixture" });
     const address = await service.listen();
+    const branchless = await fetch(`http://127.0.0.1:${address.port}/v1/handoffs`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        project_id: "inventory.v2", task_id: "remote-task", goal: "Continue remotely",
+        current_state: "BRANCHLESS_RECALL_FALLBACK", checkpoint_id: "branchless-checkpoint",
+      }),
+    });
+    assert.equal(branchless.status, 201);
+    assert.equal((await branchless.json()).disposition, "active");
     const module = await importGenerated(root, {
       projectId: "inventory.v2", transport: "http",
       url: `http://127.0.0.1:${address.port}/mcp`, tokenEnv: "OPENCODE_TEST_TOKEN",

@@ -2,6 +2,8 @@
 export function linkCheckpointToLatest(checkpoint, latest) {
   const value = { ...checkpoint };
   if (Object.prototype.hasOwnProperty.call(value, "previous_checkpoint_id") || !latest?.handoff) return value;
+  // Recall may fall back to a branchless checkpoint; lineage is exact-branch only.
+  if ((latest.handoff.branch || null) !== (value.branch || null)) return value;
   if (latest.handoff.checkpoint_id !== value.checkpoint_id) {
     value.previous_checkpoint_id = latest.handoff.checkpoint_id;
   } else if (latest.handoff.previous_checkpoint_id) {

@@ -5,7 +5,7 @@ import { ContextVault } from "./store.js";
 import { createEmbedderFromEnv, HybridEngine, normalizeSearchRequest } from "./embeddings.js";
 import { VERSION } from "./version.js";
 import { CapturePolicy, loadCapturePolicy } from "./capture-policy.js";
-import { normalizeIdentity, TokenBucketLimiter } from "./security.js";
+import { committedRecoveryOutcome, normalizeIdentity, TokenBucketLimiter } from "./security.js";
 import { createApiClientFromEnv } from "./http-client.js";
 import { isDirectEntrypoint } from "./direct-entry.js";
 
@@ -73,7 +73,19 @@ function response(value) {
   };
 }
 
-if (canRead) server.registerTool(
+function registerTool(name, config, handler) {
+  return server.registerTool(name, config, async (...args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      const committed = committedRecoveryOutcome(error);
+      if (committed) return { ...response(committed), isError: true };
+      throw error;
+    }
+  });
+}
+
+if (canRead) registerTool(
   "memory_search",
   {
     title: "Search ContinuityDB memory",
@@ -103,7 +115,7 @@ if (canRead) server.registerTool(
   },
 );
 
-if (canRead) server.registerTool(
+if (canRead) registerTool(
   "memory_context_pack",
   {
     title: "Build a cited context pack",
@@ -132,7 +144,7 @@ if (canRead) server.registerTool(
   },
 );
 
-if (canCapture) server.registerTool(
+if (canCapture) registerTool(
   "memory_capture",
   {
     title: "Capture governed project memory",
@@ -174,7 +186,7 @@ if (canCapture) server.registerTool(
   },
 );
 
-if (canFeedback) server.registerTool(
+if (canFeedback) registerTool(
   "memory_feedback",
   {
     title: "Record memory feedback",
@@ -208,7 +220,7 @@ if (canFeedback) server.registerTool(
   },
 );
 
-if (canCapture) server.registerTool(
+if (canCapture) registerTool(
   "handoff_checkpoint",
   {
     title: "Save a structured handoff checkpoint",
@@ -252,7 +264,7 @@ if (canCapture) server.registerTool(
   },
 );
 
-if (canRead) server.registerTool(
+if (canRead) registerTool(
   "handoff_latest",
   {
     title: "Read the latest task handoff",

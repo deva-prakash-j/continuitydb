@@ -606,6 +606,10 @@ checkpoints as well, while exact idempotent retries remain allowed. The first
 checkpoint for a task and branch uses `previous_checkpoint_id: null`; every
 successor must name the current latest checkpoint. This compare-and-set lineage
 quarantines stale or concurrent writers instead of replacing startup context.
+Automatic predecessor selection uses only an exact branch match; a branchless
+checkpoint can still be recalled as fallback without becoming a named branch's
+predecessor. Local lifecycle saves read `CONTINUITYDB_CAPTURE_POLICY_FILE` from
+the hook environment, including its working-memory TTL and per-agent quota.
 Review approval repeats that comparison inside the same write transaction: a
 held successor whose predecessor is no longer latest receives HTTP `409` and
 remains held. A valid approval supersedes its predecessor, receives a fresh
@@ -773,6 +777,12 @@ policy and a trusted frontend boundary instead.
 The complete request and response contract is in
 [`docs/openapi.yaml`](docs/openapi.yaml).
 
+A write that committed but still needs canonical-file recovery returns HTTP
+`503` with `code: "CANONICAL_PROJECTION_PENDING"`, `committed: true`, and
+`recovery_pending: true`. MCP exposes the same fields in its structured error
+result. This is not an uncommitted rejection: reconcile the original request and
+retain its idempotency key instead of submitting a new logical write.
+
 Loopback mode can use its configured local identity. A non-loopback bind refuses
 to start without either a private token-policy file containing only SHA-256
 token digests or a complete OIDC configuration, plus
@@ -782,6 +792,13 @@ expiry, subject, tenant and ContinuityDB authorization claims against the
 configured JWKS. Static policies remain useful for private deployments; larger
 installations should use OIDC workload identities or an mTLS-authenticating
 gateway.
+
+Unauthenticated loopback mode accepts only `127.0.0.1`, `localhost`, or `[::1]`
+Host values on the actual listening port. If a browser supplies Origin, it must
+be an HTTP origin for one of those same authorities. This boundary covers REST,
+the review UI, and MCP; non-browser local clients may omit Origin. Authenticated
+deployments retain their configured proxy/public-host behavior. OIDC issuer
+identifiers are matched exactly, including any trailing slash.
 
 `memory:capture`, `memory:propose`, `memory:approve`, and `memory:admin` are
 separate authorities. `memory:admin` is privileged and satisfies all scope

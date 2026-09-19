@@ -7,8 +7,11 @@ import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { ContextVault } from "../src/store.js";
 import { createContinuityServer } from "../src/http-server.js";
+import { createContinuityMcpServer } from "../src/mcp-server.js";
+import { normalizeIdentity } from "../src/security.js";
 
 async function waitUntil(predicate, timeoutMs = 1_000) {
   const deadline = Date.now() + timeoutMs;
@@ -30,6 +33,37 @@ function initializeRequest(name = "raw-client") {
     },
   };
 }
+
+test("MCP reports committed recovery outcomes without exposing internal failure details", async () => {
+  const flags = { code: "CANONICAL_PROJECTION_PENDING", committed: true, recovery_pending: true };
+  const fail = () => { throw Object.assign(new Error("private I/O fixture detail"), flags); };
+  for (const proxy of [false, true]) {
+    const runtime = createContinuityMcpServer({
+      apiClient: proxy ? { saveHandoff: fail } : null,
+      vault: { saveHandoff: fail },
+      engine: {},
+      capturePolicy: { evaluateHandoff: () => ({}) },
+      identity: normalizeIdentity({ scopes: ["memory:capture"], allowed_projects: ["api"] }),
+    });
+    const client = new Client({ name: "recovery-outcome-fixture", version: "1" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await runtime.server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const result = await client.callTool({
+        name: "handoff_checkpoint",
+        arguments: { project_id: "api", task_id: "outcome-test", goal: "Verify outcome", current_state: "Synthetic state" },
+      });
+      assert.equal(result.isError, true);
+      assert.deepEqual(result.structuredContent, { error: "write committed; canonical recovery is pending", ...flags });
+      assert.deepEqual(JSON.parse(result.content[0].text), result.structuredContent);
+      assert.doesNotMatch(JSON.stringify(result), /private I\/O fixture detail|stack/);
+    } finally {
+      await client.close();
+      await runtime.server.close();
+    }
+  }
+});
 
 test("MCP exposes policy-controlled capture and feedback without admin tools", async () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-mcp-test-"));
