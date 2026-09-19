@@ -13,7 +13,8 @@ test("CLI preserves committed recovery metadata without exposing underlying I/O 
   const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-recovery-error-"));
   try {
     for (const committed of [true, false]) {
-      const result = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+      // Node 22 may emit SQLite experimental warnings alongside application JSON.
+      const result = spawnSync(process.execPath, ["--no-warnings", "--input-type=module", "--eval", `
         import { ContextVault } from ${JSON.stringify(storeUrl)};
         ContextVault.prototype.stats = () => {
           const error = new Error("fixture I/O detail");
