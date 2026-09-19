@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -192,7 +192,8 @@ test("standalone installer refuses to replace an unmanaged launcher", () => {
 });
 
 test("Windows managed launcher upgrades without force and keeps previous version bytes", () => {
-  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-upgrade-"));
+  // Canonicalize only our own fixture: macOS exposes TMPDIR through /var.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-upgrade-")));
   const source = join(root, "downloaded-continuitydb.exe");
   const prefix = join(root, "prefix");
   const options = { source, prefix, standalone: true, platform: "win32", apply: true };
@@ -218,7 +219,7 @@ test("Windows managed launcher upgrades without force and keeps previous version
 });
 
 test("Windows managed upgrade restores the prior launcher when commit fails", () => {
-  const root = mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-rollback-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "continuitydb-self-install-win-rollback-")));
   const source = join(root, "downloaded-continuitydb.exe");
   const prefix = join(root, "prefix");
   const options = { source, prefix, standalone: true, platform: "win32", apply: true };
