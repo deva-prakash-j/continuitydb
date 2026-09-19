@@ -257,6 +257,8 @@ function stabilizeFixtureMemoryId(vault, record, fixtureId) {
   const stableRecord = { ...record, id: memoryId };
   vault.runTransaction(() => {
     vault.db.prepare("UPDATE memory_records SET id = ? WHERE id = ?").run(memoryId, record.id);
+    vault.db.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(record.id);
+    vault.indexRecord(stableRecord);
     vault.db.prepare("UPDATE audit_events SET target_id = ? WHERE target_id = ?").run(memoryId, record.id);
     const events = vault.db.prepare(`
       SELECT event_id, timestamp, actor, operation, target_id, result
@@ -270,8 +272,8 @@ function stabilizeFixtureMemoryId(vault, record, fixtureId) {
       update.run(previousHash, eventHash, event.event_id);
       previousHash = eventHash;
     }
+    vault.writeCanonical(stableRecord);
   });
-  vault.writeCanonical(stableRecord);
   rmSync(vault.recordPath(record.id), { force: true });
   return memoryId;
 }

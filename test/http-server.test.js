@@ -290,8 +290,10 @@ test("review inbox exposes held memories and can explicitly approve quarantined 
       body: "Review this proposed context.",
     });
     const quarantined = { ...held.record, id: randomUUID(), status: "quarantined", idempotency_key: null, body: "Review quarantined context.", content_hash: "b".repeat(64) };
-    f.vault.writeCanonical(quarantined);
-    f.vault.indexRecord(quarantined);
+    f.vault.runTransaction(() => {
+      f.vault.writeCanonical(quarantined);
+      f.vault.indexRecord(quarantined);
+    });
     const address = await f.service.listen();
     const base = `http://127.0.0.1:${address.port}`;
     const inbox = await fetch(`${base}/v1/memories?status=proposed,quarantined`);
