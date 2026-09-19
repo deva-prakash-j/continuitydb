@@ -187,6 +187,62 @@ function graphGenerationVariants(summary) {
   ));
 }
 
+export function fitSearchEnvelope({ results: candidates, retrieval: metadata }, tokenBudget = 1200) {
+  const retrievalVariants = graphGenerationVariants(metadata.graph_generation)
+    .map((graph_generation) => ({ ...metadata, graph_generation }));
+  const results = [];
+  const limit = clamp(Number(tokenBudget), 64, 32_000);
+  let retrievalIndex = retrievalVariants.findIndex((candidate) => (
+    estimateSerializedTokens({ results, retrieval: candidate }) <= limit
+  ));
+  // The fixed retrieval fields fit the public minimum budget; this final
+  // variant explicitly reports omitted generation detail.
+  if (retrievalIndex < 0) retrievalIndex = retrievalVariants.length - 1;
+  let retrieval = retrievalVariants[retrievalIndex];
+  for (const item of candidates) {
+    const optionalMetadata = { ...item };
+    delete optionalMetadata.feedback;
+    delete optionalMetadata.tags;
+    const compactMetadata = { ...optionalMetadata };
+    delete compactMetadata.score_signals;
+    let fitted = null;
+    const variants = [item, optionalMetadata, compactMetadata];
+    for (const candidate of variants) {
+      for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+        const candidateRetrieval = retrievalVariants[index];
+        if (estimateSerializedTokens({ results: [...results, candidate], retrieval: candidateRetrieval }) <= limit) {
+          fitted = candidate;
+          retrievalIndex = index;
+          retrieval = candidateRetrieval;
+          break;
+        }
+      }
+      if (fitted) break;
+    }
+    // Preserve the cited graph path while compacting optional metadata first;
+    // body text is the final elastic field in the existing result contract.
+    if (!fitted) {
+      for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
+        const candidateRetrieval = retrievalVariants[index];
+        fitted = fitResultWithinEnvelope(
+          results,
+          compactMetadata,
+          tokenBudget,
+          (items) => ({ results: items, retrieval: candidateRetrieval }),
+        );
+        if (fitted) {
+          retrievalIndex = index;
+          retrieval = candidateRetrieval;
+          break;
+        }
+      }
+    }
+    if (!fitted) break;
+    results.push(fitted);
+  }
+  return { results, retrieval };
+}
+
 export function fitContextPack(payload, tokenBudget) {
   const requestedTokens = clamp(Number(tokenBudget), 64, 32_000);
   const candidates = payload.memories || [];
@@ -527,6 +583,7 @@ export class ContextVault {
     if (readOnly) {
       this.db = new DatabaseSync(join(this.indexDir, "context-vault.db"), { readOnly: true });
       this.db.exec("PRAGMA foreign_keys = ON;");
+      this.idempotencyAliasesAvailable = Boolean(this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'memory_idempotency_aliases'").get());
       return;
     }
 
@@ -587,6 +644,18 @@ export class ContextVault {
         record_id TEXT PRIMARY KEY,
         contents TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS memory_idempotency_aliases (
+        tenant_id TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        namespace_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        record_id TEXT NOT NULL REFERENCES memory_records(id) ON DELETE CASCADE,
+        PRIMARY KEY (tenant_id, owner_id, namespace_id, agent_id, idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_memory_idempotency_alias_record
+        ON memory_idempotency_aliases(record_id);
 
       CREATE INDEX IF NOT EXISTS idx_memory_scope_status
         ON memory_records(tenant_id, namespace_id, status, expires_at);
@@ -861,6 +930,7 @@ export class ContextVault {
         ON graph_edges(tenant_id, generation_id, target_id);
     `));
 
+    this.idempotencyAliasesAvailable = true;
     // Schema upgrades and legacy evidence import must be one serialized
     // bootstrap unit. Without this transaction, concurrent processes can both
     // observe an old schema and race the same ALTER/import operation.
@@ -989,6 +1059,19 @@ export class ContextVault {
     return join(this.recordsDir, `${id}.md`);
   }
 
+  recordWithIdempotencyAliases(record) {
+    // Aliases are internal persistence state: include them in canonical/JSONL
+    // backups, not ordinary capture/get/search rows or caller-owned metadata.
+    const { idempotency_aliases: ignored, ...plain } = record;
+    if (!this.idempotencyAliasesAvailable) return plain;
+    const aliases = this.db.prepare(`
+      SELECT NULLIF(agent_id, '') AS agent_id, idempotency_key
+      FROM memory_idempotency_aliases WHERE record_id = ?
+      ORDER BY agent_id, idempotency_key
+    `).all(record.id);
+    return aliases.length ? { ...plain, idempotency_aliases: aliases } : plain;
+  }
+
   writeCanonical(record) {
     if (this.transactionDepth === 0) {
       throw new Error("canonical writes require a memory transaction");
@@ -996,7 +1079,7 @@ export class ContextVault {
     this.db.prepare(`
       INSERT INTO canonical_record_writes(record_id, contents) VALUES (?, ?)
       ON CONFLICT(record_id) DO UPDATE SET contents = excluded.contents
-    `).run(record.id, serializeRecord(record));
+    `).run(record.id, serializeRecord(this.recordWithIdempotencyAliases(record)));
     this.transactionCanonicalWrites = true;
   }
 
@@ -1686,6 +1769,7 @@ export class ContextVault {
   }
 
   indexRecordUnsafe(record) {
+    const { idempotency_aliases: aliases, ...fields } = record;
     const normalized = {
       tenant_id: LOCAL_TENANT,
       agent_id: null,
@@ -1698,8 +1782,29 @@ export class ContextVault {
       version: 1,
       subject_key: null,
       handoff_sequence: null,
-      ...record,
+      ...fields,
     };
+    if (aliases !== undefined) {
+      if (!Array.isArray(aliases)) throw new Error("idempotency aliases must be an array");
+      for (const alias of aliases) {
+        if (!alias || typeof alias !== "object" || Array.isArray(alias)
+          || Object.keys(alias).some((key) => !["agent_id", "idempotency_key"].includes(key))) {
+          throw new Error("idempotency alias contains an invalid field");
+        }
+        if (alias.agent_id !== null && alias.agent_id !== undefined) requiredIdentifier(alias.agent_id, "alias.agent_id");
+        if (typeof alias.idempotency_key !== "string" || !alias.idempotency_key.trim() || alias.idempotency_key.length > 512) {
+          throw new Error("idempotency alias key must be a non-empty string of at most 512 characters");
+        }
+      }
+    }
+    const scopedAlias = this.db.prepare(`
+      SELECT 1 FROM memory_idempotency_aliases WHERE record_id = ?
+        AND (tenant_id != ? OR owner_id != ? OR namespace_id != ?)
+      LIMIT 1
+    `).get(normalized.id, normalized.tenant_id, normalized.owner_id, normalized.namespace_id);
+    if (scopedAlias) throw new Error("idempotency alias scope cannot change");
+    const existingKey = this.findByIdempotency(normalized);
+    if (existingKey && existingKey.id !== normalized.id) throw new Error("idempotency key conflicts with another memory record");
     normalized.tags_json = typeof normalized.tags_json === "string"
       ? normalized.tags_json
       : JSON.stringify(normalized.tags_json || []);
@@ -1756,6 +1861,10 @@ export class ContextVault {
           updated_at = excluded.updated_at
       `).run(normalized);
 
+    // Canonical restoration adds remembered request identities. Omitted legacy
+    // metadata and unrelated record updates never discard acknowledged keys.
+    for (const alias of aliases || []) this.addIdempotencyAlias(normalized, alias.agent_id || null, alias.idempotency_key);
+
     this.db.prepare("DELETE FROM memory_fts WHERE memory_id = ?").run(normalized.id);
     if (normalized.status === ACTIVE) {
       this.db.prepare(`
@@ -1788,9 +1897,7 @@ export class ContextVault {
       const agentId = input.agent_id ? requiredIdentifier(input.agent_id, "agent_id") : null;
 
       if (idempotencyKey) {
-        const existing = this.db
-          .prepare("SELECT * FROM memory_records WHERE tenant_id = ? AND owner_id = ? AND namespace_id = ? AND COALESCE(agent_id, '') = COALESCE(?, '') AND idempotency_key = ?")
-          .get(tenantId, ownerId, namespaceId, agentId, idempotencyKey);
+        const existing = this.findByIdempotency({ tenant_id: tenantId, owner_id: ownerId, namespace_id: namespaceId, agent_id: agentId, idempotency_key: idempotencyKey });
         if (existing) return { duplicate: true, record: existing };
       }
 
@@ -1808,7 +1915,13 @@ export class ContextVault {
             AND (valid_to IS NULL OR valid_to > ?)
             AND stale = 0
         `).get(tenantId, contentHash, effectiveTime, effectiveTime, effectiveTime);
-        if (duplicate) return { duplicate: true, record: duplicate };
+        if (duplicate) {
+          if (idempotencyKey && this.addIdempotencyAlias(duplicate, agentId, idempotencyKey)) {
+            this.writeCanonical(duplicate);
+            this.audit("idempotency-alias", duplicate.id, "created", actor);
+          }
+          return { duplicate: true, record: duplicate };
+        }
       }
 
       const timestamp = nowIso();
@@ -1944,11 +2057,33 @@ export class ContextVault {
 
   findByIdempotency({ tenant_id, owner_id, namespace_id, agent_id = null, idempotency_key }) {
     if (!idempotency_key) return null;
-    return this.db.prepare(`
+    const primary = this.db.prepare(`
       SELECT * FROM memory_records
       WHERE tenant_id = ? AND owner_id = ? AND namespace_id = ?
         AND COALESCE(agent_id, '') = COALESCE(?, '') AND idempotency_key = ?
+    `).get(tenant_id, owner_id, namespace_id, agent_id, idempotency_key);
+    if (primary || !this.idempotencyAliasesAvailable) return primary || null;
+    return this.db.prepare(`
+      SELECT m.* FROM memory_idempotency_aliases a
+      JOIN memory_records m ON m.id = a.record_id
+      WHERE a.tenant_id = ? AND a.owner_id = ? AND a.namespace_id = ?
+        AND a.agent_id = COALESCE(?, '') AND a.idempotency_key = ?
     `).get(tenant_id, owner_id, namespace_id, agent_id, idempotency_key) || null;
+  }
+
+  addIdempotencyAlias(record, agentId, idempotencyKey) {
+    if (this.transactionDepth === 0) throw new Error("idempotency aliases require a memory transaction");
+    idempotencyKey = requiredString(idempotencyKey, "idempotency alias key");
+    const existing = this.findByIdempotency({ ...record, agent_id: agentId, idempotency_key: idempotencyKey });
+    if (existing) {
+      if (existing.id !== record.id) throw new Error("idempotency alias conflicts with another memory record");
+      return false;
+    }
+    this.db.prepare(`
+      INSERT INTO memory_idempotency_aliases(tenant_id, owner_id, namespace_id, agent_id, idempotency_key, record_id)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(record.tenant_id, record.owner_id, record.namespace_id, agentId || "", idempotencyKey, record.id);
+    return true;
   }
 
   feedback({ tenant_id, owner_id, principal_id, agent_id = null, memory_id, signal, reason = null }) {
@@ -2064,8 +2199,6 @@ export class ContextVault {
       semantic_fallback_used: false,
       fallback_reason: requestedMode === "graph-first" ? coverage.fallback_reason : null,
     };
-    const retrievalVariants = graphGenerationVariants(nativeGraphEnabled ? graphGenerationSummary(this, input) : null)
-      .map((graph_generation) => ({ ...retrievalBase, graph_generation }));
     const candidateTopK = clamp(Number(input.top_k ?? 8) * 4, 8, 100);
     const memoryResults = requestedMode === "graph-only" ? [] : this.searchMemoryResults({
       ...input,
@@ -2122,60 +2255,13 @@ export class ContextVault {
       lambda: 0.82,
       text: (item) => `${item.title || ""}\n${item.body || ""}\n${(item.graph_path || []).map((hop) => hop.edge_id).join(" ")}`,
     });
-    const results = [];
-    const topK = clamp(Number(input.top_k ?? 8), 1, 50);
-    const tokenBudget = input.token_budget ?? 1200;
-    const limit = clamp(Number(tokenBudget), 64, 32_000);
-    let retrievalIndex = retrievalVariants.findIndex((candidate) => (
-      estimateSerializedTokens({ results, retrieval: candidate }) <= limit
-    ));
-    // The fixed retrieval fields fit the public minimum budget; this final
-    // variant explicitly reports omitted generation detail.
-    if (retrievalIndex < 0) retrievalIndex = retrievalVariants.length - 1;
-    let retrieval = retrievalVariants[retrievalIndex];
-    for (const item of diverse) {
-      if (results.length >= topK) break;
-      const optionalMetadata = { ...item };
-      delete optionalMetadata.feedback;
-      delete optionalMetadata.tags;
-      const compactMetadata = { ...optionalMetadata };
-      delete compactMetadata.score_signals;
-      let fitted = null;
-      const candidates = [item, optionalMetadata, compactMetadata];
-      for (const candidate of candidates) {
-        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
-          const candidateRetrieval = retrievalVariants[index];
-          if (estimateSerializedTokens({ results: [...results, candidate], retrieval: candidateRetrieval }) <= limit) {
-            fitted = candidate;
-            retrievalIndex = index;
-            retrieval = candidateRetrieval;
-            break;
-          }
-        }
-        if (fitted) break;
-      }
-      // Preserve the cited graph path while compacting optional metadata first;
-      // body text is the final elastic field in the existing result contract.
-      if (!fitted) {
-        for (let index = retrievalIndex; index < retrievalVariants.length; index += 1) {
-          const candidateRetrieval = retrievalVariants[index];
-          fitted = fitResultWithinEnvelope(
-            results,
-            compactMetadata,
-            tokenBudget,
-            (items) => ({ results: items, retrieval: candidateRetrieval }),
-          );
-          if (fitted) {
-            retrievalIndex = index;
-            retrieval = candidateRetrieval;
-            break;
-          }
-        }
-      }
-      if (!fitted) break;
-      results.push(fitted);
-    }
-    return { results, retrieval };
+    return fitSearchEnvelope({
+      results: diverse.slice(0, clamp(Number(input.top_k ?? 8), 1, 50)),
+      retrieval: {
+        ...retrievalBase,
+        graph_generation: nativeGraphEnabled ? graphGenerationSummary(this, input) : null,
+      },
+    }, input.token_budget ?? 1200);
   }
 
   explainGraphNode(input = {}) {
@@ -2613,16 +2699,28 @@ export class ContextVault {
     }, input.token_budget ?? 1200);
   }
 
-  saveHandoff(input, { assessment, actor = null } = {}) {
+  saveHandoff(input, { assessment, actor = null, allowedSensitivities = null } = {}) {
     if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
       throw new Error("handoff capture assessment is required");
     }
+    // Only the caller's resolved identity may supply this option, never the
+    // request body. Omission preserves trusted direct-library behavior.
+    if (allowedSensitivities !== null && (!Array.isArray(allowedSensitivities)
+      || allowedSensitivities.some((value) => !["public", "private", "sensitive", "restricted"].includes(value)))) {
+      throw new Error("allowedSensitivities must be an array of valid sensitivities");
+    }
+    const requireAvailableSensitivity = (sensitivity) => {
+      if (allowedSensitivities !== null && !allowedSensitivities.includes(sensitivity)) {
+        throw Object.assign(new Error("handoff is unavailable for this identity"), { code: "FORBIDDEN" });
+      }
+    };
     const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
     const ownerId = requiredIdentifier(input.owner_id || "local-user", "owner_id");
     const agentId = requiredIdentifier(input.agent_id || input.principal_id || ownerId, "agent_id");
     const projectId = requiredIdentifier(input.project_id, "project_id");
     const sensitivity = input.sensitivity || "private";
     if (!["private", "sensitive", "restricted"].includes(sensitivity)) throw new Error("handoff sensitivity is invalid");
+    requireAvailableSensitivity(sensitivity);
     if (["sensitive", "restricted"].includes(sensitivity) && assessment.disposition === "active") {
       throw new Error("high-sensitivity handoff cannot activate without review");
     }
@@ -2630,6 +2728,11 @@ export class ContextVault {
       throw new Error("active handoff assessment must include a bounded expiry");
     }
     const handoff = normalizeHandoff(input);
+    if (input.auto_link_previous !== undefined && typeof input.auto_link_previous !== "boolean") {
+      throw new Error("auto_link_previous must be a boolean");
+    }
+    const autoLinkPrevious = input.auto_link_previous === true
+      && !Object.prototype.hasOwnProperty.call(input, "previous_checkpoint_id");
     assertNoCredentialLikeContent(handoff);
     const namespaceId = `project/${projectId}`;
     const idempotencyKey = handoffIdempotencyKey(handoff);
@@ -2656,9 +2759,16 @@ export class ContextVault {
         idempotency_key: idempotencyKey,
       });
       if (existing) {
+        requireAvailableSensitivity(existing.sensitivity);
         const persistedHandoff = JSON.parse(existing.metadata_json || "{}").handoff || null;
+        // Retry identity is resolved before consulting the latest checkpoint.
+        // Only an omitted predecessor can inherit stored lineage; an explicit
+        // predecessor (including null) must still match the original capture.
+        if (autoLinkPrevious && persistedHandoff) {
+          handoff.previous_checkpoint_id = persistedHandoff.previous_checkpoint_id;
+        }
         if (!handoffsEqual(persistedHandoff, handoff)) {
-          throw new Error("checkpoint_id was already used with different handoff data for this task and branch");
+          throw Object.assign(new Error("checkpoint_id was already used with different handoff data for this task and branch"), { statusCode: 409 });
         }
         return {
           duplicate: true,
@@ -2692,9 +2802,17 @@ export class ContextVault {
         effectiveTime,
         effectiveTime,
       ) || null;
+      // Do not filter this lookup: hiding an unavailable predecessor would
+      // otherwise allow a new active fork instead of rejecting the operation.
+      if (previousRecord) requireAvailableSensitivity(previousRecord.sensitivity);
       const previousHandoff = previousRecord
         ? JSON.parse(previousRecord.metadata_json || "{}").handoff || null
         : null;
+      // This exact-branch lookup and the following write share the SQLite
+      // writer transaction. Branchless recall fallback never creates lineage.
+      if (autoLinkPrevious && previousHandoff) {
+        handoff.previous_checkpoint_id = previousHandoff.checkpoint_id;
+      }
       const continuesLatest = Boolean(
         previousRecord
         && previousHandoff
@@ -3184,8 +3302,15 @@ export class ContextVault {
     }
     const output = [];
     for (const input of inputs) {
-      const proposed = this.propose(input);
-      output.push(commit && !proposed.duplicate ? this.commit(proposed.record.id) : proposed.record);
+      output.push(this.runTransaction(() => {
+        const proposed = this.propose(input);
+        // Explicit bulk approval includes existing proposals, but must not
+        // reactivate reviewed, superseded, or forgotten records. Publish only
+        // after this input's proposal and requested activation commit together.
+        return commit && proposed.record.status === PROPOSED
+          ? this.commit(proposed.record.id)
+          : proposed.record;
+      }));
     }
     return output;
   }
@@ -3245,8 +3370,12 @@ export class ContextVault {
     if (this.readOnly) {
       // A read-only reader cannot drain the canonical outbox. Export its
       // committed SQLite snapshot instead of possibly stale canonical files.
-      return this.db.prepare("SELECT * FROM memory_records ORDER BY id").all()
-        .map((record) => JSON.stringify(record)).join("\n");
+      // Keep each row and its aliases in the same snapshot while writers run.
+      this.db.exec("BEGIN");
+      try {
+        return this.db.prepare("SELECT * FROM memory_records ORDER BY id").all()
+          .map((record) => JSON.stringify(this.recordWithIdempotencyAliases(record))).join("\n");
+      } finally { this.db.exec("ROLLBACK"); }
     }
     return this.runTransaction(() => {
       this.flushCanonicalWritesUnsafe();

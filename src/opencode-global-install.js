@@ -19,6 +19,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { renderGlobalOpenCodePlugin } from "./opencode-global-plugin-template.js";
 import { managedOpenCodeProject, migrateManagedOpenCodeProjects } from "./agent-connectors.js";
+import { loadCapturePolicy } from "./capture-policy.js";
 
 const OWNERSHIP_PREFIX = "// continuitydb managed global opencode ownership: ";
 const MAX_PLUGIN_BYTES = 4 * 1024 * 1024;
@@ -230,6 +231,7 @@ function discoverLegacyAdapters(workspaceRoots, budget = DEFAULT_SCAN_BUDGET) {
 function normalizedOptions({
   configDir = defaultOpenCodeConfigDir(), workspaceRoots, home, binary,
   tenantId = "local", ownerId = "local-user", sensitivities = ["public", "private"],
+  capturePolicyFile = null,
 } = {}) {
   const fixedConfigDir = canonicalOpenCodeConfigDir(configDir);
   if (!Array.isArray(workspaceRoots) || workspaceRoots.length < 1 || workspaceRoots.length > 64) {
@@ -246,6 +248,12 @@ function normalizedOptions({
   if (!isAbsolute(String(home || "")) || !isAbsolute(String(binary || ""))) {
     throw new Error("global OpenCode install requires absolute home and binary paths");
   }
+  if (capturePolicyFile !== null) {
+    if (typeof capturePolicyFile !== "string" || !isAbsolute(capturePolicyFile) || capturePolicyFile.includes("\0")) {
+      throw new Error("global OpenCode capture policy file must be an absolute path");
+    }
+    loadCapturePolicy(capturePolicyFile);
+  }
   return {
     configDir: fixedConfigDir,
     pluginDir: join(fixedConfigDir, "plugins"),
@@ -256,6 +264,7 @@ function normalizedOptions({
     tenantId,
     ownerId,
     sensitivities,
+    capturePolicyFile,
   };
 }
 

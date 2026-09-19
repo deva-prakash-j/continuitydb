@@ -978,7 +978,7 @@ invalid rather than silently replaced with a newly valid-looking chain.
 Use an encrypted filesystem or volume, restrict the data directory to its owner,
 and back up the full data directory while the writer is stopped. Application-level
 encryption and remote signed audit checkpoints are not implemented in v0.6.
-For upgrade/downgrade precautions, see [the 0.9.1 release notes](docs/releases/v0.9.1.md).
+For upgrade/downgrade precautions, see [the 0.9.2 release notes](docs/releases/v0.9.2.md).
 
 ## Deployment and scale
 

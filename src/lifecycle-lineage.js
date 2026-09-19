@@ -19,12 +19,15 @@ export function checkpointSaveOutcome(result) {
   const validIdentity = typeof result?.record?.id === "string"
     && typeof result?.handoff?.checkpoint_id === "string";
   const saved = disposition === "active" && status === "active" && validIdentity;
+  const duplicate = validIdentity && Boolean(result?.duplicate);
+  const accepted = saved || (duplicate && disposition === "superseded" && status === "superseded");
   const reason = typeof result?.reason === "string" && result.reason
     ? result.reason
     : saved ? "handoff is active" : "ContinuityDB returned an invalid handoff save response";
   return {
     saved,
-    duplicate: saved && Boolean(result?.duplicate),
+    accepted,
+    duplicate,
     disposition,
     status,
     reason,

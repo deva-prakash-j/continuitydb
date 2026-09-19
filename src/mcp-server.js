@@ -239,7 +239,8 @@ if (canCapture) registerTool(
       branch: z.string().max(200).optional(),
       git_commit: z.string().max(64).optional(),
       checkpoint_id: z.string().max(200).optional(),
-      previous_checkpoint_id: z.string().max(200).optional(),
+      previous_checkpoint_id: z.string().max(200).nullable().optional(),
+      auto_link_previous: z.boolean().optional(),
       sensitivity: z.enum(["private", "sensitive", "restricted"]).default("private"),
     },
   },
@@ -260,6 +261,7 @@ if (canCapture) registerTool(
     return response(vault.saveHandoff(handoffInput, {
       assessment: capturePolicy.evaluateHandoff(handoffInput, identity, vault),
       actor: `${identity.principal_id}/${identity.agent_id}`,
+      allowedSensitivities: identity.allowed_sensitivities,
     }));
   },
 );
