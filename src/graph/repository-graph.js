@@ -4,7 +4,7 @@ import { graphEdgeId } from "./model.js";
 import { extractJavaSpring } from "./java-spring-extractor.js";
 import { extractStructuredGraph } from "./structured-extractors.js";
 
-export const REPOSITORY_GRAPH_EXTRACTOR_VERSION = "repository-graph-v1";
+export const REPOSITORY_GRAPH_EXTRACTOR_VERSION = "repository-graph-v2";
 
 function extractorFor(repoPath) {
   if (repoPath.endsWith(".java")) return extractJavaSpring;
