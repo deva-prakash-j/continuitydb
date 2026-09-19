@@ -202,6 +202,7 @@ test("global plugin renderer rejects unsafe configuration", () => {
   assert.throws(() => renderGlobalOpenCodePlugin({ executable: "continuitydb", home: "/vault", workspaceRoots: [root] }), /absolute executable/i);
   assert.throws(() => renderGlobalOpenCodePlugin({ executable: "/bin/continuitydb", home: "/vault", workspaceRoots: [] }), /workspace root/i);
   assert.throws(() => renderGlobalOpenCodePlugin({ executable: "/bin/continuitydb", home: "/vault", workspaceRoots: [root], sensitivities: ["secret"] }), /sensitivity/i);
+  assert.throws(() => renderGlobalOpenCodePlugin({ executable: "/bin/continuitydb", home: "/vault", workspaceRoots: [root], capturePolicyFile: "relative-policy.json" }), /capture policy.*absolute path/i);
 });
 
 test("untrusted auxiliary OpenCode instances expose no memory hooks or tools", async () => {

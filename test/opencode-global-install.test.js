@@ -123,6 +123,28 @@ test("global OpenCode install preserves explicit account and sensitivity setting
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("global OpenCode install validates and pins the operator capture policy path", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-policy-"));
+  const workspace = join(root, "workspace");
+  const capturePolicyFile = join(root, "capture-policy.json");
+  mkdirSync(workspace);
+  writeFileSync(capturePolicyFile, JSON.stringify({ working_ttl_seconds: 300 }), { mode: 0o600 });
+  try {
+    const options = {
+      home: join(root, "vault"), workspaceRoots: [workspace], configDir: join(root, "config"),
+      binary: process.execPath, capturePolicyFile,
+    };
+    const result = installGlobalOpenCode({ ...options, apply: true });
+    assert.equal(pluginConfig(result.plugin).capturePolicyFile, capturePolicyFile);
+    assert.equal(installGlobalOpenCode({ ...options, apply: true }).changed, false);
+    const before = readFileSync(result.plugin, "utf8");
+    assert.throws(() => installGlobalOpenCode({ ...options, capturePolicyFile: "relative-policy.json", apply: true }), /absolute path/);
+    writeFileSync(capturePolicyFile, JSON.stringify({ working_ttl_seconds: "invalid" }));
+    assert.throws(() => installGlobalOpenCode({ ...options, apply: true }), /working_ttl_seconds must be a finite number/);
+    assert.equal(readFileSync(result.plugin, "utf8"), before);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("CLI global OpenCode install uses account environment with explicit flag precedence", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-cli-account-"));
   const workspace = join(root, "workspace");
