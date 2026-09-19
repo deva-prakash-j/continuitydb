@@ -5,6 +5,25 @@ after the first stable release.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-09-19
+
+- Complete bulk approval of existing proposed records atomically and preserve
+  acknowledged request identities through content deduplication and expiry.
+- Preserve committed-but-pending recovery details across lifecycle and generated
+  OpenCode adapters, including a reusable observation ID for later retries.
+- Distinguish new OpenCode observations from retries, allowing equivalent fresh
+  captures after expiry without turning retries into new observations.
+- Propagate explicitly configured capture policies into global OpenCode tools.
+- Resolve automatic checkpoint lineage atomically without rewriting a delayed
+  retry's predecessor; keep historical duplicate outcomes truthful.
+- Import repositories in bounded batches, report interrupted progress, and accept
+  empty incremental imports without bypassing store capacity limits.
+- Repack the final detailed-search response after semantic-fallback telemetry so
+  the complete envelope respects its token budget.
+
+See `docs/releases/v0.9.2.md` for adapter refresh, retry identity, and upgrade
+precautions. No installed runtime or live memory store is upgraded automatically.
+
 ## [0.9.1] - 2026-09-19
 
 ### Storage and recovery

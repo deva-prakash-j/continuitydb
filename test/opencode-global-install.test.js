@@ -56,6 +56,28 @@ function optionalText(path) {
   }
 }
 
+test("CLI global install resolves and pins explicit policy before environment fallback", () => {
+  const root = mkdtempSync(join(tmpdir(), "continuitydb-cli-global-policy-"));
+  const workspace = join(root, "workspace");
+  const policy = join(root, "explicit.json");
+  const fallback = join(root, "environment.json");
+  mkdirSync(workspace);
+  writeFileSync(policy, JSON.stringify({ working_ttl_seconds: 300 }), { mode: 0o600 });
+  writeFileSync(fallback, JSON.stringify({ working_ttl_seconds: 600 }), { mode: 0o600 });
+  try {
+    for (const explicit of [true, false]) {
+      const configDir = join(root, explicit ? "explicit-config" : "fallback-config");
+      const result = run(["opencode", "install", "--home", join(root, "vault"),
+        "--workspace-root", workspace, "--opencode-config-dir", configDir,
+        ...(explicit ? ["--policy", "explicit.json"] : []), "--apply"], root,
+      { CONTINUITYDB_CAPTURE_POLICY_FILE: fallback });
+      assert.equal(result.status, 0, result.stderr);
+      const installed = JSON.parse(result.stdout);
+      assert.equal(pluginConfig(installed.plugin).capturePolicyFile, explicit ? policy : fallback);
+    }
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("global OpenCode install previews, applies idempotently, reports status, and uninstalls", () => {
   const root = mkdtempSync(join(tmpdir(), "continuitydb-opencode-install-"));
   const one = join(root, "one");
