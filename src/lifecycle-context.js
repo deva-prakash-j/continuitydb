@@ -177,6 +177,7 @@ export async function saveLifecycleCheckpoint({
     return vault.saveHandoff(input, {
       assessment: policy.evaluateHandoff(input, identity, vault),
       actor: `${identity.principal_id}/${identity.agent_id}`,
+      allowedSensitivities: identity.allowed_sensitivities,
     });
   } finally {
     vault.close();

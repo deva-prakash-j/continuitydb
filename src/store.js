@@ -2699,16 +2699,28 @@ export class ContextVault {
     }, input.token_budget ?? 1200);
   }
 
-  saveHandoff(input, { assessment, actor = null } = {}) {
+  saveHandoff(input, { assessment, actor = null, allowedSensitivities = null } = {}) {
     if (!assessment || !["active", "proposed", "quarantined"].includes(assessment.disposition)) {
       throw new Error("handoff capture assessment is required");
     }
+    // Only the caller's resolved identity may supply this option, never the
+    // request body. Omission preserves trusted direct-library behavior.
+    if (allowedSensitivities !== null && (!Array.isArray(allowedSensitivities)
+      || allowedSensitivities.some((value) => !["public", "private", "sensitive", "restricted"].includes(value)))) {
+      throw new Error("allowedSensitivities must be an array of valid sensitivities");
+    }
+    const requireAvailableSensitivity = (sensitivity) => {
+      if (allowedSensitivities !== null && !allowedSensitivities.includes(sensitivity)) {
+        throw Object.assign(new Error("handoff is unavailable for this identity"), { code: "FORBIDDEN" });
+      }
+    };
     const tenantId = requiredIdentifier(input.tenant_id || LOCAL_TENANT, "tenant_id");
     const ownerId = requiredIdentifier(input.owner_id || "local-user", "owner_id");
     const agentId = requiredIdentifier(input.agent_id || input.principal_id || ownerId, "agent_id");
     const projectId = requiredIdentifier(input.project_id, "project_id");
     const sensitivity = input.sensitivity || "private";
     if (!["private", "sensitive", "restricted"].includes(sensitivity)) throw new Error("handoff sensitivity is invalid");
+    requireAvailableSensitivity(sensitivity);
     if (["sensitive", "restricted"].includes(sensitivity) && assessment.disposition === "active") {
       throw new Error("high-sensitivity handoff cannot activate without review");
     }
@@ -2747,6 +2759,7 @@ export class ContextVault {
         idempotency_key: idempotencyKey,
       });
       if (existing) {
+        requireAvailableSensitivity(existing.sensitivity);
         const persistedHandoff = JSON.parse(existing.metadata_json || "{}").handoff || null;
         // Retry identity is resolved before consulting the latest checkpoint.
         // Only an omitted predecessor can inherit stored lineage; an explicit
@@ -2789,6 +2802,9 @@ export class ContextVault {
         effectiveTime,
         effectiveTime,
       ) || null;
+      // Do not filter this lookup: hiding an unavailable predecessor would
+      // otherwise allow a new active fork instead of rejecting the operation.
+      if (previousRecord) requireAvailableSensitivity(previousRecord.sensitivity);
       const previousHandoff = previousRecord
         ? JSON.parse(previousRecord.metadata_json || "{}").handoff || null
         : null;

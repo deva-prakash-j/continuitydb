@@ -349,6 +349,7 @@ export function createContinuityServer({
         const result = vault.saveHandoff(handoffInput, {
           assessment,
           actor: `${identity.principal_id}/${identity.agent_id || "agent"}`,
+          allowedSensitivities: identity.allowed_sensitivities,
         });
         return json(response, result.duplicate ? 200 : 201, result, requestId);
       }

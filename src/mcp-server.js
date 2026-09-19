@@ -261,6 +261,7 @@ if (canCapture) registerTool(
     return response(vault.saveHandoff(handoffInput, {
       assessment: capturePolicy.evaluateHandoff(handoffInput, identity, vault),
       actor: `${identity.principal_id}/${identity.agent_id}`,
+      allowedSensitivities: identity.allowed_sensitivities,
     }));
   },
 );
